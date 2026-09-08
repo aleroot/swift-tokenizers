@@ -108,8 +108,6 @@ struct PreTokenizerFactory {
 
 private let punctuationClass = #"\p{P}\u0021-\u002F\u003A-\u0040\u005B-\u0060\u007B-\u007E"#
 
-private let bertPreTokenizeRegex: NSRegularExpression = try! NSRegularExpression(
-    pattern: "[^\\s\(punctuationClass)]+|[\(punctuationClass)]")
 private let digitsIndividualRegex: NSRegularExpression = try! NSRegularExpression(pattern: "[^\\d]+|\\d")
 private let digitsGroupedRegex: NSRegularExpression = try! NSRegularExpression(pattern: "[^\\d]+|\\d+")
 
@@ -137,11 +135,47 @@ func enumerateRegexTokens(in text: String, with regex: NSRegularExpression, _ bo
 
 // MARK: - Implementations
 
-final class BertPreTokenizer: PreTokenizer {
+final class BertPreTokenizer: PreTokenizer, FastPreTokenizer {
     required init(config: Config) {}
 
     func preTokenize(text: String, options: PreTokenizerOptions = [.firstSection]) -> [String] {
-        splitMatches(in: text, with: bertPreTokenizeRegex)
+        var output: [PreToken] = []
+        preTokenize(Substring(text), options: options, into: &output)
+        return output.map { String($0.text) }
+    }
+
+    func preTokenize(_ text: Substring, options: PreTokenizerOptions, into output: inout [PreToken]) {
+        var copy = text
+        copy.withUTF8 { bytes in
+            var i = 0
+            var start = 0
+            func append(_ lo: Int, _ hi: Int) {
+                guard lo < hi else { return }
+                let utf8 = text.utf8
+                let lower = utf8.index(utf8.startIndex, offsetBy: lo)
+                let upper = utf8.index(utf8.startIndex, offsetBy: hi)
+                output.append(PreToken(text: text[lower..<upper], byteLevel: false))
+            }
+            while i < bytes.count {
+                let (value, width) = UTF8Cursor.decode(bytes, at: i)
+                let whitespace = ScalarClassifier.classify(value: value) == .whitespace
+                let punctuation: Bool
+                if value < 128 {
+                    punctuation =
+                        (33...47).contains(value) || (58...64).contains(value)
+                        || (91...96).contains(value) || (123...126).contains(value)
+                } else {
+                    punctuation = CharacterSet.punctuationCharacters.contains(Unicode.Scalar(value)!)
+                }
+                if whitespace || punctuation {
+                    append(start, i)
+                    if punctuation { append(i, i + width) }
+                    start = i + width
+                }
+                i += width
+            }
+            append(start, bytes.count)
+        }
     }
 }
 
@@ -265,7 +299,8 @@ final class PreTokenizerSequence: PreTokenizer, FastPreTokenizer {
 
 /// `Whitespace` / `WhitespaceSplit`: runs of non-whitespace scalars (`\S+`).
 final class WhitespacePreTokenizer: PreTokenizer, FastPreTokenizer {
-    required init(config: Config) {}
+    let splitWords: Bool
+    required init(config: Config) { splitWords = config.type.string() == "Whitespace" }
 
     func preTokenize(text: String, options: PreTokenizerOptions = [.firstSection]) -> [String] {
         var tokens: [PreToken] = []
@@ -280,13 +315,20 @@ final class WhitespacePreTokenizer: PreTokenizer, FastPreTokenizer {
             let n = bytes.count
             var i = 0
             var start = -1
+            var previousWord = false
             while i < n {
                 let (value, width) = UTF8Cursor.decode(bytes, at: i)
                 let isWhitespace = ScalarClassifier.classify(value: value) == .whitespace
+                let isWord = Self.isWord(value)
                 if isWhitespace {
                     if start >= 0 { ranges.append(start..<i); start = -1 }
-                } else if start < 0 {
-                    start = i
+                } else {
+                    if start >= 0, splitWords, isWord != previousWord {
+                        ranges.append(start..<i)
+                        start = -1
+                    }
+                    if start < 0 { start = i }
+                    previousWord = isWord
                 }
                 i += width
             }
@@ -299,6 +341,18 @@ final class WhitespacePreTokenizer: PreTokenizer, FastPreTokenizer {
             output.append(PreToken(text: text[lower..<upper], byteLevel: false))
         }
     }
+    private static func isWord(_ value: UInt32) -> Bool {
+        if value < 128 {
+            return (65...90).contains(value) || (97...122).contains(value) || (48...57).contains(value) || value == 95
+        }
+        guard let scalar = Unicode.Scalar(value) else { return false }
+        if scalar.properties.isAlphabetic || value == 0x200C || value == 0x200D { return true }
+        switch scalar.properties.generalCategory {
+        case .nonspacingMark, .spacingMark, .enclosingMark, .decimalNumber, .connectorPunctuation: return true
+        default: return false
+        }
+    }
+
 }
 
 /// Replaces spaces with a replacement character (SentencePiece's `▁`) and optionally

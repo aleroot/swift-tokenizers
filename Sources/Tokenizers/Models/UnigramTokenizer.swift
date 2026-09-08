@@ -31,6 +31,8 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
     let eosToken: String?
     let eosTokenId: Int?
     let fuseUnknownTokens: Bool = true
+    let byteFallback: Bool
+    let byteFallbackIds: [Int]
 
     required init(tokenizerConfig: Config, tokenizerData: Config, addedTokens: [String: Int]) throws {
         guard let configVocab = tokenizerData.model.vocab.array() else {
@@ -41,11 +43,11 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         vocab.reserveCapacity(configVocab.count)
         for piece in configVocab {
             let tuple = piece.array(or: [])
-            guard let token = tuple.first?.string(), let scoreValue = tuple.last else {
+            guard tuple.count == 2, let token = tuple.first?.string(), let scoreValue = tuple.last else {
                 throw TokenizerError.malformedVocab
             }
             let score: Double
-            if let d = scoreValue.double() {
+            if let d = scoreValue.double(), d.isFinite {
                 score = d
             } else {
                 throw TokenizerError.malformedVocab
@@ -59,7 +61,9 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         for token in vocab where token.score < minScore { minScore = token.score }
         self.minScore = minScore
 
-        guard let unknownTokenId = tokenizerData.model["unkId"].integer(), unknownTokenId < vocab.count else {
+        guard let unknownTokenId = tokenizerData.model["unkId"].integer(), unknownTokenId >= 0,
+            unknownTokenId < vocab.count
+        else {
             throw TokenizerError.malformedVocab
         }
         self.unknownTokenId = unknownTokenId
@@ -71,6 +75,8 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         for (token, id) in addedTokens { entries.append((token, id)) }
         let vocabulary = try Vocabulary(entries: entries)
         self.vocabulary = vocabulary
+        byteFallback = tokenizerData.model.byteFallback.boolean(or: false)
+        byteFallbackIds = BPETokenizer.hexaTokenStrings.map { vocabulary.id(of: $0) ?? -1 }
 
         bosTokenId = vocabulary.id(of: " ")
         let eosToken = tokenizerConfig.eosToken.string()
@@ -138,6 +144,16 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
             end = start
         }
         scratch.output.reverse()
+        var write = 0
+        for piece in scratch.output {
+            if write > 0, piece.tokenId == unkId, scratch.output[write - 1].tokenId == unkId {
+                scratch.output[write - 1].end = piece.end
+            } else {
+                scratch.output[write] = piece
+                write += 1
+            }
+        }
+        scratch.output.removeSubrange(write...)
         return scratch.output[...]
     }
 
@@ -194,12 +210,14 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
             scratch.scalars.withUnsafeBufferPointer { scalars in
                 for segment in model.segment(scalars, scratch: &scratch) {
                     let id = Int(segment.tokenId)
-                    // Unknown pieces map to the unknown id (consecutive unknowns are fused by the caller).
-                    if id == unk, let unk {
-                        ids.append(unk)
-                    } else {
-                        ids.append(id)
+                    if id == unk, model.byteFallback {
+                        let surface = String(String.UnicodeScalarView(scalars[Int(segment.start)..<Int(segment.end)]))
+                        if surface.utf8.allSatisfy({ model.byteFallbackIds[Int($0)] >= 0 }) {
+                            ids.append(contentsOf: surface.utf8.map { model.byteFallbackIds[Int($0)] })
+                            continue
+                        }
                     }
+                    ids.append(id)
                 }
             }
         }
@@ -214,7 +232,14 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
             for piece in segment(scalars, scratch: &scratch) {
                 var view = String.UnicodeScalarView()
                 view.append(contentsOf: scalars[Int(piece.start)..<Int(piece.end)])
-                tokens.append(String(view))
+                let surface = String(view)
+                if Int(piece.tokenId) == unknownTokenId, byteFallback,
+                    surface.utf8.allSatisfy({ byteFallbackIds[Int($0)] >= 0 })
+                {
+                    tokens.append(contentsOf: surface.utf8.map { BPETokenizer.hexaTokenStrings[Int($0)] })
+                } else {
+                    tokens.append(surface)
+                }
             }
             return tokens
         }

@@ -73,11 +73,12 @@ enum HubFixtures {
 
         func modelFolder(repo: String, revision: String, files: [String]) async throws -> URL {
             let key = "\(repo)@\(revision)"
-            if let task = inFlight[key] {
-                return try await task.value
-            }
+            let previous = inFlight[key]
             let task = Task<URL, Error> {
-                try await HubFixtures.fetch(repo: repo, revision: revision, files: files)
+                // Callers can request different file sets. Serialize marker updates, then
+                // check the current caller's files instead of returning a narrower fetch.
+                if let previous { _ = try await previous.value }
+                return try await HubFixtures.fetch(repo: repo, revision: revision, files: files)
             }
             inFlight[key] = task
             return try await task.value

@@ -46,9 +46,7 @@ struct ChatTemplateTests {
         #expect(decoded == decodedTarget)
     }
 
-    @Test(
-        "DeepSeek Qwen chat template formatting",
-        .disabled("Disabled due to race condition with TokenizerTests.deepSeekPostProcessor"))
+    @Test("DeepSeek Qwen chat template formatting")
     func deepSeekQwenChatTemplate() async throws {
         let tokenizer = try await HubFixtures.tokenizer(for: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
         #expect(tokenizer.hasChatTemplate)

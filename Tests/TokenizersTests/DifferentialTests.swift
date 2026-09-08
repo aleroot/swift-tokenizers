@@ -22,6 +22,9 @@ struct DifferentialTests {
         let decodedSkipSpecial: String
     }
 
+    struct SurfaceRecord: Decodable { let text: String; let tokens: [String] }
+    struct SurfaceOracle: Decodable { let models: [String: [SurfaceRecord]] }
+
     struct UpstreamRecord: Decodable {
         let text: String
         let tokens: [String]
@@ -84,19 +87,16 @@ struct DifferentialTests {
             // No HF golden for this model (transformers cannot load it); covered by the upstream test.
             return
         }
-        let tokenizer = try await HubFixtures.preTrainedTokenizer(for: model)
+        // These Python 4.57 goldens include class reconstruction (notably Llama's BOS
+        // override). Exercise the equivalent configuration factory here; folder-loading
+        // policy is covered separately by TokenizerRegressionTests and TokenizerTests.
+        let configuration = try await HubFixtures.configuration(for: model)
+        let tokenizer = try AutoTokenizer.from(
+            tokenizerConfig: #require(configuration.tokenizerConfig), tokenizerData: configuration.tokenizerData)
         #expect(records.count > 250)
 
         var mismatches: [String] = []
-        var skipped = 0
         for record in records {
-            // Legacy Llama-2 configs declare special tokens `normalized: true`; Hugging Face then
-            // matches them inside the *normalized* text with surprising results (e.g. a trailing
-            // `</s>` is not recognised). We match added tokens on raw text like swift-transformers.
-            if tokenizer.legacyNormalizedAddedTokens.contains(where: { record.text.contains($0) }) {
-                skipped += 1
-                continue
-            }
             let ids = tokenizer.encode(text: record.text)
             if ids != record.ids {
                 mismatches.append("encode(\(record.text.debugDescription)): got \(ids) expected \(record.ids)")
@@ -109,19 +109,18 @@ struct DifferentialTests {
                 )
             }
             let decoded = tokenizer.decode(tokens: ids)
-            if decoded != record.decoded {
+            if !decoded.utf8.elementsEqual(record.decoded.utf8) {
                 mismatches.append(
                     "decode(\(record.text.debugDescription)): got \(decoded.debugDescription) expected \(record.decoded.debugDescription)"
                 )
             }
             let decodedSkip = tokenizer.decode(tokens: ids, skipSpecialTokens: true)
-            if decodedSkip != record.decodedSkipSpecial {
+            if !decodedSkip.utf8.elementsEqual(record.decodedSkipSpecial.utf8) {
                 mismatches.append(
                     "decode(skip)(\(record.text.debugDescription)): got \(decodedSkip.debugDescription) expected \(record.decodedSkipSpecial.debugDescription)"
                 )
             }
         }
-        #expect(skipped < 60, "too many records skipped for \(model)")
         if !mismatches.isEmpty {
             let summary = Array(mismatches.prefix(10)).joined(separator: "\n")
             Issue.record(Comment(rawValue: "\(model): \(mismatches.count) mismatches vs Hugging Face\n\(summary)"))
@@ -132,11 +131,19 @@ struct DifferentialTests {
 
     @Test(arguments: models)
     func matchesUpstreamOrHuggingFace(model: String) async throws {
-        let tokenizer = try await HubFixtures.preTrainedTokenizer(for: model)
+        // The historical Swift goldens also used the configuration factory.
+        let configuration = try await HubFixtures.configuration(for: model)
+        let tokenizer = try AutoTokenizer.from(
+            tokenizerConfig: #require(configuration.tokenizerConfig), tokenizerData: configuration.tokenizerData)
         let upstream = try Self.loadUpstream(model)
         let hf = try Self.loadHF(model)
-        var hfByText: [String: HFRecord] = [:]
-        for record in hf ?? [] { hfByText[record.text] = record }
+        let surfaceURL = try #require(Bundle.module.url(forResource: "hf-token-surfaces", withExtension: "json"))
+        let surfaces = try JSONDecoder().decode(SurfaceOracle.self, from: Data(contentsOf: surfaceURL))
+        let surfaceRecords = try #require(surfaces.models[model])
+        let surfacesByText = Dictionary(
+            uniqueKeysWithValues: surfaceRecords.map { (BinaryDistinctString($0.text), $0.tokens) })
+        var hfByText: [BinaryDistinctString: HFRecord] = [:]
+        for record in hf ?? [] { hfByText[BinaryDistinctString(record.text)] = record }
         #expect(upstream.count > 250)
 
         var regressions: [String] = []
@@ -154,7 +161,7 @@ struct DifferentialTests {
         }
 
         for record in upstream {
-            let hfRecord = hfByText[record.text]
+            let hfRecord = hfByText[BinaryDistinctString(record.text)]
             let ids = tokenizer.encode(text: record.text)
             check("encode", text: record.text, ours: ids, upstream: record.ids, hf: hfRecord?.ids)
             check(
@@ -162,23 +169,23 @@ struct DifferentialTests {
                 ours: tokenizer.encode(text: record.text, addSpecialTokens: false),
                 upstream: record.idsNoSpecial, hf: hfRecord?.idsNoSpecial
             )
-            // `tokenize` has no HF counterpart; it must match upstream whenever the ids match.
+            // Python/Rust serialized-pipeline tokens adjudicate surface changes. In particular,
+            // upstream Swift dropped all but the first character of unknown Unigram spans.
             if ids == record.ids {
-                let tokens = tokenizer.tokenize(text: record.text)
-                if tokens != record.tokens {
-                    regressions.append(
-                        "tokenize(\(record.text.debugDescription)): got \(tokens) upstream \(record.tokens)")
-                }
+                let tokens = tokenizer.tokenize(text: record.text).map { Array($0.utf8) }
+                let reference = try #require(surfacesByText[BinaryDistinctString(record.text)])
+                check(
+                    "tokenize", text: record.text, ours: tokens,
+                    upstream: record.tokens.map { Array($0.utf8) }, hf: reference.map { Array($0.utf8) })
             }
-            // Decode comparisons need a usable HF reference; for texts containing legacy
-            // `normalized: true` special tokens neither reference is reliable (see the HF test).
-            if tokenizer.legacyNormalizedAddedTokens.contains(where: { record.text.contains($0) }) { continue }
             check(
-                "decode", text: record.text, ours: tokenizer.decode(tokens: ids), upstream: record.decoded,
-                hf: hfRecord?.decoded)
+                "decode", text: record.text, ours: Array(tokenizer.decode(tokens: ids).utf8),
+                upstream: Array(record.decoded.utf8),
+                hf: hfRecord.map { Array($0.decoded.utf8) })
             check(
-                "decode(skip)", text: record.text, ours: tokenizer.decode(tokens: ids, skipSpecialTokens: true),
-                upstream: record.decodedSkipSpecial, hf: hfRecord?.decodedSkipSpecial
+                "decode(skip)", text: record.text,
+                ours: Array(tokenizer.decode(tokens: ids, skipSpecialTokens: true).utf8),
+                upstream: Array(record.decodedSkipSpecial.utf8), hf: hfRecord.map { Array($0.decodedSkipSpecial.utf8) }
             )
         }
 

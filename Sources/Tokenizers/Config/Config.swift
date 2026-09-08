@@ -190,25 +190,25 @@ public struct Config: Hashable, Sendable,
             return Config(obj)
         case let obj as String:
             return Config(obj)
+        case let obj as NSNumber where CFGetTypeID(obj) == CFBooleanGetTypeID():
+            return Config(obj.boolValue)
+        case let obj as NSNumber:
+            // JSONSerialization bridges numeric 0/1 to Bool as well. Inspect the CF type
+            // before Swift casts so vocabulary IDs never become boolean nodes.
+            let type = String(cString: obj.objCType)
+            if type == "f" || type == "d" { return Config(obj.doubleValue) }
+            if type == "Q", obj.uint64Value > UInt64(Int.max) { return Config(obj.doubleValue) }
+            return Config(obj.intValue)
         case let obj as Bool:
             return Config(obj)
         case let obj as Int:
             return Config(obj)
         case let obj as UInt:
-            return Config(Int(obj))
+            return Int(exactly: obj).map { Config($0) } ?? Config(Double(obj))
         case let obj as Float:
             return Config(obj)
         case let obj as Double:
             return Config(obj)
-        case let obj as NSNumber:
-            #if canImport(Darwin)
-                if CFNumberIsFloatType(obj) { return Config(obj.floatValue) }
-                return Config(obj.intValue)
-            #else
-                let type = String(cString: obj.objCType)
-                if type == "f" || type == "d" { return Config(obj.floatValue) }
-                return Config(obj.intValue)
-            #endif
         case let obj as (UInt, String):
             return Config((obj.0, BinaryDistinctString(obj.1)))
         case let obj as (UInt, BinaryDistinctString):
@@ -361,7 +361,7 @@ public struct Config: Hashable, Sendable,
     public func token() -> (UInt, String)? {
         if case let .token(v) = value { return (v.0, v.1.string) }
         if case let .array(arr) = value {
-            guard arr.count == 2, let token = arr[0].string(), let id = arr[1].integer() else { return nil }
+            guard arr.count == 2, let token = arr[0].string(), let id = arr[1].integer(), id >= 0 else { return nil }
             return (UInt(id), token)
         }
         return nil

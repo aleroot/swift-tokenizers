@@ -120,6 +120,13 @@ struct ChatTemplateValueTests {
         #expect(try tojson(dict) == #"{"flag": true, "n": 1, "none": null, "s": "t", "x": 2.5}"#)
     }
 
+    @Test("JSONSerialization numbers remain numbers in tool arguments")
+    func foundationScalars() throws {
+        let json = #"{"flag":true,"one":1,"zero":0,"fraction":1.5}"#
+        let object = try JSONSerialization.jsonObject(with: Data(json.utf8))
+        #expect(try tojson(object) == #"{"flag": true, "fraction": 1.5, "one": 1, "zero": 0}"#)
+    }
+
     @Test("Unknown keys follow canonical keywords, alphabetically")
     func unknownKeys() throws {
         let node: [String: any Sendable] = ["x-custom": 1, "type": "string", "description": "d", "a-custom": 2]

@@ -21,6 +21,8 @@ let specialTokenAttributes: [String] = [
 /// which is guarded by a lock; instances are therefore safe to share across threads and
 /// tasks (`@unchecked` only because a non-final class cannot be checked by the compiler).
 public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
+    class var decodesNormalizedAddedTokens: Bool { true }
+
     let model: any TokenizingModel
 
     public var bosToken: String? { model.bosToken }
@@ -36,16 +38,14 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     /// Added tokens flagged `special`, with their ids.
     let specialTokens: [String: Int]
     let specialTokenIds: Set<Int>
-    /// Added tokens declared `normalized: true` while a normalizer is configured. Hugging Face
-    /// matches these against normalized text (a legacy Llama-2 quirk); all added tokens are
-    /// matched on the raw text here.
-    let legacyNormalizedAddedTokens: Set<String>
 
     private let splitter: AddedTokenSplitter?
+    private let normalizedSplitter: AddedTokenSplitter?
     private let preTokenizer: (any PreTokenizer)?
     private let normalizer: (any Normalizer)?
     private let postProcessor: (any PostProcessor)?
     private let decoder: (any Decoder)?
+    private let normalizedAddedTokenSpellings: [Int: String]
     private let tokenizerConfig: Config
     private let cleanUpTokenizationSpaces: Bool
 
@@ -71,7 +71,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         var specialTokens: [String: Int] = [:]
         var splitterTokens: [AddedTokenSplitter.Token] = []
 
-        var normalizedAdded: Set<String> = []
+        var normalizedTokens: [AddedTokenSplitter.Token] = []
+        var normalizedSpellings: [Int: String] = [:]
+        let normalizer = try NormalizerFactory.fromConfig(config: tokenizerData["normalizer"])
         for addedToken in tokenizerData["addedTokens"].array(or: []) {
             guard let id = addedToken["id"].integer() else { continue }  // malformed: token with no id
             guard let content = addedToken.content.string() else { continue }  // malformed: token with no content
@@ -79,32 +81,36 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             if addedToken["special"].boolean(or: false) {
                 specialTokens[content] = id
             }
-            if addedToken["normalized"].boolean(or: false) {
-                normalizedAdded.insert(content)
+            let normalized = addedToken["normalized"].boolean(or: false) && normalizer != nil
+            let match = normalized ? normalizer!.normalize(text: content) : content
+            if Self.decodesNormalizedAddedTokens, normalized, !match.utf8.elementsEqual(content.utf8) {
+                normalizedSpellings[id] = match
             }
-            splitterTokens.append(
-                AddedTokenSplitter.Token(
-                    content: content,
-                    id: id,
-                    lstrip: addedToken["lstrip"].boolean(or: false),
-                    rstrip: addedToken["rstrip"].boolean(or: false),
-                    scalarCount: content.unicodeScalars.count
-                )
+            let token = AddedTokenSplitter.Token(
+                content: match,
+                id: id,
+                lstrip: addedToken["lstrip"].boolean(or: false),
+                rstrip: addedToken["rstrip"].boolean(or: false),
+                scalarCount: match.unicodeScalars.count,
+                singleWord: addedToken["single_word"].boolean(or: false)
             )
+            if normalized { normalizedTokens.append(token) } else { splitterTokens.append(token) }
         }
         // Longest content first, so a shorter token never shadows a longer one it prefixes.
         splitterTokens.sort { $0.scalarCount > $1.scalarCount }
 
+        normalizedAddedTokenSpellings = normalizedSpellings
         self.specialTokens = specialTokens
         specialTokenIds = Set(specialTokens.values)
         self.addedTokens = Set(addedTokens.keys)
         splitter = AddedTokenSplitter(tokens: splitterTokens)
 
         preTokenizer = try PreTokenizerFactory.fromConfig(config: tokenizerData["preTokenizer"])
-        normalizer = try NormalizerFactory.fromConfig(config: tokenizerData["normalizer"])
-        legacyNormalizedAddedTokens = normalizer == nil ? [] : normalizedAdded
+        self.normalizer = normalizer
+        normalizedSplitter = AddedTokenSplitter(tokens: normalizedTokens)
         postProcessor = try PostProcessorFactory.fromConfig(config: tokenizerData["postProcessor"])
-        decoder = try DecoderFactory.fromConfig(config: tokenizerData["decoder"], addedTokens: self.addedTokens)
+        decoder = try DecoderFactory.fromConfig(
+            config: tokenizerData["decoder"], addedTokens: self.addedTokens.union(normalizedSpellings.values))
         // `transformers` >= 4.45 defaults `clean_up_tokenization_spaces` to `False`.
         cleanUpTokenizationSpaces = tokenizerConfig.cleanUpTokenizationSpaces.boolean(or: false)
         self.tokenizerConfig = tokenizerConfig
@@ -120,19 +126,23 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             fastPostProcessor = postProcessor as? any FastPostProcessor
         }
 
-        if decoder is ByteLevelDecoder, let bpe = model as? BPETokenizer {
+        if decoder is ByteLevelDecoder, normalizedSpellings.isEmpty, let bpe = model as? BPETokenizer {
             byteLevelDecodeTable = ByteLevelDecodeTable(vocabulary: bpe.vocab, addedTokens: self.addedTokens)
         } else {
             byteLevelDecodeTable = nil
         }
 
-        if model is BPETokenizer, normalizer == nil || normalizer is NFCNormalizer {
+        if model is BPETokenizer, normalizedTokens.isEmpty, normalizer == nil || normalizer is NFCNormalizer {
             byteFastPath = Self.byteLevelPattern(of: preTokenizer)
             byteFastPathNFC = normalizer is NFCNormalizer
         } else {
             byteFastPath = nil
             byteFastPathNFC = false
         }
+
+        // Prepare shared Unicode classification data so a loaded tokenizer is ready
+        // for its first request. Subsequent tokenizers reuse the table.
+        _ = ScalarClassifier.bmp
     }
 
     /// The pre-tokenization stages the byte-level fast path can run without materialising
@@ -197,7 +207,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     }
 
     func fuseUnknown(_ tokens: [String]) -> [String] {
-        guard fuseUnknownTokens else { return tokens }
+        guard fuseUnknownTokens, !(model is BPETokenizer), !(model is UnigramTokenizer) else { return tokens }
         var fused: [String] = []
         fused.reserveCapacity(tokens.count)
         var previousIsUnknown = false
@@ -222,22 +232,33 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 
     /// Sections of `text` around added tokens, in order.
     private func sections(of text: String) -> [AddedTokenSplitter.Section] {
-        splitter?.split(text) ?? [.text(Substring(text))]
+        guard !text.isEmpty else { return [] }
+        let rawSections = splitter?.split(text) ?? [.text(Substring(text))]
+        guard normalizer != nil else { return rawSections }
+        return rawSections.flatMap { section -> [AddedTokenSplitter.Section] in
+            switch section {
+            case .token: return [section]
+            case .text(let chunk):
+                let normalized = normalize(String(chunk))
+                guard !normalized.isEmpty else { return [] }
+                return normalizedSplitter?.split(normalized) ?? [.text(Substring(normalized))]
+            }
+        }
     }
 
     public func tokenize(text: String) -> [String] {
         var tokens: [String] = []
         for (index, section) in sections(of: text).enumerated() {
             switch section {
-            case let .token(content, _):
-                tokens.append(String(content))
+            case let .token(_, id):
+                if let content = model.convertIdToToken(id) { tokens.append(content) }
             case let .text(chunk):
                 let options: PreTokenizerOptions = index == 0 ? [.firstSection] : []
                 var sectionTokens: [String] = []
-                for piece in preTokenize(normalize(String(chunk)), options: options) {
-                    sectionTokens.append(contentsOf: model.tokenize(text: piece))
+                for piece in preTokenize(String(chunk), options: options) {
+                    sectionTokens.append(contentsOf: fuseUnknown(model.tokenize(text: piece)))
                 }
-                tokens.append(contentsOf: fuseUnknown(sectionTokens))
+                tokens.append(contentsOf: sectionTokens)
             }
         }
         return tokens
@@ -269,7 +290,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 
         var preTokens: [PreToken] = []
         let unknownId = model.unknownTokenId
-        let fuse = model.fuseUnknownTokens
+        let fuse = model.fuseUnknownTokens && !(model is BPETokenizer) && !(model is UnigramTokenizer)
 
         for (index, section) in sections(of: text).enumerated() {
             switch section {
@@ -278,12 +299,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             case let .text(chunk):
                 let sectionStart = ids.count
                 let options: PreTokenizerOptions = index == 0 ? [.firstSection] : []
-                let normalized: Substring
-                if let normalizer {
-                    normalized = Substring(normalizer.normalize(text: String(chunk)))
-                } else {
-                    normalized = chunk
-                }
+                let normalized = chunk  // sections(of:) already normalized non-added text once.
                 preTokens.removeAll(keepingCapacity: true)
                 if let preTokenizer {
                     preTokenizer.preTokenizeFast(normalized, options: options, into: &preTokens)
@@ -325,7 +341,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         let encoder = fastModel.makeEncoder()
         defer { encoder.finish() }
         let unknownId = model.unknownTokenId
-        let fuse = model.fuseUnknownTokens
+        let fuse = model.fuseUnknownTokens && !(model is BPETokenizer) && !(model is UnigramTokenizer)
         let splitter = self.splitter
         let nfc = byteFastPathNFC
         let pattern = pipeline.pattern
@@ -468,7 +484,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         tokenStrings.reserveCapacity(tokens.count)
         for id in tokens {
             if skipSpecialTokens, specialTokenIds.contains(id) { continue }
-            if let token = model.convertIdToToken(id) {
+            if let token = convertIdToToken(id) {
                 tokenStrings.append(token)
             }
         }
@@ -481,7 +497,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     }
 
     public func convertIdToToken(_ id: Int) -> String? {
-        model.convertIdToToken(id)
+        normalizedAddedTokenSpellings[id] ?? model.convertIdToToken(id)
     }
 
     // MARK: - Chat templates
@@ -599,6 +615,12 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         tools: [ToolSpec]? = nil,
         additionalContext: [String: any Sendable]? = nil
     ) throws -> [Int] {
+        if let maxLength, maxLength < 0 {
+            throw TokenizerError.invalidConfiguration("maxLength must be nonnegative")
+        }
+        if let limit = tokenizerConfig.modelMaxLength.integer(), limit < 0 {
+            throw TokenizerError.invalidConfiguration("model_max_length must be nonnegative")
+        }
         let rendered = try renderChatTemplate(
             messages: messages, chatTemplate: chatTemplate, addGenerationPrompt: addGenerationPrompt, tools: tools,
             additionalContext: additionalContext
@@ -727,8 +749,12 @@ enum TokenizationCleanup {
         (" ' ", "'"), (" n't", "n't"), (" 'm", "'m"), (" 's", "'s"), (" 've", "'ve"), (" 're", "'re"),
     ].map { (Array($0.0.utf8), Array($0.1.utf8)) }
 
+    private static let wordPieceReplacements = Array(replacements.prefix(7))
+        + [(pattern: Array(" do not".utf8), replacement: Array(" don't".utf8))]
+        + Array(replacements.suffix(3))
+
     /// Sequentially applies the classic `clean_up_tokenization_spaces` replacements.
-    static func cleanUp(_ text: String) -> String {
+    static func cleanUp(_ text: String, wordPiece: Bool = false) -> String {
         // Quick reject: every pattern starts with a space followed by one of `.?!,'n`.
         var candidate = false
         var previousWasSpace = false
@@ -738,6 +764,8 @@ enum TokenizationCleanup {
                 case UInt8(ascii: "."), UInt8(ascii: "?"), UInt8(ascii: "!"), UInt8(ascii: ","), UInt8(ascii: "'"),
                     UInt8(ascii: "n"):
                     candidate = true
+                case UInt8(ascii: "d"):
+                    candidate = wordPiece
                 default:
                     break
                 }
@@ -748,7 +776,7 @@ enum TokenizationCleanup {
         guard candidate else { return text }
 
         var bytes = Array(text.utf8)
-        for (pattern, replacement) in replacements {
+        for (pattern, replacement) in wordPiece ? wordPieceReplacements : replacements {
             bytes = replace(bytes, pattern: pattern, with: replacement)
         }
         return String(decoding: bytes, as: UTF8.self)

@@ -109,6 +109,23 @@ struct DecoderTests {
         #expect(decoded.joined() == "How are you?")
     }
 
+    @Test("WordPiece cleanup keeps upstream replacement order and token boundaries")
+    func wordPieceCleanupOrder() throws {
+        // Expected strings from tokenizers 0.23.2 decoders.WordPiece().decode.
+        let decoder = try WordPieceDecoder(config: ["prefix": "##", "cleanup": true])
+        let cases: [([String], String)] = [
+            ([" do not 'm 's 've 're n't . ? ! , ' "], " don't'm's've'ren't.?!,'"),
+            (["do", "not"], "do not"),
+            ([" do not", " "], " don't  "),
+            (["x\t.\n!\u{a0}? .\u{301}"], "x\t.\n!\u{a0}?.\u{301}"),
+            (["## do not", "## .", "##\t."], "## don't.\t."),
+            (["a", "\n!", " do not"], "a \n!  don't"),
+        ]
+        for (tokens, expected) in cases {
+            #expect(decoder.decode(tokens: tokens).joined().utf8.elementsEqual(expected.utf8))
+        }
+    }
+
     @Test("WordPiece decoder with prefix and cleanup")
     func wordPieceDecoder() throws {
         let config = Config(["prefix": "##", "cleanup": true])

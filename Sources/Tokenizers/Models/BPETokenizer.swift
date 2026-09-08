@@ -69,6 +69,11 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
     let unknownToken: String?
     let unknownTokenId: Int?
     let fuseUnknownTokens: Bool
+    let byteFallback: Bool
+    let continuingPrefix: String
+    let endSuffix: String
+    let ignoreMerges: Bool
+    var hasAffixes: Bool { !continuingPrefix.isEmpty || !endSuffix.isEmpty }
 
     /// Pretoken → ids memo, shared across calls (see ``PretokenCache``).
     let cache = PretokenCache()
@@ -103,6 +108,9 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
 
         let vocab = try Vocabulary(vocab: vocabDict, addedTokens: addedTokens)
         self.vocab = vocab
+        continuingPrefix = tokenizerData.model.continuingSubwordPrefix.string(or: "")
+        endSuffix = tokenizerData.model.endOfWordSuffix.string(or: "")
+        ignoreMerges = tokenizerData.model.ignoreMerges.boolean(or: false)
 
         // Merge table. Strings that are not vocabulary entries get synthetic ids.
         var synthetic: [BinaryDistinctString: Int32] = [:]
@@ -124,13 +132,15 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
             let b = merge[1]
             let left = intern(a)
             let right = intern(b)
-            let merged = intern(a + b)
+            let merged = intern(a + String(b.droppingBytePrefix(continuingPrefix)))
             table.insert(left: left, right: right, rank: UInt32(rank), merged: merged)
         }
         merges = table
         symbolCount = Int(nextSynthetic)
 
-        var chunkingSafe = vocab.id(of: sentencePieceUnderline) != nil
+        var chunkingSafe =
+            vocab.id(of: sentencePieceUnderline) != nil && continuingPrefix.isEmpty && endSuffix.isEmpty
+            && !ignoreMerges
         var guards: [(bytes: [UInt8], offset: Int)] = []
         if chunkingSafe {
             var seen: Set<[UInt8]> = []
@@ -170,7 +180,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         hexaTokenIds = hexa
 
         // Special tokens.
-        if let unk = TokenizerModel.unknownToken(from: tokenizerConfig) {
+        if let unk = TokenizerModel.unknownToken(from: tokenizerConfig) ?? tokenizerData.model.unkToken.string() {
             unknownToken = unk
             unknownTokenId = vocab.id(of: unk)
         } else {
@@ -181,7 +191,8 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         eosTokenId = eosToken.flatMap { vocab.id(of: $0) }
         bosToken = addedTokenAsString(tokenizerConfig.bosToken)
         bosTokenId = bosToken.flatMap { vocab.id(of: $0) }
-        fuseUnknownTokens = tokenizerConfig.fuseUnk.boolean(or: false)
+        fuseUnknownTokens = tokenizerConfig.fuseUnk.boolean(or: tokenizerData.model.fuseUnk.boolean(or: false))
+        byteFallback = tokenizerData.model.byteFallback.boolean(or: true)
     }
 
     /// `<0x00>` … `<0xFF>`
@@ -286,6 +297,45 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
             symbols.append(Symbol(id: id, start: Int32(i), end: Int32(i + width)))
             i += width
         }
+    }
+
+    /// Used only for configured affixes or missing initial symbols. Resolve fallback and
+    /// pending unknowns before merges, matching tokenizers' BPE::merge_word.
+    func referenceSymbols(_ bytes: UnsafeBufferPointer<UInt8>, byteLevel: Bool, into symbols: inout [Symbol]) {
+        symbols.removeAll(keepingCapacity: true)
+        var pendingUnknown: Symbol?
+        var i = 0
+        while i < bytes.count {
+            let value: UInt32
+            let width: Int
+            if byteLevel {
+                value = ByteLevelAlphabet.byteToScalar[Int(bytes[i])]; width = 1
+            } else {
+                (value, width) = UTF8Cursor.decode(bytes, at: i)
+            }
+            let end = i + width
+            var spelling = String(Unicode.Scalar(value)!)
+            if i > 0 { spelling = continuingPrefix + spelling }
+            if end == bytes.count { spelling += endSuffix }
+            if let id = vocab.id(of: spelling) {
+                if let pendingUnknown { symbols.append(pendingUnknown) }
+                pendingUnknown = nil
+                symbols.append(Symbol(id: Int32(id), start: Int32(i), end: Int32(end)))
+            } else if byteFallback, spelling.utf8.allSatisfy({ hexaTokenIds[Int($0)] >= 0 }) {
+                for byte in spelling.utf8 {
+                    symbols.append(Symbol(id: hexaTokenIds[Int(byte)], start: Int32(i), end: Int32(end)))
+                }
+            } else if let unknownTokenId {
+                if let previous = pendingUnknown, fuseUnknownTokens {
+                    pendingUnknown = Symbol(id: previous.id, start: previous.start, end: Int32(end))
+                } else {
+                    if let pendingUnknown { symbols.append(pendingUnknown) }
+                    pendingUnknown = Symbol(id: Int32(unknownTokenId), start: Int32(i), end: Int32(end))
+                }
+            }
+            i = end
+        }
+        if let pendingUnknown { symbols.append(pendingUnknown) }
     }
 
     // MARK: - Merging
@@ -503,16 +553,31 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
                 return
             }
             let start = ids.count
+            if model.ignoreMerges {
+                let id: Int32
+                if byteLevel {
+                    id = Int32(model.vocab.id(of: ByteLevelAlphabet.encode(bytes)) ?? -1)
+                } else {
+                    id = model.vocab.id(of: bytes)
+                }
+                if id >= 0 {
+                    ids.append(Int(id))
+                    return
+                }
+            }
 
             if byteLevel {
                 model.byteLevelSymbols(bytes, into: &symbols)
             } else {
                 model.scalarSymbols(bytes, into: &symbols)
             }
+            if model.hasAffixes || symbols.contains(where: { $0.id < 0 }) {
+                model.referenceSymbols(bytes, byteLevel: byteLevel, into: &symbols)
+            }
             model.merge(&symbols, scratch: &scratch)
 
             for symbol in symbols {
-                if model.isVocabularyId(symbol.id), Int(symbol.id) != model.unknownTokenId {
+                if model.isVocabularyId(symbol.id) {
                     ids.append(Int(symbol.id))
                 } else {
                     appendFallback(bytes: bytes, symbol: symbol, byteLevel: byteLevel, into: &ids)
@@ -528,6 +593,10 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         private func appendFallback(
             bytes: UnsafeBufferPointer<UInt8>, symbol: Symbol, byteLevel: Bool, into ids: inout [Int]
         ) {
+            if !model.byteFallback {
+                if let unknown = model.unknownTokenId { ids.append(unknown) }
+                return
+            }
             let slice = UnsafeBufferPointer(rebasing: bytes[Int(symbol.start)..<Int(symbol.end)])
             fallbackBytes.removeAll(keepingCapacity: true)
             if byteLevel {
@@ -551,26 +620,11 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
 
     /// Tokenizes an already pre-tokenized (alphabet-encoded) chunk into token strings.
     func tokenize(text: String) -> [String] {
-        var symbols: [Symbol] = []
-        var scratch = MergeScratch()
-        scalarSymbols(Substring(text), into: &symbols)
-        merge(&symbols, scratch: &scratch)
-
-        var tokens: [String] = []
-        tokens.reserveCapacity(symbols.count)
-        var copy = text
-        copy.withUTF8 { bytes in
-            for symbol in symbols {
-                if isVocabularyId(symbol.id), Int(symbol.id) != unknownTokenId {
-                    tokens.append(vocab.token(Int(symbol.id))!)
-                } else {
-                    for b in bytes[Int(symbol.start)..<Int(symbol.end)] {
-                        tokens.append(Self.hexaTokenStrings[Int(b)])
-                    }
-                }
-            }
-        }
-        return tokens
+        let encoder = makeEncoder()
+        defer { encoder.finish() }
+        var ids: [Int] = []
+        encoder.encode(piece: Substring(text), byteLevel: false, into: &ids)
+        return ids.compactMap { vocab.token($0) }
     }
 
     /// Applies BPE merges to `token` and returns the resulting pieces (no fallback handling).

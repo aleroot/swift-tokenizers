@@ -15,6 +15,7 @@ struct AddedTokenSplitter: Sendable {
         let lstrip: Bool
         let rstrip: Bool
         let scalarCount: Int
+        var singleWord: Bool = false
     }
 
     /// A section of the input: plain text, or an added token.
@@ -73,6 +74,18 @@ struct AddedTokenSplitter: Sendable {
             return (ScalarClassifier.classify(value: v) == .whitespace, w)
         }
 
+        func accepts(_ index: Int32, at start: Int) -> Bool {
+            let token = tokens[Int(index)]
+            guard token.singleWord else { return true }
+            if start > 0 {
+                var previous = start - 1
+                while previous > 0, bytes[previous] & 0xC0 == 0x80 { previous -= 1 }
+                if Self.isWord(UTF8Cursor.decode(bytes, at: previous).0) { return false }
+            }
+            let next = start + token.content.utf8.count
+            return next == end || !Self.isWord(UTF8Cursor.decode(bytes, at: next).0)
+        }
+
         while i < end {
             if let single = singleCandidateByte {
                 // Jump to the next possible token start.
@@ -87,7 +100,7 @@ struct AddedTokenSplitter: Sendable {
             }
 
             var best: (token: Int32, contentEnd: Int)?
-            if let (index, matchEnd) = trie.longestMatch(bytes, from: i, filter: nil) {
+            if let (index, matchEnd) = trie.longestMatch(bytes, from: i, filter: { accepts($0, at: i) }) {
                 best = (index, matchEnd)
             }
 
@@ -104,7 +117,7 @@ struct AddedTokenSplitter: Sendable {
                     }
                     for start in probes.reversed() {
                         if let (index, matchEnd) = trie.longestMatch(
-                            bytes, from: start, filter: { self.tokens[Int($0)].lstrip })
+                            bytes, from: start, filter: { self.tokens[Int($0)].lstrip && accepts($0, at: start) })
                         {
                             if best == nil || tokens[Int(index)].scalarCount > tokens[Int(best!.token)].scalarCount {
                                 best = (index, matchEnd)
@@ -142,76 +155,37 @@ struct AddedTokenSplitter: Sendable {
         }
     }
 
-    /// Splits `text` into alternating text / token sections (empty text sections are omitted).
-    func split(_ text: String) -> [Section] {
-        var sections: [Section] = []
-        let utf8 = text.utf8
-        let scalars = text.unicodeScalars
-        var sectionStart = text.startIndex
-        var i = text.startIndex
-        let end = text.endIndex
-
-        while i < end {
-            let firstByte = utf8[i]
-            guard candidateFirstBytes[Int(firstByte)] else {
-                scalars.formIndex(after: &i)
-                continue
-            }
-
-            var best: (token: Int32, contentStart: String.Index, contentEnd: String.Index)?
-
-            // Direct match at i.
-            if let (index, matchEnd) = trie.longestMatch(text, from: i, filter: nil) {
-                best = (index, i, matchEnd)
-            }
-
-            // lstrip tokens may start after a run of whitespace beginning at i.
-            if hasLstrip, ScalarClassifier.classify(scalars[i]) == .whitespace {
-                var p = scalars.index(after: i)
-                var probes: [String.Index] = []
-                while p < end {
-                    probes.append(p)
-                    guard ScalarClassifier.classify(scalars[p]) == .whitespace else { break }
-                    scalars.formIndex(after: &p)
-                }
-                // Greedy `\s*`: prefer the latest start (longest whitespace prefix).
-                for start in probes.reversed() {
-                    if let (index, matchEnd) = trie.longestMatch(
-                        text, from: start, filter: { self.tokens[Int($0)].lstrip })
-                    {
-                        if best == nil || tokens[Int(index)].scalarCount > tokens[Int(best!.token)].scalarCount {
-                            best = (index, start, matchEnd)
-                        }
-                    }
-                }
-            }
-
-            guard let match = best else {
-                scalars.formIndex(after: &i)
-                continue
-            }
-
-            if sectionStart < i {
-                sections.append(.text(text[sectionStart..<i]))
-            }
-            let token = tokens[Int(match.token)]
-            sections.append(.token(text[match.contentStart..<match.contentEnd], id: token.id))
-
-            var next = match.contentEnd
-            if token.rstrip {
-                while next < end, ScalarClassifier.classify(scalars[next]) == .whitespace {
-                    scalars.formIndex(after: &next)
-                }
-            }
-            sectionStart = next
-            i = next
+    /// Rust's Unicode word boundary: alphabetic, marks, decimal numbers, connector
+    /// punctuation, and join controls. WordPiece punctuation rules are different.
+    private static func isWord(_ value: UInt32) -> Bool {
+        guard let scalar = Unicode.Scalar(value) else { return false }
+        if scalar.properties.isAlphabetic || value == 0x200C || value == 0x200D { return true }
+        switch scalar.properties.generalCategory {
+        case .nonspacingMark, .spacingMark, .enclosingMark, .decimalNumber, .connectorPunctuation: return true
+        default: return false
         }
-
-        if sectionStart < end {
-            sections.append(.text(text[sectionStart..<end]))
-        }
-        return sections
     }
+
+    /// Both pipelines share the same byte-exact matcher and word-boundary semantics.
+    func split(_ text: String) -> [Section] {
+        var copy = text
+        return copy.withUTF8 { bytes in
+            var sections: [ByteSection] = []
+            split(bytes: bytes, into: &sections)
+            return sections.map { section in
+                switch section {
+                case .text(let range):
+                    let start = text.utf8.index(text.utf8.startIndex, offsetBy: range.lowerBound)
+                    let end = text.utf8.index(start, offsetBy: range.count)
+                    return .text(text[start..<end])
+                case .token(let id):
+                    let token = tokens.first { $0.id == id }!
+                    return .token(Substring(token.content), id: id)
+                }
+            }
+        }
+    }
+
 }
 
 /// A byte trie whose nodes live in flat arrays; children resolved via a hash keyed on

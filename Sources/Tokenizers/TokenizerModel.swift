@@ -1,5 +1,5 @@
 // Resolves the tokenization model for a configuration: by Hugging Face `tokenizer_class`
-// name first, then by the authoritative `model.type` of `tokenizer.json`.
+// name only when the authoritative `model.type` of `tokenizer.json` is absent.
 
 import Foundation
 
@@ -39,29 +39,26 @@ enum TokenizerModel {
 
     /// Instantiates the model for `tokenizerConfig` / `tokenizerData`.
     ///
-    /// The `tokenizer_class` registry is consulted first (it carries model-family behaviour
-    /// such as BERT's basic tokenizer). Unregistered classes — new Hub classes appear
-    /// regularly — resolve through `tokenizer.json`'s own `model.type`, which is what the
-    /// `tokenizers` library itself uses. Only when neither is known does `strict` decide
-    /// between throwing and assuming BPE.
+    /// Serialized `model.type` is authoritative, including for generic Python tokenizer
+    /// classes. The class registry supports older files without a serialized model type.
     static func from(
         tokenizerConfig: Config,
         tokenizerData: Config,
         addedTokens: [String: Int],
         strict: Bool = true
     ) throws -> any TokenizingModel {
-        guard let tokenizerClassName = tokenizerConfig.tokenizerClass.string() else {
-            throw TokenizerError.missingTokenizerClassInConfig
-        }
-        let tokenizerName = tokenizerClassName.replacingOccurrences(of: "Fast", with: "")
-
+        let tokenizerName = tokenizerConfig.tokenizerClass.string()?.replacingOccurrences(of: "Fast", with: "")
         let tokenizerClass: any PreTrainedTokenizerModel.Type
-        if let registered = knownTokenizers[tokenizerName] {
-            tokenizerClass = registered
-        } else if let modelType = tokenizerData.model.type.string(), let byModelType = modelTypes[modelType] {
+        if let modelType = tokenizerData.model.type.string() {
+            guard let byModelType = modelTypes[modelType] else {
+                throw TokenizerError.unsupportedComponent("model `\(modelType)`")
+            }
             tokenizerClass = byModelType
+        } else if let tokenizerName, let registered = knownTokenizers[tokenizerName] {
+            tokenizerClass = registered
         } else if strict {
-            throw TokenizerError.unsupportedTokenizer(tokenizerName)
+            if let tokenizerName { throw TokenizerError.unsupportedTokenizer(tokenizerName) }
+            throw TokenizerError.missingTokenizerClassInConfig
         } else {
             tokenizerClass = BPETokenizer.self
         }

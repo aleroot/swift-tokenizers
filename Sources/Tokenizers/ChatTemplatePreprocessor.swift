@@ -29,6 +29,12 @@ import Foundation
 /// expression's string literal is never rewritten.
 enum ChatTemplatePreprocessor {
     static func preprocess(_ source: String) -> String {
+        // Jinja2's lexer normalizes source line endings and defaults
+        // keep_trailing_newline to false. Strip exactly one source newline;
+        // newlines emitted by expressions must remain untouched.
+        var source = source.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        if source.hasSuffix("\n") { source.removeLast() }
         guard source.contains("{#") || source.contains("{ ") || source.contains("{\n") || source.contains("{\t") else {
             return source
         }

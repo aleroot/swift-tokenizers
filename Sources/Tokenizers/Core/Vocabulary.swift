@@ -48,7 +48,7 @@ final class Vocabulary: Sendable {
         var maxId = -1
         var totalBytes = 0
         for (token, id) in entries {
-            guard id >= 0 else { throw TokenizerError.malformedVocab }
+            guard id >= 0, id < 64_000_000 else { throw TokenizerError.malformedVocab }
             if id > maxId { maxId = id }
             totalBytes += token.utf8.count
         }

@@ -293,14 +293,20 @@ struct TokenizerTests {
         }
     }
 
-    /// Deepseek needs a post-processor override to add a bos token as in the reference implementation
+    /// The legacy folder API honors the exported processor; the configuration factory
+    /// applies the Llama class override.
     @Test
     func deepSeekPostProcessor() async throws {
         let tokenizerOpt =
             try await HubFixtures.tokenizer(for: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B") as? PreTrainedTokenizer
         #expect(tokenizerOpt != nil)
         let tokenizer = tokenizerOpt!
-        #expect(tokenizer.encode(text: "Who are you?") == [151646, 15191, 525, 498, 30])
+        #expect(tokenizer.encode(text: "Who are you?") == [15191, 525, 498, 30])
+        #expect(tokenizer.encode(text: "") == [])
+        let configuration = try await HubFixtures.configuration(for: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
+        let classTokenizer = try AutoTokenizer.from(
+            tokenizerConfig: #require(configuration.tokenizerConfig), tokenizerData: configuration.tokenizerData)
+        #expect(classTokenizer.encode(text: "Who are you?") == [151646, 15191, 525, 498, 30])
     }
 
     /// Some Llama tokenizers already use a bos-prepending Template post-processor
@@ -315,13 +321,8 @@ struct TokenizerTests {
 
     @Test
     func localTokenizerFromPretrained() async throws {
-        let downloadDestination: URL = {
-            let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
-            return base.appending(component: "hf-local-pretrained-tests-downloads")
-        }()
-        if FileManager.default.fileExists(atPath: downloadDestination.path) {
-            try FileManager.default.removeItem(at: downloadDestination)
-        }
+        let downloadDestination = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hf-local-pretrained-tests-\(UUID().uuidString)")
         defer {
             try? FileManager.default.removeItem(at: downloadDestination)
         }

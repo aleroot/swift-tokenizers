@@ -53,6 +53,14 @@ public extension AutoTokenizer {
         guard let tokenizerConfig = configuration.tokenizerConfig else {
             throw TokenizerError.missingFile(modelFolder.appendingPathComponent("tokenizer_config.json"))
         }
+        // swift-transformers' folder API preserves the serialized post-processor, unlike
+        // its configuration factory. Rebuilding it here adds an extra BOS to exports such
+        // as DeepSeek-R1-Distill-Qwen. Keep the class's decoding policy in either path.
+        if tokenizerClass(for: tokenizerConfig) == LlamaPreTrainedTokenizer.self {
+            return try LlamaPreTrainedTokenizer(
+                tokenizerConfig: tokenizerConfig, tokenizerData: configuration.tokenizerData,
+                strict: strict, updatePostProcessor: false)
+        }
         return try from(tokenizerConfig: tokenizerConfig, tokenizerData: configuration.tokenizerData, strict: strict)
     }
 }
@@ -105,17 +113,36 @@ func llamaPostProcessorConfig(tokenizerConfig: Config) throws -> Config {
 
 /// Llama-family tokenizer (`LlamaTokenizer`, `CodeLlamaTokenizer`, `GemmaTokenizer`).
 ///
-/// `transformers` loads `tokenizer.json` verbatim for these models — the `legacy` flag only
+/// Transformers 4.57 fast tokenizers load `tokenizer.json` verbatim here — the `legacy` flag only
 /// affects conversion from a slow SentencePiece model — so no Metaspace pre-tokenizer is
-/// injected. The only adjustment is the post-processor rebuild performed by
-/// `LlamaTokenizerFast.__init__`.
+/// injected. Configuration construction rebuilds the post-processor as in
+/// `LlamaTokenizerFast.__init__`; folder loading preserves the exported processor for
+/// compatibility with swift-transformers' local-folder API.
 final class LlamaPreTrainedTokenizer: PreTrainedTokenizer, @unchecked Sendable {
+    // Python Llama construction removes the serialized SentencePiece normalizer.
+    // Preserve declared added-token spellings here; feeding the exported dummy prefix
+    // through decoding would introduce spaces between BOS/EOS tokens. Generic pipeline
+    // tokenizers still use the Rust normalized reverse lookup.
+    override class var decodesNormalizedAddedTokens: Bool { false }
+
     let isLegacy: Bool
 
-    required init(tokenizerConfig: Config, tokenizerData: Config, strict: Bool = true) throws {
+    required convenience init(tokenizerConfig: Config, tokenizerData: Config, strict: Bool = true) throws {
+        try self.init(
+            tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData,
+            strict: strict, updatePostProcessor: true)
+    }
+
+    init(tokenizerConfig: Config, tokenizerData: Config, strict: Bool, updatePostProcessor: Bool) throws {
         isLegacy = tokenizerConfig.legacy.boolean(or: true)
         var configDictionary = tokenizerData.dictionary(or: [:])
-        configDictionary["post_processor"] = try llamaPostProcessorConfig(tokenizerConfig: tokenizerConfig)
+        // Some exported Llama configs omit BOS metadata but provide a complete serialized
+        // processor. Upstream loads these; an implicit default must not make them unloadable.
+        if updatePostProcessor,
+            addedTokenAsString(tokenizerConfig.bosToken) != nil || tokenizerConfig.addBosToken.boolean() != nil
+        {
+            configDictionary["post_processor"] = try llamaPostProcessorConfig(tokenizerConfig: tokenizerConfig)
+        }
         try super.init(tokenizerConfig: tokenizerConfig, tokenizerData: Config(configDictionary), strict: strict)
     }
 }

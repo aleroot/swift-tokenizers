@@ -60,6 +60,9 @@ final class TemplateProcessing: PostProcessor, FastPostProcessor {
         pair = try require(config.pair.array(), "TemplateProcessing", field: "pair")
         singleItems = single.map(Self.item)
         pairItems = pair.map(Self.item)
+        guard !singleItems.contains(where: { if case .sequenceB = $0 { return true }; return false }) else {
+            throw TokenizerError.invalidConfiguration("TemplateProcessing single template references sequence B")
+        }
     }
 
     private static func item(_ config: Config) -> Item {
@@ -92,6 +95,23 @@ final class TemplateProcessing: PostProcessor, FastPostProcessor {
 
     func postProcess(ids: inout [Int], addSpecialTokens: Bool, resolve: (String) -> Int?) {
         // Fast path for the overwhelmingly common `[specials…] A [specials…]` shape.
+        let sequenceCount = singleItems.reduce(0) { count, item in
+            if case .sequenceA = item { return count + 1 }
+            return count
+        }
+        if sequenceCount != 1 {
+            let input = ids
+            ids.removeAll(keepingCapacity: true)
+            for item in singleItems {
+                switch item {
+                case .sequenceA: ids.append(contentsOf: input)
+                case let .special(token):
+                    if addSpecialTokens, let id = resolve(token) { ids.append(id) }
+                case .sequenceB, .ignored: break
+                }
+            }
+            return
+        }
         var prefix: [Int] = []
         var suffix: [Int] = []
         var seenA = false

@@ -7,13 +7,13 @@
 // in which the caller wrote the JSON. A Swift `Dictionary` has no insertion order, so a
 // naïve conversion (such as swift-jinja's `Value(any:)`) sorts keys
 // alphabetically and renders `{"function": {"description": …, "name": …}, "type": …}` —
-// a shape no model was trained on.
+// a different prompt despite equivalent JSON data.
 //
 // Tool specifications are not arbitrary JSON, though: they follow the OpenAI
 // function-calling schema, and `transformers.utils.get_json_schema` — the generator whose
-// output the chat templates were trained against — emits its keywords in one fixed order.
-// `Dictionary` inputs are therefore laid out in that canonical order, which reproduces the
-// Python rendering byte for byte for every standard tool definition. Keys that are not
+// output follows conventional schema ordering — provides the default ordering used here.
+// `Dictionary` inputs are laid out in that deterministic order. This does not establish
+// every model's training format or match arbitrary Python dictionary insertion order. Keys that are not
 // schema keywords, and the user-named children of `properties` / `arguments` / `$defs`,
 // have no canonical order; they keep the caller's order when it is available (see below)
 // and fall back to alphabetical otherwise.
@@ -77,6 +77,11 @@ enum ChatTemplateValue {
             // A Swift `Bool` (or a JSON boolean from JSONSerialization); must precede the
             // integer cases because `NSNumber(true) as? Int` succeeds.
             return .boolean(number.boolValue)
+        case let number as NSNumber:
+            let type = String(cString: number.objCType)
+            if type == "f" || type == "d" { return .double(number.doubleValue) }
+            if type == "Q", number.uint64Value > UInt64(Int.max) { return .double(number.doubleValue) }
+            return .int(number.intValue)
         case let bool as Bool:
             return .boolean(bool)
         case let int as Int:

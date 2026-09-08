@@ -5,6 +5,22 @@ import Testing
 
 @Suite("Normalizer Tests")
 struct NormalizerTests {
+    @Test("Strip preserves combining marks attached to boundary whitespace")
+    func stripCombiningMarks() {
+        // tokenizers 0.23.2 normalizers.Strip: whitespace is scalar-based, not grapheme-based.
+        for (input, both, left, right) in [
+            (" \u{3099} ", "\u{3099}", "\u{3099} ", " \u{3099}"),
+            (" \u{301} ", "\u{301}", "\u{301} ", " \u{301}"),
+            ("\u{a0}\u{301}\u{a0}", "\u{301}", "\u{301}\u{a0}", "\u{a0}\u{301}"),
+            ("a \u{3099} ", "a \u{3099}", "a \u{3099} ", "a \u{3099}"),
+        ] {
+            for (stripLeft, stripRight, expected) in [(true, true, both), (true, false, left), (false, true, right)] {
+                let normalizer = StripNormalizer(config: ["strip_left": Config(stripLeft), "strip_right": Config(stripRight)])
+                #expect(normalizer.normalize(text: input).utf8.elementsEqual(expected.utf8))
+            }
+        }
+    }
+
     @Test("Lowercase normalizer functionality")
     func lowercaseNormalizer() throws {
         let testCases: [(String, String)] = [
@@ -188,30 +204,12 @@ struct NormalizerTests {
         #expect(try NormalizerFactory.fromConfig(config: config) as? BertNormalizer != nil)
     }
 
-    @Test("Precompiled normalizer functionality")
+    @Test("Precompiled normalization requires the model's map")
     func precompiledNormalizer() throws {
-        let testCases: [(String, String)] = [
-            ("café", "café"),
-            ("François", "François"),
-            ("Ωmega", "Ωmega"),
-            ("über", "über"),
-            ("háček", "háček"),
-            ("Häagen-Dazs", "Häagen-Dazs"),
-            ("你好!", "你好!"),
-            ("𝔄𝔅ℭ⓵⓶⓷︷,︸,i⁹,i₉,㌀,¼", "ABC⓵⓶⓷{,},i9,i9,アパート,1⁄4"),
-            ("\u{00C5}", "\u{00C5}"),
-            ("™\u{001e}g", "TMg"),
-            ("full-width～tilde", "full-width～tilde"),
-        ]
-
-        for (arg, expect) in testCases {
-            let config = Config([String: Config]())
-            let normalizer = PrecompiledNormalizer(config: config)
-            #expect(normalizer.normalize(text: arg) == expect)
+        #expect(throws: TokenizerError.self) {
+            try NormalizerFactory.fromConfig(config: ["type": "Precompiled"])
         }
-
-        let config = Config(["type": NormalizerType.Precompiled.rawValue])
-        #expect(try NormalizerFactory.fromConfig(config: config) as? PrecompiledNormalizer != nil)
+        // Real map behavior is covered byte-for-byte by UpstreamComponentTests.
     }
 
     @Test("Strip accents normalizer functionality")
@@ -224,14 +222,14 @@ struct NormalizerTests {
             ("háček", "háček"),
             ("Häagen-Dazs", "Häagen-Dazs"),
             ("你好!", "你好!"),
-            ("𝔄𝔅ℭ⓵⓶⓷︷,︸,i⁹,i₉,㌀,¼", "ABC⓵⓶⓷{,},i9,i9,アパート,1⁄4"),
+            ("𝔄𝔅ℭ⓵⓶⓷︷,︸,i⁹,i₉,㌀,¼", "𝔄𝔅ℭ⓵⓶⓷︷,︸,i⁹,i₉,㌀,¼"),
             ("\u{00C5}", "\u{00C5}"),
         ]
 
         for (arg, expect) in testCases {
             let config = Config([String: Config]())
             let normalizer = StripAccentsNormalizer(config: config)
-            #expect(normalizer.normalize(text: arg) == expect)
+            #expect(normalizer.normalize(text: arg).utf8.elementsEqual(expect.utf8))
         }
 
         let config = Config(["type": NormalizerType.StripAccents.rawValue])

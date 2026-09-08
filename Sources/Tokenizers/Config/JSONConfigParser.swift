@@ -32,7 +32,8 @@ public enum JSONConfigError: Error, CustomStringConvertible, Sendable {
 
 public extension Config {
     /// Parses a JSON document. Accepts UTF-8 (with or without BOM) as well as UTF-16 LE/BE
-    /// documents that carry a byte order mark.
+    /// documents that carry a byte order mark. Like swift-transformers' file loader,
+    /// accepts trailing commas and non-finite numeric metadata (Inf/Infinity/NaN).
     init(jsonData data: Foundation.Data) throws {
         let utf8 = try Config.normalizeToUTF8(data)
         self = try utf8.withUnsafeBytes { raw -> Config in
@@ -122,7 +123,12 @@ struct JSONConfigParser {
         case UInt8(ascii: "n"):
             try expectLiteral("null")
             return Config()
+        case UInt8(ascii: "I"), UInt8(ascii: "N"):
+            return try parseNonFiniteNumber()
         case UInt8(ascii: "-"), UInt8(ascii: "0")...UInt8(ascii: "9"):
+            if bytes[pos] == UInt8(ascii: "-"), pos + 1 < bytes.count, bytes[pos + 1] == UInt8(ascii: "I") {
+                return try parseNonFiniteNumber()
+            }
             return try parseNumber()
         default:
             throw JSONConfigError.unexpectedCharacter(bytes[pos], offset: pos)
@@ -162,6 +168,11 @@ struct JSONConfigParser {
             let c = bytes[pos]
             if c == UInt8(ascii: ",") {
                 pos += 1
+                skipWhitespace()
+                if pos < bytes.count, bytes[pos] == UInt8(ascii: "}") {
+                    pos += 1
+                    return Config(dict)
+                }
                 continue
             }
             if c == UInt8(ascii: "}") {
@@ -192,6 +203,11 @@ struct JSONConfigParser {
             let c = bytes[pos]
             if c == UInt8(ascii: ",") {
                 pos += 1
+                skipWhitespace()
+                if pos < bytes.count, bytes[pos] == UInt8(ascii: "]") {
+                    pos += 1
+                    return Config(array)
+                }
                 continue
             }
             if c == UInt8(ascii: "]") {
@@ -215,6 +231,21 @@ struct JSONConfigParser {
 
     // MARK: - Numbers
 
+    private mutating func parseNonFiniteNumber() throws -> Config {
+        let start = pos
+        if bytes[pos] == UInt8(ascii: "-") { pos += 1 }
+        while pos < bytes.count, (0x41...0x5A).contains(bytes[pos]) || (0x61...0x7A).contains(bytes[pos]) {
+            pos += 1
+        }
+        let text = String(decoding: bytes[start..<pos], as: UTF8.self)
+        switch text {
+        case "Inf", "Infinity": return Config(Double.infinity)
+        case "-Inf", "-Infinity": return Config(-Double.infinity)
+        case "NaN": return Config(Double.nan)
+        default: throw JSONConfigError.invalidNumber(offset: start)
+        }
+    }
+
     private mutating func parseNumber() throws -> Config {
         let start = pos
         var negative = false
@@ -224,48 +255,59 @@ struct JSONConfigParser {
         }
         guard pos < bytes.count else { throw JSONConfigError.unexpectedEnd }
 
-        var isFloat = false
-        var magnitude: UInt64 = 0
-        var overflow = false
-        var sawDigit = false
-
-        while pos < bytes.count {
-            let c = bytes[pos]
-            if c >= UInt8(ascii: "0"), c <= UInt8(ascii: "9") {
-                sawDigit = true
-                if !overflow {
-                    let (m1, o1) = magnitude.multipliedReportingOverflow(by: 10)
-                    let (m2, o2) = m1.addingReportingOverflow(UInt64(c &- UInt8(ascii: "0")))
-                    if o1 || o2 { overflow = true } else { magnitude = m2 }
-                }
-                pos += 1
-            } else if c == UInt8(ascii: ".") || c == UInt8(ascii: "e") || c == UInt8(ascii: "E")
-                || c == UInt8(ascii: "+") || c == UInt8(ascii: "-")
-            {
-                isFloat = true
-                pos += 1
-            } else {
-                break
-            }
+        let integerStart = pos
+        guard bytes[pos] >= 0x30, bytes[pos] <= 0x39 else {
+            throw JSONConfigError.invalidNumber(offset: start)
         }
-        guard sawDigit else { throw JSONConfigError.invalidNumber(offset: start) }
+        if bytes[pos] == 0x30 {
+            pos += 1
+            if pos < bytes.count, bytes[pos] >= 0x30, bytes[pos] <= 0x39 {
+                throw JSONConfigError.invalidNumber(offset: start)
+            }
+        } else {
+            while pos < bytes.count, bytes[pos] >= 0x30, bytes[pos] <= 0x39 { pos += 1 }
+        }
+        let integerEnd = pos
+        var isFloat = false
+        if pos < bytes.count, bytes[pos] == UInt8(ascii: ".") {
+            isFloat = true
+            pos += 1
+            let digitsStart = pos
+            while pos < bytes.count, bytes[pos] >= 0x30, bytes[pos] <= 0x39 { pos += 1 }
+            guard pos > digitsStart else { throw JSONConfigError.invalidNumber(offset: start) }
+        }
+        if pos < bytes.count, bytes[pos] == UInt8(ascii: "e") || bytes[pos] == UInt8(ascii: "E") {
+            isFloat = true
+            pos += 1
+            if pos < bytes.count, bytes[pos] == UInt8(ascii: "+") || bytes[pos] == UInt8(ascii: "-") { pos += 1 }
+            let digitsStart = pos
+            while pos < bytes.count, bytes[pos] >= 0x30, bytes[pos] <= 0x39 { pos += 1 }
+            guard pos > digitsStart else { throw JSONConfigError.invalidNumber(offset: start) }
+        }
 
-        if !isFloat, !overflow {
+        if !isFloat {
+            var magnitude: UInt64 = 0
+            for i in integerStart..<integerEnd {
+                let (product, multiplicationOverflow) = magnitude.multipliedReportingOverflow(by: 10)
+                let (sum, additionOverflow) = product.addingReportingOverflow(UInt64(bytes[i] - 0x30))
+                if multiplicationOverflow || additionOverflow { return try floatingFallback(start) }
+                magnitude = sum
+            }
             if negative {
-                guard magnitude <= UInt64(Int.max) + 1 else { return floatingFallback(start) }
+                guard magnitude <= UInt64(Int.max) + 1 else { return try floatingFallback(start) }
                 return Config(magnitude == UInt64(Int.max) + 1 ? Int.min : -Int(magnitude))
             }
-            guard magnitude <= UInt64(Int.max) else { return floatingFallback(start) }
+            guard magnitude <= UInt64(Int.max) else { return try floatingFallback(start) }
             return Config(Int(magnitude))
         }
-        return floatingFallback(start)
+        return try floatingFallback(start)
     }
 
-    private func floatingFallback(_ start: Int) -> Config {
+    private func floatingFallback(_ start: Int) throws -> Config {
         let slice = UnsafeBufferPointer(rebasing: bytes[start..<pos])
         let text = String(decoding: slice, as: UTF8.self)
-        if let d = Double(text) { return Config(d) }
-        return Config()
+        guard let d = Double(text), d.isFinite else { throw JSONConfigError.invalidNumber(offset: start) }
+        return Config(d)
     }
 
     // MARK: - Strings
@@ -286,6 +328,7 @@ struct JSONConfigParser {
                 hasEscape = true
                 break
             }
+            guard c >= 0x20 else { throw JSONConfigError.unexpectedCharacter(c, offset: i) }
             i += 1
         }
 
@@ -293,7 +336,13 @@ struct JSONConfigParser {
             guard i < n else { throw JSONConfigError.unexpectedEnd }
             let slice = UnsafeBufferPointer(rebasing: bytes[start..<i])
             pos = i + 1
-            return String(decoding: slice, as: UTF8.self)
+            let string = String(decoding: slice, as: UTF8.self)
+            // Foundation's encoding initializer consumes a leading BOM even inside a
+            // vocabulary key. Preserve every scalar and reject repaired UTF-8 instead.
+            guard string.utf8.elementsEqual(slice) else {
+                throw JSONConfigError.invalidUTF8(offset: start)
+            }
+            return string
         }
 
         // Slow path with escapes: copy into scratch buffer.
@@ -304,7 +353,11 @@ struct JSONConfigParser {
             let c = bytes[pos]
             if c == UInt8(ascii: "\"") {
                 pos += 1
-                return String(decoding: scratch, as: UTF8.self)
+                let string = String(decoding: scratch, as: UTF8.self)
+                guard string.utf8.elementsEqual(scratch) else {
+                    throw JSONConfigError.invalidUTF8(offset: start)
+                }
+                return string
             }
             if c == UInt8(ascii: "\\") {
                 pos += 1
@@ -330,20 +383,20 @@ struct JSONConfigParser {
                             if low >= 0xDC00, low <= 0xDFFF {
                                 scalar = 0x10000 + ((scalar - 0xD800) << 10) + (low - 0xDC00)
                             } else {
-                                appendUTF8(0xFFFD)
-                                scalar = low
+                                throw JSONConfigError.invalidEscape(offset: pos - 4)
                             }
                         } else {
-                            scalar = 0xFFFD
+                            throw JSONConfigError.invalidEscape(offset: pos)
                         }
                     } else if scalar >= 0xDC00, scalar <= 0xDFFF {
-                        scalar = 0xFFFD
+                        throw JSONConfigError.invalidEscape(offset: pos - 4)
                     }
                     appendUTF8(scalar)
                 default:
                     throw JSONConfigError.invalidEscape(offset: pos - 1)
                 }
             } else {
+                guard c >= 0x20 else { throw JSONConfigError.unexpectedCharacter(c, offset: pos) }
                 scratch.append(c)
                 pos += 1
             }

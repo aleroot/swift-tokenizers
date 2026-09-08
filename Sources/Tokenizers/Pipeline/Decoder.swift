@@ -16,6 +16,8 @@ public extension Decoder {
 enum DecoderType: String {
     case Sequence
     case WordPiece
+    case BPEDecoder
+    case CTC
     case ByteLevel
     case Replace
     case ByteFallback
@@ -36,6 +38,8 @@ struct DecoderFactory {
         case .Fuse: return FuseDecoder(config: config)
         case .Strip: return try StripDecoder(config: config)
         case .Metaspace: return MetaspaceDecoder(config: config)
+        case .BPEDecoder: return BPEDecoder(config: config)
+        case .CTC: return CTCDecoder(config: config)
         case .WordPiece: return try WordPieceDecoder(config: config)
         default: throw TokenizerError.unsupportedComponent("decoder `\(typeName)`")
         }
@@ -46,11 +50,6 @@ final class WordPieceDecoder: Decoder {
     let prefix: String
     let cleanup: Bool
 
-    /// https://github.com/huggingface/tokenizers/blob/main/tokenizers/src/decoders/wordpiece.rs#L31
-    /// (A compile-time constant pattern: compilation cannot fail.)
-    private static let cleanupRegex = try! NSRegularExpression(
-        pattern: "\\s(\\.|\\?|\\!|\\,|'\\s|n't|'m|'s|'ve|'re)", options: [])
-
     required init(config: Config) throws {
         prefix = try require(config.prefix.string(), "WordPiece decoder", field: "prefix")
         cleanup = config.cleanup.boolean(or: false)
@@ -60,18 +59,18 @@ final class WordPieceDecoder: Decoder {
         guard let first = tokens.first else { return [] }
         var result: [String] = []
         result.reserveCapacity(tokens.count)
-        result.append(cleanup ? cleanUpTokenization(first) : first)
+        result.append(cleanup ? Self.cleanUpTokenization(first) : first)
         for token in tokens.dropFirst() {
             let piece = token.hasBytePrefix(prefix) ? String(token.droppingBytePrefix(prefix)) : " \(token)"
-            result.append(cleanup ? cleanUpTokenization(piece) : piece)
+            result.append(cleanup ? Self.cleanUpTokenization(piece) : piece)
         }
         return result
     }
 
-    private func cleanUpTokenization(_ token: String) -> String {
-        let range = NSRange(location: 0, length: token.utf16.count)
-        return Self.cleanupRegex.stringByReplacingMatches(in: token, options: [], range: range, withTemplate: "$1")
-            .replacingOccurrences(of: " do not", with: " don't")
+    static func cleanUpTokenization(_ token: String) -> String {
+        // Keep the Rust replacement order and per-token semantics while avoiding eleven
+        // Foundation searches and allocations for each ordinary vocabulary piece.
+        TokenizationCleanup.cleanUp(token, wordPiece: true)
     }
 }
 
@@ -158,8 +157,8 @@ final class ByteFallbackDecoder: Decoder {
 
         func flush() {
             guard !bytes.isEmpty else { return }
-            if let string = String(bytes: bytes, encoding: .utf8) {
-                newTokens.append(string)
+            if String(bytes: bytes, encoding: .utf8) != nil {
+                newTokens.append(String(decoding: bytes, as: UTF8.self))
             } else {
                 for _ in bytes { newTokens.append("\u{FFFD}") }
             }
@@ -260,5 +259,42 @@ final class MetaspaceDecoder: Decoder {
             replaced[0] = String(replaced[0].droppingBytePrefix(" "))
         }
         return replaced
+    }
+}
+
+/// Character BPE end-of-word suffix decoding (HF tokenizers decoders/bpe.rs).
+final class BPEDecoder: Decoder {
+    let suffix: String
+    required init(config: Config) { suffix = config.suffix.string(or: "</w>") }
+    func decode(tokens: [String]) -> [String] {
+        tokens.enumerated().map { index, token in
+            token.replacingBytes(of: suffix, with: index == tokens.count - 1 ? "" : " ")
+        }
+    }
+}
+
+/// CTC collapse happens before pad removal, so pad-separated repeats survive.
+final class CTCDecoder: Decoder {
+    let pad: String
+    let delimiter: String
+    let cleanup: Bool
+    required init(config: Config) {
+        pad = config.padToken.string(or: "<pad>")
+        delimiter = config.wordDelimiterToken.string(or: "|")
+        cleanup = config.cleanup.boolean(or: true)
+    }
+    func decode(tokens: [String]) -> [String] {
+        var previous: String?
+        var result: [String] = []
+        for token in tokens {
+            defer { previous = token }
+            if let previous, previous.utf8.elementsEqual(token.utf8) { continue }
+            var piece = token.replacingBytes(of: pad, with: "")
+            if cleanup {
+                piece = WordPieceDecoder.cleanUpTokenization(piece).replacingBytes(of: delimiter, with: " ")
+            }
+            if !piece.isEmpty { result.append(piece) }
+        }
+        return result
     }
 }

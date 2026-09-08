@@ -44,7 +44,7 @@ struct NormalizerFactory {
         case .NFKD: return NFKDNormalizer(config: config)
         case .NFKC: return NFKCNormalizer(config: config)
         case .Bert, .BertNormalizer: return BertNormalizer(config: config)
-        case .Precompiled: return PrecompiledNormalizer(config: config)
+        case .Precompiled: return try PrecompiledNormalizer(config: config)
         case .StripAccents: return StripAccentsNormalizer(config: config)
         case .Strip: return StripNormalizer(config: config)
         default: throw TokenizerError.unsupportedComponent("normalizer `\(typeName)`")
@@ -76,7 +76,7 @@ final class PrependNormalizer: Normalizer {
         prepend = config.prepend.string(or: "")
     }
 
-    func normalize(text: String) -> String { prepend + text }
+    func normalize(text: String) -> String { text.isEmpty ? text : prepend + text }
 }
 
 final class ReplaceNormalizer: Normalizer {
@@ -137,8 +137,21 @@ final class BertNormalizer: Normalizer {
             return normalizeASCII(text)
         }
         var output = text
-        if shouldCleanText { output = cleanText(output) }
-        if shouldHandleChineseChars { output = handleChineseChars(output) }
+        if shouldCleanText || shouldHandleChineseChars {
+            var bytes: [UInt8] = []
+            bytes.reserveCapacity(text.utf8.count + 16)
+            for scalar in text.unicodeScalars {
+                if shouldCleanText {
+                    if scalar.value == 0 || scalar.value == 0xFFFD || isControl(scalar) { continue }
+                    if isWhitespace(scalar) { bytes.append(32); continue }
+                }
+                let chinese = shouldHandleChineseChars && scalar.isCJKUnifiedIdeograph
+                if chinese { bytes.append(32) }
+                bytes.append(contentsOf: scalar.utf8)
+                if chinese { bytes.append(32) }
+            }
+            output = String(decoding: bytes, as: UTF8.self)
+        }
         if shouldStripAccents { output = Self.stripAccents(output) }
         if shouldLowercase { output = output.lowercased() }
         return output
@@ -166,19 +179,6 @@ final class BertNormalizer: Normalizer {
         }
     }
 
-    /// Mirrors `tokenizers`' `do_clean_text`: drops NUL, U+FFFD and control/format characters
-    /// (Cc/Cf/Cs/Co, except tab/newline/CR) and maps every whitespace to a plain space.
-    private func cleanText(_ text: String) -> String {
-        var out = ""
-        out.reserveCapacity(text.utf8.count)
-        for scalar in text.unicodeScalars {
-            let v = scalar.value
-            if v == 0 || v == 0xFFFD || isControl(scalar) { continue }
-            out.unicodeScalars.append(isWhitespace(scalar) ? " " : scalar)
-        }
-        return out
-    }
-
     private func isWhitespace(_ c: Unicode.Scalar) -> Bool {
         if c.value == 0x09 || c.value == 0x0A || c.value == 0x0D { return true }
         if c.value < 0x80 { return c.value == 0x20 }
@@ -195,27 +195,6 @@ final class BertNormalizer: Normalizer {
         }
     }
 
-    private func handleChineseChars(_ text: String) -> String {
-        var hasCJK = false
-        for scalar in text.unicodeScalars where scalar.isCJKUnifiedIdeograph {
-            hasCJK = true
-            break
-        }
-        guard hasCJK else { return text }
-        var out = ""
-        out.reserveCapacity(text.utf8.count + 16)
-        for scalar in text.unicodeScalars {
-            if scalar.isCJKUnifiedIdeograph {
-                out.unicodeScalars.append(" ")
-                out.unicodeScalars.append(scalar)
-                out.unicodeScalars.append(" ")
-            } else {
-                out.unicodeScalars.append(scalar)
-            }
-        }
-        return out
-    }
-
     /// NFD-decompose then drop every nonspacing mark (general category Mn), matching HF's
     /// `_run_strip_accents`.
     static func stripAccents(_ text: String) -> String {
@@ -227,12 +206,12 @@ final class BertNormalizer: Normalizer {
             break
         }
         guard hasMark else { return decomposed }
-        var out = ""
-        out.reserveCapacity(decomposed.utf8.count)
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(decomposed.utf8.count)
         for scalar in decomposed.unicodeScalars where scalar.properties.generalCategory != .nonspacingMark {
-            out.unicodeScalars.append(scalar)
+            bytes.append(contentsOf: scalar.utf8)
         }
-        return out
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 
@@ -250,43 +229,133 @@ extension Unicode.Scalar {
     }
 }
 
+/// SentencePiece's serialized Darts map, following spm_precompiled 0.1.3.
+/// The map is model data: substituting Foundation NFKC changes token IDs.
 final class PrecompiledNormalizer: Normalizer {
-    // Simplified implementation (mirrors transformers.js): NFKC plus SentencePiece's
-    // control/separator handling. The precompiled charsmap itself is not interpreted.
-    required init(config: Config) {}
+    private let trie: [UInt32]
+    private let replacements: [UInt8]
+    private let asciiReplacements: [[UInt8]?]
+    private let crlfReplacement: [UInt8]?
+
+    required init(config: Config) throws {
+        guard let encoded = config.precompiledCharsmap.string(), let data = Data(base64Encoded: encoded),
+            data.count >= 8
+        else {
+            throw TokenizerError.invalidConfiguration("Precompiled normalizer requires a valid base64 charsmap")
+        }
+        let bytes = Array(data)
+        func uint32(at i: Int) -> UInt32 {
+            UInt32(bytes[i]) | UInt32(bytes[i + 1]) << 8 | UInt32(bytes[i + 2]) << 16 | UInt32(bytes[i + 3]) << 24
+        }
+        let size = Int(uint32(at: 0))
+        guard size >= 4, size % 4 == 0, size <= bytes.count - 4 else {
+            throw TokenizerError.invalidConfiguration("Invalid Precompiled trie size")
+        }
+        trie = stride(from: 4, to: size + 4, by: 4).map { uint32(at: $0) }
+        replacements = Array(bytes[(size + 4)...])
+        guard replacements.last == 0, String(bytes: replacements, encoding: .utf8) != nil else {
+            throw TokenizerError.invalidConfiguration("Invalid Precompiled replacement table")
+        }
+        guard Self.offset(trie[0]) < trie.count else {
+            throw TokenizerError.invalidConfiguration("Invalid Precompiled root offset")
+        }
+        let trie = self.trie
+        let replacements = self.replacements
+        asciiReplacements = (0..<128).map { value in
+            Self.replacement(for: [UInt8(value)], trie: trie, replacements: replacements).map(Array.init)
+        }
+        crlfReplacement = Self.replacement(for: [UInt8(13), 10], trie: trie, replacements: replacements).map(Array.init)
+    }
+
+    @inline(__always) private static func offset(_ unit: UInt32) -> Int {
+        Int(unit >> 10) << Int((unit & (1 << 9)) >> 6)
+    }
+
+    /// Returns the first prefix match, as the reference does (not the longest match).
+    private static func replacement<C: Collection>(
+        for bytes: C, trie: [UInt32], replacements: [UInt8]
+    ) -> ArraySlice<UInt8>? where C.Element == UInt8 {
+        var node = Self.offset(trie[0])
+        for byte in bytes {
+            if byte == 0 { break }
+            node ^= Int(byte)
+            guard node < trie.count else { return nil }
+            let unit = trie[node]
+            guard unit & 0x800000ff == UInt32(byte) else { return nil }
+            node ^= Self.offset(unit)
+            if unit & 0x100 != 0 {
+                guard node < trie.count else { return nil }
+                let start = Int(trie[node] & 0x7fffffff)
+                guard start < replacements.count else { return nil }
+                var end = start
+                while end < replacements.count, replacements[end] != 0 { end += 1 }
+                return replacements[start..<end]
+            }
+        }
+        return nil
+    }
+
+    private func replacement<C: Collection>(for bytes: C) -> ArraySlice<UInt8>? where C.Element == UInt8 {
+        Self.replacement(for: bytes, trie: trie, replacements: replacements)
+    }
 
     func normalize(text: String) -> String {
-        // SentencePiece's nmt_nfkc charsmap leaves U+FF5E (FULLWIDTH TILDE) untouched, while NFKC
-        // would fold it to "~". Normalize the segments between tildes independently.
-        var result = ""
-        var segment = ""
-        func flush() {
-            if !segment.isEmpty {
-                result += segment.precomposedStringWithCompatibilityMapping
-                segment = ""
+        // Most prompts are ASCII. Reuse model-specific mappings without constructing a
+        // Character/String per scalar; unchanged text needs no output allocation.
+        var input = text
+        if let ascii = input.withUTF8({ bytes -> String? in
+            guard bytes.allSatisfy({ $0 < 128 }) else { return nil }
+            guard bytes.contains(where: { asciiReplacements[Int($0)] != nil }) else { return text }
+            var output: [UInt8] = []
+            output.reserveCapacity(bytes.count)
+            var i = 0
+            while i < bytes.count {
+                if bytes[i] == 13, i + 1 < bytes.count, bytes[i + 1] == 10, let crlfReplacement {
+                    output.append(contentsOf: crlfReplacement)
+                    i += 2
+                } else {
+                    if let mapped = asciiReplacements[Int(bytes[i])] {
+                        output.append(contentsOf: mapped)
+                    } else {
+                        output.append(bytes[i])
+                    }
+                    i += 1
+                }
+            }
+            return String(decoding: output, as: UTF8.self)
+        }) {
+            return ascii
+        }
+        var output: [UInt8] = []
+        output.reserveCapacity(text.utf8.count)
+        for grapheme in text {
+            let chunk = String(grapheme)
+            if chunk.utf8.count < 6, let mapped = replacement(for: chunk.utf8) {
+                output.append(contentsOf: mapped)
+            } else {
+                for scalar in chunk.unicodeScalars {
+                    let bytes = scalar.utf8
+                    output.append(contentsOf: replacement(for: bytes) ?? ArraySlice(bytes))
+                }
             }
         }
-        for scalar in text.unicodeScalars {
-            switch scalar.value {
-            case 0x0001...0x0008, 0x000B, 0x000E...0x001F, 0x007F, 0x008F, 0x009F:
-                break  // non-printing control characters
-            case 0x0009, 0x000A, 0x000C, 0x000D, 0x1680, 0x200B...0x200F, 0x2028, 0x2029, 0x2581, 0xFEFF, 0xFFFD:
-                segment.append(" ")  // separators
-            case 0xFF5E:
-                flush()
-                result.unicodeScalars.append(scalar)
-            default:
-                segment.unicodeScalars.append(scalar)
-            }
-        }
-        flush()
-        return result
+        return String(decoding: output, as: UTF8.self)
     }
 }
 
 final class StripAccentsNormalizer: Normalizer {
     required init(config: Config) {}
-    func normalize(text: String) -> String { text.precomposedStringWithCompatibilityMapping }
+    func normalize(text: String) -> String {
+        // Standalone StripAccents removes marks without decomposing precomposed letters.
+        String(
+            String.UnicodeScalarView(
+                text.unicodeScalars.filter {
+                    switch $0.properties.generalCategory {
+                    case .nonspacingMark, .spacingMark, .enclosingMark: return false
+                    default: return true
+                    }
+                }))
+    }
 }
 
 final class StripNormalizer: Normalizer {
@@ -299,12 +368,14 @@ final class StripNormalizer: Normalizer {
     }
 
     func normalize(text: String) -> String {
-        var result = Substring(text)
+        // Rust trims Unicode scalar values. A Swift Character may combine whitespace
+        // with an accent; removing that whole grapheme would silently delete the accent.
+        var result = text.unicodeScalars[...]
         if leftStrip {
-            result = result.drop(while: { $0.isWhitespace })
+            result = result.drop(while: { $0.properties.isWhitespace })
         }
         if rightStrip {
-            while let last = result.last, last.isWhitespace {
+            while let last = result.last, last.properties.isWhitespace {
                 result.removeLast()
             }
         }
