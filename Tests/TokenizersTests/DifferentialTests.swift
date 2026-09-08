@@ -1,0 +1,194 @@
+// Differential testing over ~300 adversarial inputs (`scripts/differential_corpus.py`) for
+// 24 tokenizers against two references:
+//
+// * `Resources/differential/hf__*.json` — ground truth produced by Hugging Face `transformers`
+//   (Rust `tokenizers` core) via `scripts/hf_golden.py`. We must match exactly.
+// * `Resources/differential/upstream__*.json` — swift-transformers' output. Wherever we differ from
+//   it, we must agree with Hugging Face: every deviation is a documented correctness fix,
+//   never a regression.
+
+import Foundation
+import Testing
+
+@testable import Tokenizers
+
+@Suite("Differential vs Hugging Face & swift-transformers")
+struct DifferentialTests {
+    struct HFRecord: Decodable {
+        let text: String
+        let ids: [Int]
+        let idsNoSpecial: [Int]
+        let decoded: String
+        let decodedSkipSpecial: String
+    }
+
+    struct UpstreamRecord: Decodable {
+        let text: String
+        let tokens: [String]
+        let ids: [Int]
+        let idsNoSpecial: [Int]
+        let decoded: String
+        let decodedSkipSpecial: String
+    }
+
+    static let models = [
+        "coreml-projects/Llama-2-7b-chat-coreml",
+        "distilbert/distilbert-base-multilingual-cased",
+        "distilgpt2",
+        "openai/whisper-large-v2",
+        "openai/whisper-tiny.en",
+        "pcuenq/Llama-3.2-1B-Instruct-tokenizer",
+        "t5-base",
+        "tiiuae/falcon-7b",
+        "pcuenq/gemma-tokenizer",
+        "microsoft/phi-4",
+        "mlx-community/Phi-3-mini-4k-instruct-4bit-no-q-embed",
+        "google-t5/t5-small",
+        "huggyllama/llama-7b",
+        "intfloat/multilingual-e5-small",
+        "FacebookAI/xlm-roberta-base",
+        "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+        "google-bert/bert-base-uncased",
+        "BAAI/bge-small-en-v1.5",
+        "FacebookAI/roberta-base",
+        "mlx-community/Ministral-3-3B-Instruct-2512-4bit",
+        "Qwen/Qwen3-0.6B",
+        "mlx-community/Qwen2.5-7B-Instruct-4bit",
+        "mlx-community/Mistral-7B-Instruct-v0.3-4bit",
+        "microsoft/Phi-3-mini-128k-instruct",
+    ]
+
+    static func resourceName(_ model: String) -> String {
+        model.replacingOccurrences(of: "/", with: "__")
+    }
+
+    static func loadHF(_ model: String) throws -> [HFRecord]? {
+        guard let url = Bundle.module.url(forResource: "hf__" + resourceName(model), withExtension: "json") else {
+            return nil
+        }
+        return try JSONDecoder().decode([HFRecord].self, from: Data(contentsOf: url))
+    }
+
+    static func loadUpstream(_ model: String) throws -> [UpstreamRecord] {
+        guard let url = Bundle.module.url(forResource: "upstream__" + resourceName(model), withExtension: "json") else {
+            throw HubFixtures.FixtureError.unsupportedTokenizer
+        }
+        return try JSONDecoder().decode([UpstreamRecord].self, from: Data(contentsOf: url))
+    }
+
+    // MARK: - Hugging Face ground truth
+
+    @Test(arguments: models)
+    func matchesHuggingFace(model: String) async throws {
+        guard let records = try Self.loadHF(model) else {
+            // No HF golden for this model (transformers cannot load it); covered by the upstream test.
+            return
+        }
+        let tokenizer = try await HubFixtures.preTrainedTokenizer(for: model)
+        #expect(records.count > 250)
+
+        var mismatches: [String] = []
+        var skipped = 0
+        for record in records {
+            // Legacy Llama-2 configs declare special tokens `normalized: true`; Hugging Face then
+            // matches them inside the *normalized* text with surprising results (e.g. a trailing
+            // `</s>` is not recognised). We match added tokens on raw text like swift-transformers.
+            if tokenizer.legacyNormalizedAddedTokens.contains(where: { record.text.contains($0) }) {
+                skipped += 1
+                continue
+            }
+            let ids = tokenizer.encode(text: record.text)
+            if ids != record.ids {
+                mismatches.append("encode(\(record.text.debugDescription)): got \(ids) expected \(record.ids)")
+                continue
+            }
+            let noSpecial = tokenizer.encode(text: record.text, addSpecialTokens: false)
+            if noSpecial != record.idsNoSpecial {
+                mismatches.append(
+                    "encode(noSpecial)(\(record.text.debugDescription)): got \(noSpecial) expected \(record.idsNoSpecial)"
+                )
+            }
+            let decoded = tokenizer.decode(tokens: ids)
+            if decoded != record.decoded {
+                mismatches.append(
+                    "decode(\(record.text.debugDescription)): got \(decoded.debugDescription) expected \(record.decoded.debugDescription)"
+                )
+            }
+            let decodedSkip = tokenizer.decode(tokens: ids, skipSpecialTokens: true)
+            if decodedSkip != record.decodedSkipSpecial {
+                mismatches.append(
+                    "decode(skip)(\(record.text.debugDescription)): got \(decodedSkip.debugDescription) expected \(record.decodedSkipSpecial.debugDescription)"
+                )
+            }
+        }
+        #expect(skipped < 60, "too many records skipped for \(model)")
+        if !mismatches.isEmpty {
+            let summary = Array(mismatches.prefix(10)).joined(separator: "\n")
+            Issue.record(Comment(rawValue: "\(model): \(mismatches.count) mismatches vs Hugging Face\n\(summary)"))
+        }
+    }
+
+    // MARK: - swift-transformers compatibility
+
+    @Test(arguments: models)
+    func matchesUpstreamOrHuggingFace(model: String) async throws {
+        let tokenizer = try await HubFixtures.preTrainedTokenizer(for: model)
+        let upstream = try Self.loadUpstream(model)
+        let hf = try Self.loadHF(model)
+        var hfByText: [String: HFRecord] = [:]
+        for record in hf ?? [] { hfByText[record.text] = record }
+        #expect(upstream.count > 250)
+
+        var regressions: [String] = []
+        var deviations = 0
+
+        func check<T: Equatable>(_ label: String, text: String, ours: T, upstream: T, hf: T?) {
+            if ours == upstream { return }
+            if let hf, ours == hf {
+                deviations += 1  // we differ from swift-transformers but agree with Hugging Face
+                return
+            }
+            regressions.append(
+                "\(label)(\(text.debugDescription)): got \(ours) upstream \(upstream) hf \(hf.map { "\($0)" } ?? "n/a")"
+            )
+        }
+
+        for record in upstream {
+            let hfRecord = hfByText[record.text]
+            let ids = tokenizer.encode(text: record.text)
+            check("encode", text: record.text, ours: ids, upstream: record.ids, hf: hfRecord?.ids)
+            check(
+                "encode(noSpecial)", text: record.text,
+                ours: tokenizer.encode(text: record.text, addSpecialTokens: false),
+                upstream: record.idsNoSpecial, hf: hfRecord?.idsNoSpecial
+            )
+            // `tokenize` has no HF counterpart; it must match upstream whenever the ids match.
+            if ids == record.ids {
+                let tokens = tokenizer.tokenize(text: record.text)
+                if tokens != record.tokens {
+                    regressions.append(
+                        "tokenize(\(record.text.debugDescription)): got \(tokens) upstream \(record.tokens)")
+                }
+            }
+            // Decode comparisons need a usable HF reference; for texts containing legacy
+            // `normalized: true` special tokens neither reference is reliable (see the HF test).
+            if tokenizer.legacyNormalizedAddedTokens.contains(where: { record.text.contains($0) }) { continue }
+            check(
+                "decode", text: record.text, ours: tokenizer.decode(tokens: ids), upstream: record.decoded,
+                hf: hfRecord?.decoded)
+            check(
+                "decode(skip)", text: record.text, ours: tokenizer.decode(tokens: ids, skipSpecialTokens: true),
+                upstream: record.decodedSkipSpecial, hf: hfRecord?.decodedSkipSpecial
+            )
+        }
+
+        if !regressions.isEmpty {
+            let summary = Array(regressions.prefix(10)).joined(separator: "\n")
+            Issue.record(
+                Comment(
+                    rawValue:
+                        "\(model): \(regressions.count) unexplained differences vs swift-transformers (\(deviations) HF-confirmed fixes)\n\(summary)"
+                ))
+        }
+    }
+}

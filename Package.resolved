@@ -1,0 +1,24 @@
+{
+  "originHash" : "5421af811dc43f730a376424ccf5b918176f20133ab3d22d51347ac5ade4a7e7",
+  "pins" : [
+    {
+      "identity" : "swift-collections",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/apple/swift-collections.git",
+      "state" : {
+        "revision" : "a0cb0954ecb21e4e31b0070e6ed5674e8556685a",
+        "version" : "1.6.0"
+      }
+    },
+    {
+      "identity" : "swift-jinja",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/huggingface/swift-jinja.git",
+      "state" : {
+        "revision" : "12ea4955e380dae6b0cd98299effe48c7fe584fc",
+        "version" : "2.5.0"
+      }
+    }
+  ],
+  "version" : 3
+}
