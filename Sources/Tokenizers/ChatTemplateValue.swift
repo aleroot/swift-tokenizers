@@ -102,10 +102,19 @@ enum ChatTemplateValue {
             return try object(pairs.map { ($0.key, $0.value) })
 
         // Unordered containers: canonical schema order, or alphabetical for user-named keys.
+        // Match the concrete dictionary/array types callers actually pass (`Message` is
+        // `[String: any Sendable]`) so conversion does not depend on NSDictionary bridging.
+        case let dict as [String: any Sendable]:
+            return try convertDictionary(dict.mapValues { $0 as Any? }, userKeyed: userKeyed)
+        case let dict as [String: Any]:
+            return try convertDictionary(dict.mapValues { $0 as Any? }, userKeyed: userKeyed)
         case let dict as [String: Any?]:
-            let keys = userKeyed ? dict.keys.sorted() : dict.keys.sorted(by: canonicalLess)
-            return try object(keys.map { ($0, dict[$0] ?? nil) })
+            return try convertDictionary(dict, userKeyed: userKeyed)
 
+        case let array as [any Sendable]:
+            return .array(try array.map { try convert($0, userKeyed: false) })
+        case let array as [Any]:
+            return .array(try array.map { try convert($0, userKeyed: false) })
         case let array as [Any?]:
             return .array(try array.map { try convert($0, userKeyed: false) })
 
@@ -118,6 +127,11 @@ enum ChatTemplateValue {
             }
             return try convert(mirror.children.first?.value, userKeyed: userKeyed)
         }
+    }
+
+    private static func convertDictionary(_ dict: [String: Any?], userKeyed: Bool) throws -> Value {
+        let keys = userKeyed ? dict.keys.sorted() : dict.keys.sorted(by: canonicalLess)
+        return try object(keys.map { ($0, dict[$0] ?? nil) })
     }
 
     /// Builds an object from already-ordered pairs, converting each value with the right

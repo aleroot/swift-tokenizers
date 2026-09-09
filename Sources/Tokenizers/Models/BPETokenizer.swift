@@ -90,9 +90,15 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
                 guard pair.count == 2, let a = pair[0].string(), let b = pair[1].string() else { continue }
                 result.append([a, b])
             } else if let s = element.string() {
-                // Legacy "a b" strings.
-                let parts = s.unicodeScalars.split(separator: " ", omittingEmptySubsequences: false).map { String($0) }
-                result.append(parts)
+                // Legacy "a b" strings. Hugging Face's `convert_merges_to_hashmap` rejects a
+                // line unless it splits into exactly two space-separated parts; we are more
+                // lenient and split on the first space only (a piece may itself contain
+                // spaces, as in the two-element list format) and skip lines without one.
+                if let idx = s.unicodeScalars.firstIndex(of: " ") {
+                    let a = String(s.unicodeScalars[..<idx])
+                    let b = String(s.unicodeScalars[s.unicodeScalars.index(after: idx)...])
+                    result.append([a, b])
+                }
             }
         }
         return result
@@ -192,7 +198,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         bosToken = addedTokenAsString(tokenizerConfig.bosToken)
         bosTokenId = bosToken.flatMap { vocab.id(of: $0) }
         fuseUnknownTokens = tokenizerConfig.fuseUnk.boolean(or: tokenizerData.model.fuseUnk.boolean(or: false))
-        byteFallback = tokenizerData.model.byteFallback.boolean(or: true)
+        byteFallback = tokenizerData.model.byteFallback.boolean(or: false)
     }
 
     /// `<0x00>` … `<0xFF>`

@@ -53,14 +53,9 @@ public extension AutoTokenizer {
         guard let tokenizerConfig = configuration.tokenizerConfig else {
             throw TokenizerError.missingFile(modelFolder.appendingPathComponent("tokenizer_config.json"))
         }
-        // swift-transformers' folder API preserves the serialized post-processor, unlike
-        // its configuration factory. Rebuilding it here adds an extra BOS to exports such
-        // as DeepSeek-R1-Distill-Qwen. Keep the class's decoding policy in either path.
-        if tokenizerClass(for: tokenizerConfig) == LlamaPreTrainedTokenizer.self {
-            return try LlamaPreTrainedTokenizer(
-                tokenizerConfig: tokenizerConfig, tokenizerData: configuration.tokenizerData,
-                strict: strict, updatePostProcessor: false)
-        }
+        // Same construction as `from(tokenizerConfig:tokenizerData:)`: LlamaTokenizerFast and
+        // GemmaTokenizerFast always call `update_post_processor()` in Python, including when
+        // `from_pretrained` loads a folder whose `tokenizer.json` only serializes ByteLevel.
         return try from(tokenizerConfig: tokenizerConfig, tokenizerData: configuration.tokenizerData, strict: strict)
     }
 }
@@ -115,9 +110,8 @@ func llamaPostProcessorConfig(tokenizerConfig: Config) throws -> Config {
 ///
 /// Transformers 4.57 fast tokenizers load `tokenizer.json` verbatim here — the `legacy` flag only
 /// affects conversion from a slow SentencePiece model — so no Metaspace pre-tokenizer is
-/// injected. Configuration construction rebuilds the post-processor as in
-/// `LlamaTokenizerFast.__init__`; folder loading preserves the exported processor for
-/// compatibility with swift-transformers' local-folder API.
+/// injected. Both configuration construction and folder loading rebuild the post-processor as in
+/// `LlamaTokenizerFast.__init__` / `GemmaTokenizerFast.__init__`.
 final class LlamaPreTrainedTokenizer: PreTrainedTokenizer, @unchecked Sendable {
     // Python Llama construction removes the serialized SentencePiece normalizer.
     // Preserve declared added-token spellings here; feeding the exported dummy prefix

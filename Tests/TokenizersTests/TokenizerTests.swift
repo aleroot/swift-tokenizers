@@ -293,16 +293,17 @@ struct TokenizerTests {
         }
     }
 
-    /// The legacy folder API honors the exported processor; the configuration factory
-    /// applies the Llama class override.
+    /// Both the folder API and the configuration factory rebuild the post-processor like
+    /// `LlamaTokenizerFast.__init__` (transformers 4.57): `encode("Who are you?")` starts
+    /// with BOS 151646 and `encode("")` is `[151646]`.
     @Test
     func deepSeekPostProcessor() async throws {
         let tokenizerOpt =
             try await HubFixtures.tokenizer(for: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B") as? PreTrainedTokenizer
         #expect(tokenizerOpt != nil)
         let tokenizer = tokenizerOpt!
-        #expect(tokenizer.encode(text: "Who are you?") == [15191, 525, 498, 30])
-        #expect(tokenizer.encode(text: "") == [])
+        #expect(tokenizer.encode(text: "Who are you?") == [151_646, 15191, 525, 498, 30])
+        #expect(tokenizer.encode(text: "") == [151_646])
         let configuration = try await HubFixtures.configuration(for: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
         let classTokenizer = try AutoTokenizer.from(
             tokenizerConfig: #require(configuration.tokenizerConfig), tokenizerData: configuration.tokenizerData)

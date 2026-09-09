@@ -7,8 +7,12 @@ import Testing
 struct TokenizerRegressionTests {
     private let configuration: Config = ["tokenizer_class": "GPT2Tokenizer"]
 
-    @Test("Folder loading preserves exported BOS policy and Llama special-token decoding")
+    @Test("Folder loading rebuilds Llama post-processor like transformers")
     func folderPostProcessorPolicy() async throws {
+        // Python `LlamaTokenizerFast.__init__` always calls `update_post_processor()`, even when
+        // loading from a folder whose `tokenizer.json` only has a ByteLevel processor
+        // (DeepSeek-R1-Distill-Qwen is this shape). The prepend normalizer still runs, so
+        // `encode("a")` is BOS + `" a"`.
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: folder) }
@@ -21,16 +25,47 @@ struct TokenizerRegressionTests {
             """#
         try Data(config.utf8).write(to: folder.appendingPathComponent("tokenizer_config.json"))
         try Data(data.utf8).write(to: folder.appendingPathComponent("tokenizer.json"))
+        let pythonIds = [1, 2, 0]
         for strict in [true, false] {
             let tokenizer = try await AutoTokenizer.from(modelFolder: folder, strict: strict)
-            #expect(tokenizer.encode(text: "a") == [2, 0])
+            #expect(tokenizer.encode(text: "a") == pythonIds)
             #expect(tokenizer.decode(tokens: [1, 1]) == "<s><s>")
             let synchronous = try AutoTokenizer.load(from: folder, strict: strict)
-            #expect(synchronous.encode(text: "a") == [2, 0])
+            #expect(synchronous.encode(text: "a") == pythonIds)
             let reconstructed = try AutoTokenizer.from(
                 tokenizerConfig: Config(jsonString: config), tokenizerData: Config(jsonString: data), strict: strict)
-            #expect(reconstructed.encode(text: "a") == [1, 2, 0])
+            #expect(reconstructed.encode(text: "a") == pythonIds)
         }
+    }
+
+    @Test("DeepSeek-R1 Distill Qwen folder load prepends BOS like transformers")
+    func deepSeekFolderLoadAddsBOS() async throws {
+        // transformers 4.57 `LlamaTokenizerFast.from_pretrained` on this export:
+        // encode("Hello") == [151646, 9707]; add_special_tokens=False == [9707].
+        let tokenizer = try await HubFixtures.tokenizer(for: "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B")
+        #expect(tokenizer.encode(text: "Hello") == [151_646, 9707])
+        #expect(tokenizer.encode(text: "Hello", addSpecialTokens: false) == [9707])
+        #expect(tokenizer.bosToken == "<｜begin▁of▁sentence｜>")
+        #expect(tokenizer.bosTokenId == 151_646)
+    }
+
+    @Test("T5 bos token is nil like transformers")
+    func t5BosTokenIsNil() async throws {
+        // T5TokenizerFast.from_pretrained("google-t5/t5-small"): bos_token is None, eos is </s>.
+        let tokenizer = try await HubFixtures.tokenizer(for: "google-t5/t5-small")
+        #expect(tokenizer.bosToken == nil)
+        #expect(tokenizer.bosTokenId == nil)
+        #expect(tokenizer.eosToken == "</s>")
+        #expect(tokenizer.encode(text: "Hello") == [8774, 1])
+    }
+
+    @Test("XLM-R bos token is <s> like transformers")
+    func xlmrBosTokenMatchesTransformers() async throws {
+        // XLMRobertaTokenizerFast.from_pretrained: bos_token "<s>", bos_token_id 0.
+        let tokenizer = try await HubFixtures.tokenizer(for: "intfloat/multilingual-e5-small")
+        #expect(tokenizer.bosToken == "<s>")
+        #expect(tokenizer.bosTokenId == 0)
+        #expect(tokenizer.encode(text: "Hello").prefix(3).map { $0 } == [0, 35378, 2])
     }
 
     @Test("Chat source newlines follow Python Jinja without stripping generated output")
@@ -195,6 +230,26 @@ struct TokenizerRegressionTests {
             #expect(tokenizer.encode(text: "😀😀a") == (fuse ? [0, 1] : [0, 0, 1]))
             #expect(tokenizer.tokenize(text: "😀😀a") == (fuse ? ["<unk>", "a"] : ["<unk>", "<unk>", "a"]))
         }
+    }
+
+    @Test("Omitted BPE byte_fallback matches Hugging Face's false default")
+    func omittedByteFallbackDefaultsFalse() throws {
+        // `ab` merges to a product that is not in the vocabulary. Hugging Face then emits a
+        // single unknown token; `byte_fallback: true` would emit one unknown per byte.
+        let data: Config = [
+            "model": [
+                "type": "BPE", "vocab": ["<unk>": 0, "a": 1, "b": 2], "merges": ["a b"],
+                "unk_token": "<unk>",
+            ]
+        ]
+        let tokenizer = try PreTrainedTokenizer(tokenizerConfig: configuration, tokenizerData: data)
+        #expect(tokenizer.encode(text: "ab", addSpecialTokens: false) == [0])
+    }
+
+    @Test("Legacy merge strings split on the first space only")
+    func legacyMergesSplitOnce() throws {
+        let merges = BPETokenizer.mergesFromConfig(try Config(jsonString: #"["a  b","foo bar baz"]"#))
+        #expect(merges == [["a", " b"], ["foo", "bar baz"]])
     }
 
     @Test("NLLB unknown Unicode agrees with Hugging Face")

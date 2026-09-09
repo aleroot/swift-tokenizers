@@ -35,8 +35,6 @@ let package = Package(
             dependencies: ["Tokenizers"],
             resources: [.process("Resources")]
         ),
-        // Sampling-profiler harness: `swift build -c release --product profile-encode && sample profile-encode 3`.
-        .executableTarget(name: "profile-encode", dependencies: ["Tokenizers"], path: "Tools/profile-encode"),
         .testTarget(
             name: "Benchmarks",
             dependencies: ["Tokenizers"]

@@ -25,8 +25,7 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
     var unknownToken: String? { unknownPiece.token }
     let minScore: Double
 
-    /// SentencePiece models treat the space as sentence start (kept for compatibility).
-    let bosToken: String? = " "
+    let bosToken: String?
     let bosTokenId: Int?
     let eosToken: String?
     let eosTokenId: Int?
@@ -78,9 +77,9 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         byteFallback = tokenizerData.model.byteFallback.boolean(or: false)
         byteFallbackIds = BPETokenizer.hexaTokenStrings.map { vocabulary.id(of: $0) ?? -1 }
 
-        bosTokenId = vocabulary.id(of: " ")
-        let eosToken = tokenizerConfig.eosToken.string()
-        self.eosToken = eosToken
+        bosToken = addedTokenAsString(tokenizerConfig.bosToken)
+        bosTokenId = bosToken.flatMap { vocabulary.id(of: $0) }
+        eosToken = addedTokenAsString(tokenizerConfig.eosToken)
         eosTokenId = eosToken.flatMap { vocabulary.id(of: $0) }
 
         var trie = ScalarTrie()
