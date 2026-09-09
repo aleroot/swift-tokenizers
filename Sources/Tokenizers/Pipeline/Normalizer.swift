@@ -1,3 +1,13 @@
+// Text normalization applied before pre-tokenization (lowercasing, Unicode normalization,
+// accent stripping, …).
+//
+// Every built-in normalizer works on raw UTF-8: `normalize(_:into:scratch:)` appends the
+// normalized bytes of a chunk to a caller-owned buffer, so the encode pipeline never
+// materialises intermediate strings. ASCII input — the bulk of real prompts — is handled
+// with byte loops; only non-ASCII chunks fall back to the Unicode machinery of the
+// standard library and Foundation. The public `normalize(text:)` is derived from the byte
+// form, so each rule is implemented exactly once.
+
 import Foundation
 
 /// Text normalization applied before pre-tokenization (lowercasing, Unicode normalization,
@@ -12,6 +22,29 @@ public protocol Normalizer: Sendable {
 
 public extension Normalizer {
     func callAsFunction(text: String) -> String { normalize(text: text) }
+}
+
+/// Byte-level contract implemented by every built-in normalizer.
+protocol ByteNormalizer: Normalizer {
+    /// Appends the normalized form of `bytes` (well-formed UTF-8) to `output`.
+    /// - Parameter scratch: buffers for intermediate results; never aliases `output`.
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers)
+
+    /// `true` when normalizing `bytes` is guaranteed to return them unchanged, letting callers
+    /// skip the copy. Must be cheap (a linear scan at most); `false` is always a safe answer.
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool
+}
+
+extension ByteNormalizer {
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool { false }
+
+    func normalize(text: String) -> String {
+        var copy = text
+        var output: [UInt8] = []
+        let scratch = ScratchBuffers()
+        copy.withUTF8 { normalize($0, into: &output, scratch: scratch) }
+        return String(decoding: output, as: UTF8.self)
+    }
 }
 
 enum NormalizerType: String {
@@ -32,7 +65,7 @@ enum NormalizerType: String {
 }
 
 struct NormalizerFactory {
-    static func fromConfig(config: Config?) throws -> (any Normalizer)? {
+    static func fromConfig(config: Config?) throws -> (any ByteNormalizer)? {
         guard let config, let typeName = config.type.string() else { return nil }
         switch NormalizerType(rawValue: typeName) {
         case .Sequence: return try NormalizerSequence(config: config)
@@ -52,72 +85,138 @@ struct NormalizerFactory {
     }
 }
 
-final class NormalizerSequence: Normalizer {
-    let normalizers: [any Normalizer]
+final class NormalizerSequence: ByteNormalizer {
+    let normalizers: [any ByteNormalizer]
 
     required init(config: Config) throws {
         let configs = try require(config.normalizers.array(), "Sequence normalizer", field: "normalizers")
         normalizers = try configs.compactMap { try NormalizerFactory.fromConfig(config: $0) }
     }
 
-    func normalize(text: String) -> String {
-        var current = text
-        for normalizer in normalizers {
-            current = normalizer.normalize(text: current)
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        normalizers.allSatisfy { $0.isIdentity(on: bytes) }
+    }
+
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        // Stages that would not change the text are skipped; the rest ping-pong between two
+        // scratch buffers.
+        var index = 0
+        while index < normalizers.count, normalizers[index].isIdentity(on: bytes) { index += 1 }
+        guard index < normalizers.count else {
+            output.append(contentsOf: bytes)
+            return
         }
-        return current
+        var current = scratch.take()
+        var next = scratch.take()
+        defer {
+            scratch.recycle(current)
+            scratch.recycle(next)
+        }
+        normalizers[index].normalize(bytes, into: &current, scratch: scratch)
+        index += 1
+        while index < normalizers.count {
+            let stage = normalizers[index]
+            index += 1
+            if current.withUnsafeBufferPointer({ stage.isIdentity(on: $0) }) { continue }
+            next.removeAll(keepingCapacity: true)
+            current.withUnsafeBufferPointer { stage.normalize($0, into: &next, scratch: scratch) }
+            swap(&current, &next)
+        }
+        output.append(contentsOf: current)
     }
 }
 
-final class PrependNormalizer: Normalizer {
+final class PrependNormalizer: ByteNormalizer {
     let prepend: String
+    private let prependBytes: [UInt8]
 
     required init(config: Config) {
         prepend = config.prepend.string(or: "")
+        prependBytes = Array(prepend.utf8)
     }
 
-    func normalize(text: String) -> String { text.isEmpty ? text : prepend + text }
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool { bytes.isEmpty || prependBytes.isEmpty }
+
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        // `NormalizedString::prepend` is a no-op on empty input.
+        if !bytes.isEmpty { output.append(contentsOf: prependBytes) }
+        output.append(contentsOf: bytes)
+    }
 }
 
-final class ReplaceNormalizer: Normalizer {
+final class ReplaceNormalizer: ByteNormalizer {
     let pattern: StringReplacePattern?
 
     required init(config: Config) throws {
         pattern = try StringReplacePattern.from(config: config)
     }
 
-    func normalize(text: String) -> String {
-        guard let pattern else { return text }
-        return pattern.replace(text)
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool { pattern?.matches(in: bytes) == false }
+
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        guard let pattern else {
+            output.append(contentsOf: bytes)
+            return
+        }
+        pattern.replace(bytes, into: &output)
     }
 }
 
-final class LowercaseNormalizer: Normalizer {
+final class LowercaseNormalizer: ByteNormalizer {
     required init(config: Config) {}
-    func normalize(text: String) -> String { text.lowercased() }
+
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        ASCII.isASCII(bytes) && !bytes.contains { $0 >= 0x41 && $0 <= 0x5A }
+    }
+
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        if ASCII.isASCII(bytes) {
+            output.reserveCapacity(output.count + bytes.count)
+            for byte in bytes { output.append(byte >= 0x41 && byte <= 0x5A ? byte | 0x20 : byte) }
+        } else {
+            ASCII.append(String(decoding: bytes, as: UTF8.self).lowercased(), to: &output)
+        }
+    }
 }
 
-final class NFDNormalizer: Normalizer {
-    required init(config: Config) {}
-    func normalize(text: String) -> String { text.decomposedStringWithCanonicalMapping }
+/// A Unicode normalization form. Identity on ASCII; Foundation handles the rest.
+protocol UnicodeFormNormalizer: ByteNormalizer {
+    static func apply(_ text: String) -> String
 }
 
-final class NFCNormalizer: Normalizer {
-    required init(config: Config) {}
-    func normalize(text: String) -> String { text.precomposedStringWithCanonicalMapping }
+extension UnicodeFormNormalizer {
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool { ASCII.isASCII(bytes) }
+
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        if ASCII.isASCII(bytes) {
+            output.append(contentsOf: bytes)
+        } else {
+            ASCII.append(Self.apply(String(decoding: bytes, as: UTF8.self)), to: &output)
+        }
+    }
 }
 
-final class NFKDNormalizer: Normalizer {
+final class NFDNormalizer: UnicodeFormNormalizer {
     required init(config: Config) {}
-    func normalize(text: String) -> String { text.decomposedStringWithCompatibilityMapping }
+    static func apply(_ text: String) -> String { text.decomposedStringWithCanonicalMapping }
 }
 
-final class NFKCNormalizer: Normalizer {
+final class NFCNormalizer: UnicodeFormNormalizer {
     required init(config: Config) {}
-    func normalize(text: String) -> String { text.precomposedStringWithCompatibilityMapping }
+    static func apply(_ text: String) -> String { text.precomposedStringWithCanonicalMapping }
 }
 
-final class BertNormalizer: Normalizer {
+final class NFKDNormalizer: UnicodeFormNormalizer {
+    required init(config: Config) {}
+    static func apply(_ text: String) -> String { text.decomposedStringWithCompatibilityMapping }
+}
+
+final class NFKCNormalizer: UnicodeFormNormalizer {
+    required init(config: Config) {}
+    static func apply(_ text: String) -> String { text.precomposedStringWithCompatibilityMapping }
+}
+
+final class BertNormalizer: ByteNormalizer {
     let shouldCleanText: Bool
     let shouldHandleChineseChars: Bool
     let shouldStripAccents: Bool
@@ -130,41 +229,20 @@ final class BertNormalizer: Normalizer {
         shouldStripAccents = config.stripAccents.boolean(or: shouldLowercase)
     }
 
-    func normalize(text: String) -> String {
-        var copy = text
-        let isASCII = copy.withUTF8 { bytes in bytes.allSatisfy { $0 < 0x80 } }
-        if isASCII {
-            return normalizeASCII(text)
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard ASCII.isASCII(bytes) else { return false }
+        for byte in bytes {
+            if shouldCleanText, byte < 0x20 || byte == 0x7F { return false }
+            if shouldLowercase, byte >= 0x41, byte <= 0x5A { return false }
         }
-        var output = text
-        if shouldCleanText || shouldHandleChineseChars {
-            var bytes: [UInt8] = []
-            bytes.reserveCapacity(text.utf8.count + 16)
-            for scalar in text.unicodeScalars {
-                if shouldCleanText {
-                    if scalar.value == 0 || scalar.value == 0xFFFD || isControl(scalar) { continue }
-                    if isWhitespace(scalar) { bytes.append(32); continue }
-                }
-                let chinese = shouldHandleChineseChars && scalar.isCJKUnifiedIdeograph
-                if chinese { bytes.append(32) }
-                bytes.append(contentsOf: scalar.utf8)
-                if chinese { bytes.append(32) }
-            }
-            output = String(decoding: bytes, as: UTF8.self)
-        }
-        if shouldStripAccents { output = Self.stripAccents(output) }
-        if shouldLowercase { output = output.lowercased() }
-        return output
+        return true
     }
 
-    /// ASCII has no CJK ideographs or combining marks, so only cleaning and lowercasing apply.
-    private func normalizeASCII(_ text: String) -> String {
-        var copy = text
-        return copy.withUTF8 { bytes -> String in
-            var out: [UInt8] = []
-            out.reserveCapacity(bytes.count)
-            for b in bytes {
-                var byte = b
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        // ASCII has no CJK ideographs or combining marks, so only cleaning and lowercasing apply.
+        if ASCII.isASCII(bytes) {
+            output.reserveCapacity(output.count + bytes.count)
+            for var byte in bytes {
                 if shouldCleanText {
                     switch byte {
                     case 0x09, 0x0A, 0x0D: byte = 0x20
@@ -173,51 +251,72 @@ final class BertNormalizer: Normalizer {
                     }
                 }
                 if shouldLowercase, byte >= 0x41, byte <= 0x5A { byte |= 0x20 }
-                out.append(byte)
+                output.append(byte)
             }
-            return String(decoding: out, as: UTF8.self)
+            return
+        }
+
+        var cleaned = scratch.take()
+        defer { scratch.recycle(cleaned) }
+        if shouldCleanText || shouldHandleChineseChars {
+            cleaned.reserveCapacity(bytes.count + 16)
+            var i = 0
+            while i < bytes.count {
+                let (value, width) = UTF8Cursor.decode(bytes, at: i)
+                defer { i += width }
+                if shouldCleanText {
+                    if value == 0 || value == 0xFFFD || Self.isControl(value) { continue }
+                    if Self.isWhitespace(value) {
+                        cleaned.append(0x20)
+                        continue
+                    }
+                }
+                let chinese = shouldHandleChineseChars && Self.isCJKUnifiedIdeograph(value)
+                if chinese { cleaned.append(0x20) }
+                cleaned.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<i + width]))
+                if chinese { cleaned.append(0x20) }
+            }
+        } else {
+            cleaned.append(contentsOf: bytes)
+        }
+
+        if shouldStripAccents {
+            var stripped = scratch.take()
+            cleaned.withUnsafeBufferPointer { Self.stripAccents($0, into: &stripped) }
+            swap(&cleaned, &stripped)
+            scratch.recycle(stripped)
+        }
+
+        if shouldLowercase {
+            cleaned.withUnsafeBufferPointer { cleaned in
+                if ASCII.isASCII(cleaned) {
+                    for byte in cleaned { output.append(byte >= 0x41 && byte <= 0x5A ? byte | 0x20 : byte) }
+                } else {
+                    ASCII.append(String(decoding: cleaned, as: UTF8.self).lowercased(), to: &output)
+                }
+            }
+        } else {
+            output.append(contentsOf: cleaned)
         }
     }
 
-    private func isWhitespace(_ c: Unicode.Scalar) -> Bool {
-        if c.value == 0x09 || c.value == 0x0A || c.value == 0x0D { return true }
-        if c.value < 0x80 { return c.value == 0x20 }
-        return c.properties.generalCategory == .spaceSeparator
+    /// `\t` `\n` `\r` or `Zs`.
+    @inline(__always)
+    static func isWhitespace(_ value: UInt32) -> Bool {
+        if value < 0x80 { return value == 0x20 || value == 0x09 || value == 0x0A || value == 0x0D }
+        return ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.spaceSeparator != 0
     }
 
-    /// Cc/Cf/Cs/Co (but not unassigned code points, which `tokenizers` leaves untouched).
-    private func isControl(_ c: Unicode.Scalar) -> Bool {
-        if c.value == 0x09 || c.value == 0x0A || c.value == 0x0D { return false }
-        if c.value < 0x80 { return c.value < 0x20 || c.value == 0x7F }
-        switch c.properties.generalCategory {
-        case .control, .format, .surrogate, .privateUse: return true
-        default: return false
-        }
+    /// Cc/Cf/Cs/Co except `\t` `\n` `\r` (unassigned code points are left untouched, as in `tokenizers`).
+    @inline(__always)
+    static func isControl(_ value: UInt32) -> Bool {
+        if value < 0x80 { return (value < 0x20 && value != 0x09 && value != 0x0A && value != 0x0D) || value == 0x7F }
+        return ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.control != 0
     }
 
-    /// NFD-decompose then drop every nonspacing mark (general category Mn), matching HF's
-    /// `_run_strip_accents`.
-    static func stripAccents(_ text: String) -> String {
-        let decomposed = text.decomposedStringWithCanonicalMapping
-        var hasMark = false
-        for scalar in decomposed.unicodeScalars
-        where scalar.value >= 0x300 && scalar.properties.generalCategory == .nonspacingMark {
-            hasMark = true
-            break
-        }
-        guard hasMark else { return decomposed }
-        var bytes: [UInt8] = []
-        bytes.reserveCapacity(decomposed.utf8.count)
-        for scalar in decomposed.unicodeScalars where scalar.properties.generalCategory != .nonspacingMark {
-            bytes.append(contentsOf: scalar.utf8)
-        }
-        return String(decoding: bytes, as: UTF8.self)
-    }
-}
-
-extension Unicode.Scalar {
     /// https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
-    var isCJKUnifiedIdeograph: Bool {
+    @inline(__always)
+    static func isCJKUnifiedIdeograph(_ value: UInt32) -> Bool {
         (value >= 0x4E00 && value <= 0x9FFF)
             || (value >= 0x3400 && value <= 0x4DBF)
             || (value >= 0x20000 && value <= 0x2A6DF)
@@ -227,15 +326,58 @@ extension Unicode.Scalar {
             || (value >= 0xF900 && value <= 0xFAFF)
             || (value >= 0x2F800 && value <= 0x2FA1F)
     }
+
+    /// NFD-decompose then drop every nonspacing mark (general category Mn), matching HF's
+    /// `_run_strip_accents`. The output stays decomposed, as in the reference.
+    static func stripAccents(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8]) {
+        if ASCII.isASCII(bytes) {
+            output.append(contentsOf: bytes)
+            return
+        }
+        var decomposed = String(decoding: bytes, as: UTF8.self).decomposedStringWithCanonicalMapping
+        decomposed.withUTF8 { decomposed in
+            output.reserveCapacity(output.count + decomposed.count)
+            var i = 0
+            while i < decomposed.count {
+                let b0 = decomposed[i]
+                if b0 < 0x80 {
+                    output.append(b0)
+                    i += 1
+                    continue
+                }
+                let (value, width) = UTF8Cursor.decode(decomposed, at: i)
+                if ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.nonspacingMark == 0 {
+                    output.append(contentsOf: UnsafeBufferPointer(rebasing: decomposed[i..<i + width]))
+                }
+                i += width
+            }
+        }
+    }
+
+    /// String form of ``stripAccents(_:into:)`` (used by the legacy BERT basic tokenizer).
+    static func stripAccents(_ text: String) -> String {
+        var copy = text
+        var output: [UInt8] = []
+        copy.withUTF8 { stripAccents($0, into: &output) }
+        return String(decoding: output, as: UTF8.self)
+    }
+}
+
+extension Unicode.Scalar {
+    var isCJKUnifiedIdeograph: Bool { BertNormalizer.isCJKUnifiedIdeograph(value) }
 }
 
 /// SentencePiece's serialized Darts map, following spm_precompiled 0.1.3.
 /// The map is model data: substituting Foundation NFKC changes token IDs.
-final class PrecompiledNormalizer: Normalizer {
+final class PrecompiledNormalizer: ByteNormalizer {
     private let trie: [UInt32]
+    /// NUL-terminated replacement strings, back to back.
     private let replacements: [UInt8]
-    private let asciiReplacements: [[UInt8]?]
-    private let crlfReplacement: [UInt8]?
+    /// Per ASCII byte: offset of its replacement in `replacements`, or `-1` when it maps to itself.
+    private let asciiReplacementOffsets: [Int32]
+    private let crlfReplacementOffset: Int32
+    /// `true` when no ASCII byte (or CRLF) maps to anything: ASCII chunks are then copied verbatim.
+    private let asciiIsIdentity: Bool
 
     required init(config: Config) throws {
         guard let encoded = config.precompiledCharsmap.string(), let data = Data(base64Encoded: encoded),
@@ -261,20 +403,42 @@ final class PrecompiledNormalizer: Normalizer {
         }
         let trie = self.trie
         let replacements = self.replacements
-        asciiReplacements = (0..<128).map { value in
-            Self.replacement(for: [UInt8(value)], trie: trie, replacements: replacements).map(Array.init)
+        asciiReplacementOffsets = (0..<128).map { value in
+            Self.replacementOffset(for: [UInt8(value)], trie: trie, replacements: replacements) ?? -1
         }
-        crlfReplacement = Self.replacement(for: [UInt8(13), 10], trie: trie, replacements: replacements).map(Array.init)
+        crlfReplacementOffset = Self.replacementOffset(for: [UInt8(13), 10], trie: trie, replacements: replacements) ?? -1
+        asciiIsIdentity = asciiReplacementOffsets.allSatisfy { $0 < 0 } && crlfReplacementOffset < 0
+    }
+
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard ASCII.isASCII(bytes) else { return false }
+        if asciiIsIdentity { return true }
+        for byte in bytes where asciiReplacementOffsets[Int(byte)] >= 0 { return false }
+        if crlfReplacementOffset >= 0, bytes.count > 1 {
+            for i in 0..<(bytes.count - 1) where bytes[i] == 13 && bytes[i + 1] == 10 { return false }
+        }
+        return true
+    }
+
+    /// Appends the NUL-terminated replacement starting at `offset`.
+    @inline(__always)
+    private func appendReplacement(at offset: Int32, to output: inout [UInt8]) {
+        var i = Int(offset)
+        while replacements[i] != 0 {
+            output.append(replacements[i])
+            i += 1
+        }
     }
 
     @inline(__always) private static func offset(_ unit: UInt32) -> Int {
         Int(unit >> 10) << Int((unit & (1 << 9)) >> 6)
     }
 
-    /// Returns the first prefix match, as the reference does (not the longest match).
-    private static func replacement<C: Collection>(
+    /// Offset in `replacements` of the first prefix match, as the reference does (not the
+    /// longest match).
+    private static func replacementOffset<C: Collection>(
         for bytes: C, trie: [UInt32], replacements: [UInt8]
-    ) -> ArraySlice<UInt8>? where C.Element == UInt8 {
+    ) -> Int32? where C.Element == UInt8 {
         var node = Self.offset(trie[0])
         for byte in bytes {
             if byte == 0 { break }
@@ -287,78 +451,118 @@ final class PrecompiledNormalizer: Normalizer {
                 guard node < trie.count else { return nil }
                 let start = Int(trie[node] & 0x7fffffff)
                 guard start < replacements.count else { return nil }
-                var end = start
-                while end < replacements.count, replacements[end] != 0 { end += 1 }
-                return replacements[start..<end]
+                return Int32(start)
             }
         }
         return nil
     }
 
-    private func replacement<C: Collection>(for bytes: C) -> ArraySlice<UInt8>? where C.Element == UInt8 {
-        Self.replacement(for: bytes, trie: trie, replacements: replacements)
+    private func replacementOffset<C: Collection>(for bytes: C) -> Int32? where C.Element == UInt8 {
+        Self.replacementOffset(for: bytes, trie: trie, replacements: replacements)
     }
 
-    func normalize(text: String) -> String {
-        // Most prompts are ASCII. Reuse model-specific mappings without constructing a
-        // Character/String per scalar; unchanged text needs no output allocation.
-        var input = text
-        if let ascii = input.withUTF8({ bytes -> String? in
-            guard bytes.allSatisfy({ $0 < 128 }) else { return nil }
-            guard bytes.contains(where: { asciiReplacements[Int($0)] != nil }) else { return text }
-            var output: [UInt8] = []
-            output.reserveCapacity(bytes.count)
-            var i = 0
-            while i < bytes.count {
-                if bytes[i] == 13, i + 1 < bytes.count, bytes[i + 1] == 10, let crlfReplacement {
-                    output.append(contentsOf: crlfReplacement)
-                    i += 2
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        output.reserveCapacity(output.count + bytes.count)
+        let n = bytes.count
+        var i = 0
+        while i < n {
+            // ASCII runs go through the per-byte table without constructing graphemes.
+            if bytes[i] < 0x80 {
+                var j = i
+                while j < n, bytes[j] < 0x80 {
+                    // Keep a trailing ASCII scalar for the non-ASCII run if it may start a
+                    // grapheme that a following mark extends (e.g. `e` + U+0301 maps as one unit).
+                    if j + 1 < n, bytes[j + 1] >= 0x80, Self.extendsGrapheme(bytes, at: j + 1) { break }
+                    j += 1
+                }
+                appendASCII(UnsafeBufferPointer(rebasing: bytes[i..<j]), to: &output)
+                i = j
+                if i >= n { break }
+            }
+            // A non-ASCII run (plus at most one leading ASCII scalar): the reference maps whole
+            // graphemes first (when shorter than 6 bytes), then scalars.
+            var j = i + 1
+            while j < n, bytes[j] >= 0x80 { j += 1 }
+            for grapheme in String(decoding: UnsafeBufferPointer(rebasing: bytes[i..<j]), as: UTF8.self) {
+                appendGrapheme(grapheme, to: &output)
+            }
+            i = j
+        }
+    }
+
+    /// Whether the scalar at `i` continues the grapheme cluster started by the scalar before it.
+    @inline(__always)
+    private static func extendsGrapheme(_ bytes: UnsafeBufferPointer<UInt8>, at i: Int) -> Bool {
+        let (value, _) = UTF8Cursor.decode(bytes, at: i)
+        return ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.graphemeExtend != 0
+    }
+
+    @inline(__always)
+    private func appendASCII(_ bytes: UnsafeBufferPointer<UInt8>, to output: inout [UInt8]) {
+        if asciiIsIdentity {
+            output.append(contentsOf: bytes)
+            return
+        }
+        var i = 0
+        while i < bytes.count {
+            let byte = bytes[i]
+            if byte == 13, crlfReplacementOffset >= 0, i + 1 < bytes.count, bytes[i + 1] == 10 {
+                appendReplacement(at: crlfReplacementOffset, to: &output)
+                i += 2
+                continue
+            }
+            let offset = asciiReplacementOffsets[Int(byte)]
+            if offset < 0 { output.append(byte) } else { appendReplacement(at: offset, to: &output) }
+            i += 1
+        }
+    }
+
+    private func appendGrapheme(_ grapheme: Character, to output: inout [UInt8]) {
+        let utf8 = grapheme.utf8
+        if utf8.count == 1 {
+            let byte = utf8.first!
+            let offset = asciiReplacementOffsets[Int(byte)]
+            if offset < 0 { output.append(byte) } else { appendReplacement(at: offset, to: &output) }
+        } else if utf8.count < 6, let offset = replacementOffset(for: utf8) {
+            appendReplacement(at: offset, to: &output)
+        } else {
+            for scalar in grapheme.unicodeScalars {
+                if let offset = replacementOffset(for: scalar.utf8) {
+                    appendReplacement(at: offset, to: &output)
                 } else {
-                    if let mapped = asciiReplacements[Int(bytes[i])] {
-                        output.append(contentsOf: mapped)
-                    } else {
-                        output.append(bytes[i])
-                    }
-                    i += 1
-                }
-            }
-            return String(decoding: output, as: UTF8.self)
-        }) {
-            return ascii
-        }
-        var output: [UInt8] = []
-        output.reserveCapacity(text.utf8.count)
-        for grapheme in text {
-            let chunk = String(grapheme)
-            if chunk.utf8.count < 6, let mapped = replacement(for: chunk.utf8) {
-                output.append(contentsOf: mapped)
-            } else {
-                for scalar in chunk.unicodeScalars {
-                    let bytes = scalar.utf8
-                    output.append(contentsOf: replacement(for: bytes) ?? ArraySlice(bytes))
+                    output.append(contentsOf: scalar.utf8)
                 }
             }
         }
-        return String(decoding: output, as: UTF8.self)
     }
 }
 
-final class StripAccentsNormalizer: Normalizer {
+final class StripAccentsNormalizer: ByteNormalizer {
     required init(config: Config) {}
-    func normalize(text: String) -> String {
-        // Standalone StripAccents removes marks without decomposing precomposed letters.
-        String(
-            String.UnicodeScalarView(
-                text.unicodeScalars.filter {
-                    switch $0.properties.generalCategory {
-                    case .nonspacingMark, .spacingMark, .enclosingMark: return false
-                    default: return true
-                    }
-                }))
+
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool { ASCII.isASCII(bytes) }
+
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        // Standalone StripAccents removes marks (Mn/Mc/Me) without decomposing precomposed letters.
+        output.reserveCapacity(output.count + bytes.count)
+        var i = 0
+        while i < bytes.count {
+            let b0 = bytes[i]
+            if b0 < 0x80 {
+                output.append(b0)
+                i += 1
+                continue
+            }
+            let (value, width) = UTF8Cursor.decode(bytes, at: i)
+            if ScalarClassifier.flags(value: value) & ScalarFlags.mark == 0 {
+                output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<i + width]))
+            }
+            i += width
+        }
     }
 }
 
-final class StripNormalizer: Normalizer {
+final class StripNormalizer: ByteNormalizer {
     let leftStrip: Bool
     let rightStrip: Bool
 
@@ -367,19 +571,36 @@ final class StripNormalizer: Normalizer {
         rightStrip = config.stripRight.boolean(or: true)
     }
 
-    func normalize(text: String) -> String {
-        // Rust trims Unicode scalar values. A Swift Character may combine whitespace
-        // with an accent; removing that whole grapheme would silently delete the accent.
-        var result = text.unicodeScalars[...]
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        trimmedRange(of: bytes) == 0..<bytes.count
+    }
+
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[trimmedRange(of: bytes)]))
+    }
+
+    /// The range that survives trimming. Rust trims Unicode scalar values
+    /// (`char::is_whitespace`), never whole graphemes.
+    private func trimmedRange(of bytes: UnsafeBufferPointer<UInt8>) -> Range<Int> {
+        var start = 0
+        var end = bytes.count
         if leftStrip {
-            result = result.drop(while: { $0.properties.isWhitespace })
-        }
-        if rightStrip {
-            while let last = result.last, last.properties.isWhitespace {
-                result.removeLast()
+            while start < end {
+                let (value, width) = UTF8Cursor.decode(bytes, at: start)
+                guard ScalarClassifier.flags(value: value) & ScalarFlags.whitespace != 0 else { break }
+                start += width
             }
         }
-        return String(result)
+        if rightStrip {
+            while end > start {
+                var scalarStart = end - 1
+                while scalarStart > start, bytes[scalarStart] & 0xC0 == 0x80 { scalarStart -= 1 }
+                let (value, _) = UTF8Cursor.decode(bytes, at: scalarStart)
+                guard ScalarClassifier.flags(value: value) & ScalarFlags.whitespace != 0 else { break }
+                end = scalarStart
+            }
+        }
+        return start..<end
     }
 }
 
@@ -387,36 +608,153 @@ final class StripNormalizer: Normalizer {
 
 enum StringReplacePattern: Sendable {
     case regexp(regexp: NSRegularExpression, replacement: String)
-    case string(pattern: String, replacement: String)
+    case string(pattern: [UInt8], replacement: [UInt8])
+    /// `X{n,}` for a single ASCII character `X`: runs of at least `minimum` bytes are replaced.
+    case run(byte: UInt8, minimum: Int, replacement: [UInt8])
 
     func replace(_ text: String) -> String {
+        var copy = text
+        var output: [UInt8] = []
+        copy.withUTF8 { replace($0, into: &output) }
+        return String(decoding: output, as: UTF8.self)
+    }
+
+    /// Appends `bytes` with every match replaced to `output`.
+    func replace(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8]) {
         switch self {
         case let .regexp(regexp, replacement):
+            let text = String(decoding: bytes, as: UTF8.self)
             let range = NSRange(text.startIndex..., in: text)
-            return regexp.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: replacement)
-        case let .string(toReplace, replacement):
-            return text.replacingBytes(of: toReplace, with: replacement)
+            ASCII.append(
+                regexp.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: replacement),
+                to: &output)
+        case let .string(pattern, replacement):
+            Self.replaceLiteral(bytes, pattern: pattern, with: replacement, into: &output)
+        case let .run(byte, minimum, replacement):
+            var i = 0
+            var cursor = 0
+            let n = bytes.count
+            while i < n {
+                guard bytes[i] == byte else {
+                    i += 1
+                    continue
+                }
+                var j = i + 1
+                while j < n, bytes[j] == byte { j += 1 }
+                if j - i >= minimum {
+                    output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[cursor..<i]))
+                    output.append(contentsOf: replacement)
+                    cursor = j
+                }
+                i = j
+            }
+            output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[cursor..<n]))
         }
+    }
+
+    /// Whether `bytes` contain at least one match (`false` means replacement is the identity).
+    func matches(in bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        switch self {
+        case .regexp:
+            return true  // unknown without running the engine; treat as a potential match
+        case let .string(pattern, _):
+            guard let first = pattern.first, pattern.count <= bytes.count, let base = bytes.baseAddress else {
+                return false
+            }
+            var i = 0
+            let n = bytes.count
+            let m = pattern.count
+            while i + m <= n {
+                guard let hit = memchr(base + i, Int32(first), n - m + 1 - i) else { return false }
+                let p = UnsafePointer<UInt8>(hit.assumingMemoryBound(to: UInt8.self)) - base
+                if m == 1 || memcmp(base + p, pattern, m) == 0 { return true }
+                i = p + 1
+            }
+            return false
+        case let .run(byte, minimum, _):
+            var i = 0
+            let n = bytes.count
+            while i < n {
+                guard bytes[i] == byte else {
+                    i += 1
+                    continue
+                }
+                var j = i + 1
+                while j < n, bytes[j] == byte { j += 1 }
+                if j - i >= minimum { return true }
+                i = j
+            }
+            return false
+        }
+    }
+
+    /// Non-overlapping left-to-right literal replacement (`str::replace` semantics).
+    static func replaceLiteral(
+        _ bytes: UnsafeBufferPointer<UInt8>, pattern: [UInt8], with replacement: [UInt8], into output: inout [UInt8]
+    ) {
+        let n = bytes.count
+        let m = pattern.count
+        guard m > 0, m <= n, let base = bytes.baseAddress else {
+            output.append(contentsOf: bytes)
+            return
+        }
+        let first = Int32(pattern[0])
+        var cursor = 0
+        var i = 0
+        while i + m <= n {
+            guard let hit = memchr(base + i, first, n - m + 1 - i) else { break }
+            let p = UnsafePointer<UInt8>(hit.assumingMemoryBound(to: UInt8.self)) - base
+            if m == 1 || memcmp(base + p, pattern, m) == 0 {
+                output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[cursor..<p]))
+                output.append(contentsOf: replacement)
+                cursor = p + m
+                i = cursor
+            } else {
+                i = p + 1
+            }
+        }
+        output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[cursor..<n]))
     }
 
     static func from(config: Config) throws -> StringReplacePattern? {
         guard let replacement = config.content.string() else { return nil }
         if let pattern = config.pattern.String.string() {
-            return .string(pattern: pattern, replacement: replacement)
+            return .string(pattern: Array(pattern.utf8), replacement: Array(replacement.utf8))
         }
         if let pattern = config.pattern.Regex.string() {
             // Many SentencePiece configs express a literal via a regex with a single-scalar
             // pattern such as " ". Treat trivial patterns as literals to skip the regex engine.
             if Self.isLiteral(pattern), !replacement.contains("$"), !replacement.contains("\\") {
-                return .string(pattern: pattern, replacement: replacement)
+                return .string(pattern: Array(pattern.utf8), replacement: Array(replacement.utf8))
+            }
+            // ` {2,}` (T5, XLM-R, …): collapse runs of a character.
+            if let run = Self.runPattern(pattern), !replacement.contains("$"), !replacement.contains("\\") {
+                return .run(byte: run.byte, minimum: run.minimum, replacement: Array(replacement.utf8))
             }
             return .regexp(regexp: try compileRegex(pattern, component: "Replace normalizer"), replacement: replacement)
         }
         return nil
     }
 
+    private static let metacharacters: Set<Character> = [
+        "\\", "^", "$", ".", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}",
+    ]
+
     private static func isLiteral(_ pattern: String) -> Bool {
-        let metacharacters: Set<Character> = ["\\", "^", "$", ".", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]
-        return !pattern.isEmpty && !pattern.contains(where: { metacharacters.contains($0) })
+        !pattern.isEmpty && !pattern.contains(where: { metacharacters.contains($0) })
+    }
+
+    /// Recognises `X{n,}` where `X` is a single non-metacharacter ASCII byte.
+    private static func runPattern(_ pattern: String) -> (byte: UInt8, minimum: Int)? {
+        let bytes = Array(pattern.utf8)
+        guard bytes.count >= 5, bytes[0] < 0x80, !metacharacters.contains(Character(UnicodeScalar(bytes[0]))),
+            bytes[1] == UInt8(ascii: "{"), bytes[bytes.count - 2] == UInt8(ascii: ","),
+            bytes[bytes.count - 1] == UInt8(ascii: "}")
+        else { return nil }
+        let digits = bytes[2..<(bytes.count - 2)]
+        guard !digits.isEmpty, digits.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }),
+            let minimum = Int(String(decoding: digits, as: UTF8.self)), minimum >= 1
+        else { return nil }
+        return (bytes[0], minimum)
     }
 }

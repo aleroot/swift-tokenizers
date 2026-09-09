@@ -96,26 +96,6 @@ enum KnownSplitPattern: Sendable {
         ByteLevelScanner.scan(bytes, rules: rules, into: &ranges)
     }
 
-    /// Appends the matches in `text` as `PreToken`s, reusing `scratch` for the byte ranges so
-    /// repeated calls on many small chunks do not allocate.
-    func split(_ text: Substring, scratch: inout [Range<Int>], byteLevel: Bool, into output: inout [PreToken]) {
-        var copy = text
-        scratch.removeAll(keepingCapacity: true)
-        copy.withUTF8 { bytes in
-            ByteLevelScanner.scan(bytes, rules: rules, into: &scratch)
-        }
-        if scratch.count == 1 {
-            output.append(PreToken(text: text, byteLevel: byteLevel))
-            return
-        }
-        let utf8 = text.utf8
-        let base = utf8.startIndex
-        for range in scratch {
-            let lower = utf8.index(base, offsetBy: range.lowerBound)
-            let upper = utf8.index(base, offsetBy: range.upperBound)
-            output.append(PreToken(text: text[lower..<upper], byteLevel: byteLevel))
-        }
-    }
 }
 
 // MARK: - Scalar classification
@@ -218,6 +198,103 @@ enum ScalarClassifier {
     @inlinable
     static func isNewline(_ v: UInt32) -> Bool {
         v == 0x0A || v == 0x0D
+    }
+
+    // MARK: Extended properties (normalizers)
+
+    /// Precomputed ``ScalarExtraFlags`` for the Basic Multilingual Plane, built on first use.
+    @usableFromInline
+    static let bmpExtra: [UInt8] = {
+        var table = [UInt8](repeating: 0, count: 0x10000)
+        for v in 0..<0x10000 {
+            guard let scalar = Unicode.Scalar(UInt32(v)) else {
+                table[v] = ScalarExtraFlags.control  // surrogates (Cs)
+                continue
+            }
+            table[v] = extraFlagsSlow(scalar)
+        }
+        return table
+    }()
+
+    @inlinable
+    static func extraFlags(value v: UInt32) -> UInt8 {
+        if v < 0x10000 { return bmpExtra[Int(v)] }
+        guard let scalar = Unicode.Scalar(v) else { return ScalarExtraFlags.control }
+        return extraFlagsSlow(scalar)
+    }
+
+    @usableFromInline
+    static func extraFlagsSlow(_ scalar: Unicode.Scalar) -> UInt8 {
+        var flags: UInt8 = 0
+        let properties = scalar.properties
+        let category = properties.generalCategory
+        switch category {
+        case .nonspacingMark: flags |= ScalarExtraFlags.nonspacingMark
+        case .control, .format, .surrogate, .privateUse: flags |= ScalarExtraFlags.control
+        case .spaceSeparator: flags |= ScalarExtraFlags.spaceSeparator
+        case .decimalNumber: flags |= ScalarExtraFlags.decimalDigit
+        default: break
+        }
+        let value = scalar.value
+        switch category {
+        case .nonspacingMark, .spacingMark, .enclosingMark, .decimalNumber, .connectorPunctuation:
+            flags |= ScalarExtraFlags.word
+        default:
+            if properties.isAlphabetic || value == 0x200C || value == 0x200D { flags |= ScalarExtraFlags.word }
+        }
+        // UAX #29 GB9/GB9a: Extend (Grapheme_Extend ∪ Emoji_Modifier), ZWJ, SpacingMark (Mc plus
+        // U+0E33 / U+0EB3). Over-approximating is safe for callers; under-approximating is not.
+        if properties.isGraphemeExtend || category == .spacingMark || value == 0x200D || value == 0x0E33
+            || value == 0x0EB3 || (value >= 0x1F3FB && value <= 0x1F3FF)
+        {
+            flags |= ScalarExtraFlags.graphemeExtend
+        }
+        return flags
+    }
+}
+
+/// Additional scalar properties needed by normalizers; see ``ScalarClassifier/bmpExtra``.
+@usableFromInline
+enum ScalarExtraFlags {
+    /// `Mn` (what BERT's accent stripping removes after NFD).
+    @usableFromInline static let nonspacingMark: UInt8 = 1
+    /// `Cc` / `Cf` / `Cs` / `Co` (what BERT's `clean_text` drops, except `\t` `\n` `\r`).
+    @usableFromInline static let control: UInt8 = 2
+    /// `Zs`.
+    @usableFromInline static let spaceSeparator: UInt8 = 4
+    /// `Nd` (regex `\d`).
+    @usableFromInline static let decimalDigit: UInt8 = 8
+    /// Regex `\w`: Alphabetic, `M*`, `Nd`, `Pc`, join controls.
+    @usableFromInline static let word: UInt8 = 16
+    /// Continues the preceding grapheme cluster: `Grapheme_Extend`, `Mc`, ZWJ.
+    @usableFromInline static let graphemeExtend: UInt8 = 32
+}
+
+/// Byte-level helpers shared by the encode pipeline.
+enum ASCII {
+    /// `true` if every byte is < 0x80. Checks eight bytes per step.
+    @inline(__always)
+    static func isASCII(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        guard let base = bytes.baseAddress else { return true }
+        let raw = UnsafeRawPointer(base)
+        var i = 0
+        let n = bytes.count
+        while i + 8 <= n {
+            if raw.loadUnaligned(fromByteOffset: i, as: UInt64.self) & 0x8080_8080_8080_8080 != 0 { return false }
+            i += 8
+        }
+        while i < n {
+            if base[i] >= 0x80 { return false }
+            i += 1
+        }
+        return true
+    }
+
+    /// Appends the UTF-8 of `string` to `output` without an intermediate copy.
+    @inline(__always)
+    static func append(_ string: String, to output: inout [UInt8]) {
+        var copy = string
+        copy.withUTF8 { output.append(contentsOf: $0) }
     }
 }
 

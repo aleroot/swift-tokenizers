@@ -59,6 +59,17 @@ struct ScannerEquivalenceTests {
         (.falcon, KnownSplitPattern.falconSource),
     ]
 
+    /// Every match of `regex` in `text` (the reference the scanners are checked against).
+    private func splitMatches(in text: String, with regex: NSRegularExpression) -> [String] {
+        let ns = text as NSString
+        var result: [String] = []
+        regex.enumerateMatches(in: text, range: NSRange(location: 0, length: ns.length)) { match, _, _ in
+            guard let match else { return }
+            result.append(ns.substring(with: match.range))
+        }
+        return result
+    }
+
     @Test(arguments: [0, 1, 2, 3, 4, 5])
     func randomTexts(patternIndex: Int) throws {
         let (pattern, source) = Self.patterns[patternIndex]

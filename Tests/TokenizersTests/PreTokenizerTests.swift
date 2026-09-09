@@ -96,19 +96,22 @@ struct PreTokenizerTests {
             ]
         )
 
+        // `add_prefix_space` prepends to the section before the regex split, so only the first
+        // piece gains a space — verified with `tokenizers`:
+        // ByteLevel(add_prefix_space=True).pre_tokenize_str("Hey friend!") == ["ĠHey", "Ġfriend", "!"]
         let preTokenizer2 = ByteLevelPreTokenizer(config: Config(["addPrefixSpace": true]))
 
         #expect(
-            preTokenizer2.preTokenize(text: "Hey friend!") == ["ĠHey", "Ġfriend", "Ġ!"]
+            preTokenizer2.preTokenize(text: "Hey friend!") == ["ĠHey", "Ġfriend", "!"]
         )
         #expect(
             preTokenizer2.preTokenize(text: "Hey friend!     How are you?!?") == [
-                "ĠHey", "Ġfriend", "Ġ!", "ĠĠĠĠ", "ĠHow", "Ġare", "Ġyou", "Ġ?!?",
+                "ĠHey", "Ġfriend", "!", "ĠĠĠĠ", "ĠHow", "Ġare", "Ġyou", "?!?",
             ]
         )
         #expect(
             preTokenizer2.preTokenize(text: "   Hey,    friend,    what's up?  ") == [
-                "ĠĠ", "ĠHey", "Ġ,", "ĠĠĠ", "Ġfriend", "Ġ,", "ĠĠĠ", "Ġwhat", "Ġ's", "Ġup", "Ġ?",
+                "ĠĠ", "ĠHey", ",", "ĠĠĠ", "Ġfriend", ",", "ĠĠĠ", "Ġwhat", "'s", "Ġup", "?",
                 "ĠĠ",
             ]
         )

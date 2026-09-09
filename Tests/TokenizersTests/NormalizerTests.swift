@@ -262,3 +262,24 @@ struct NormalizerTests {
         #expect(try NormalizerFactory.fromConfig(config: config) as? StripNormalizer != nil)
     }
 }
+
+@Suite("Grapheme-extension invariant")
+struct GraphemeExtensionInvariantTests {
+    /// The Precompiled normalizer processes ASCII runs directly and only hands a trailing
+    /// ASCII scalar to the grapheme segmenter when the following scalar is flagged
+    /// `graphemeExtend`. The flag must therefore cover every scalar that Swift's segmentation
+    /// joins to a preceding ASCII scalar.
+    @Test("Every scalar that extends an ASCII-led grapheme is flagged")
+    func flagCoversSegmentation() {
+        var missing: [UInt32] = []
+        for value in 0x80..<0x30000 as Range<UInt32> {
+            guard let scalar = Unicode.Scalar(value) else { continue }
+            var text = "a"
+            text.unicodeScalars.append(scalar)
+            let joined = text.count == 1
+            let flagged = ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.graphemeExtend != 0
+            if joined, !flagged { missing.append(value) }
+        }
+        #expect(missing.isEmpty, "unflagged extenders: \(missing.prefix(20).map { String($0, radix: 16) })")
+    }
+}

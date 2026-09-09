@@ -39,27 +39,20 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     let specialTokens: [String: Int]
     let specialTokenIds: Set<Int>
 
-    private let splitter: AddedTokenSplitter?
-    private let normalizedSplitter: AddedTokenSplitter?
-    private let preTokenizer: (any PreTokenizer)?
-    private let normalizer: (any Normalizer)?
+    private let preTokenizer: (any StagedPreTokenizer)?
+    private let normalizer: (any ByteNormalizer)?
     private let postProcessor: (any PostProcessor)?
     private let decoder: (any Decoder)?
     private let normalizedAddedTokenSpellings: [Int: String]
     private let tokenizerConfig: Config
     private let cleanUpTokenizationSpaces: Bool
 
+    /// Raw text → pieces, over UTF-8 bytes.
+    private let pipeline: EncodePipeline
+    private let scratchPool = EncodeScratchPool()
     private let fastModel: (any FastTokenizingModel)?
     private let fastPostProcessor: (any FastPostProcessor)?
     private let byteLevelDecodeTable: ByteLevelDecodeTable?
-
-    /// Present when the whole encode pipeline can run on raw UTF-8: no normalizer (or only
-    /// NFC), a recognised byte-level split pattern, no `add_prefix_space`, and a BPE model.
-    /// Covers GPT-2, Llama 3, Qwen, DeepSeek, Phi-4, Mistral-Tekken, o200k and Falcon-H1
-    /// style tokenizers.
-    private let byteFastPath: ByteLevelPipeline?
-    /// Whether the fast path must NFC-normalize non-ASCII sections first.
-    private let byteFastPathNFC: Bool
 
     /// Compiled Jinja templates keyed by their source.
     private let compiledChatTemplates = Locked<[String: Template]>([:])
@@ -103,11 +96,10 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         self.specialTokens = specialTokens
         specialTokenIds = Set(specialTokens.values)
         self.addedTokens = Set(addedTokens.keys)
-        splitter = AddedTokenSplitter(tokens: splitterTokens)
 
-        preTokenizer = try PreTokenizerFactory.fromConfig(config: tokenizerData["preTokenizer"])
+        let preTokenizer = try PreTokenizerFactory.fromConfig(config: tokenizerData["preTokenizer"])
+        self.preTokenizer = preTokenizer
         self.normalizer = normalizer
-        normalizedSplitter = AddedTokenSplitter(tokens: normalizedTokens)
         postProcessor = try PostProcessorFactory.fromConfig(config: tokenizerData["postProcessor"])
         decoder = try DecoderFactory.fromConfig(
             config: tokenizerData["decoder"], addedTokens: self.addedTokens.union(normalizedSpellings.values))
@@ -119,6 +111,17 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData, addedTokens: addedTokens, strict: strict)
         self.model = model
         fastModel = model as? any FastTokenizingModel
+
+        // `fuse_unk` is a property of the WordPiece-style models; BPE and Unigram fuse
+        // (or byte-fall-back) unknowns themselves.
+        let fusesUnknown = model.fuseUnknownTokens && !(model is BPETokenizer) && !(model is UnigramTokenizer)
+        pipeline = EncodePipeline(
+            splitter: AddedTokenSplitter(tokens: splitterTokens),
+            normalizer: normalizer,
+            normalizedSplitter: AddedTokenSplitter(tokens: normalizedTokens),
+            preTokenizer: preTokenizer.map { PreTokenizationRunner(stages: $0.stages) },
+            fuseUnknownId: fusesUnknown ? model.unknownTokenId : nil
+        )
 
         if let sequence = postProcessor as? SequenceProcessing {
             fastPostProcessor = sequence.supportsFastPath ? sequence : nil
@@ -132,56 +135,10 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             byteLevelDecodeTable = nil
         }
 
-        if model is BPETokenizer, normalizedTokens.isEmpty, normalizer == nil || normalizer is NFCNormalizer {
-            byteFastPath = Self.byteLevelPattern(of: preTokenizer)
-            byteFastPathNFC = normalizer is NFCNormalizer
-        } else {
-            byteFastPath = nil
-            byteFastPathNFC = false
-        }
-
         // Prepare shared Unicode classification data so a loaded tokenizer is ready
-        // for its first request. Subsequent tokenizers reuse the table.
+        // for its first request. Subsequent tokenizers reuse the tables.
         _ = ScalarClassifier.bmp
-    }
-
-    /// The pre-tokenization stages the byte-level fast path can run without materialising
-    /// strings: an optional `Punctuation` pre-split, a known regex, `ByteLevel`, and an
-    /// optional `[0-9]` isolation after it.
-    struct ByteLevelPipeline {
-        var punctuation: PunctuationPreTokenizer.Behavior?
-        var pattern: KnownSplitPattern
-        var isolateDigits: Bool
-    }
-
-    /// Recognises `ByteLevel(use_regex: true)`, `Sequence[Split(<known regex>), ByteLevel(use_regex: false)]`
-    /// and the Falcon-H1 shape `Sequence[Punctuation, Split(<known>), ByteLevel, Split([0-9])]`.
-    /// pre-tokenizers without `add_prefix_space`.
-    private static func byteLevelPattern(of preTokenizer: (any PreTokenizer)?) -> ByteLevelPipeline? {
-        if let byteLevel = preTokenizer as? ByteLevelPreTokenizer {
-            return byteLevel.useRegex && !byteLevel.addPrefixSpace
-                ? ByteLevelPipeline(punctuation: nil, pattern: .gpt2, isolateDigits: false) : nil
-        }
-        guard let sequence = preTokenizer as? PreTokenizerSequence else { return nil }
-        var stages = sequence.preTokenizers[...]
-        var pipeline = ByteLevelPipeline(punctuation: nil, pattern: .gpt2, isolateDigits: false)
-        if let punctuation = stages.first as? PunctuationPreTokenizer {
-            pipeline.punctuation = punctuation.behavior
-            stages = stages.dropFirst()
-        }
-        guard let split = stages.first as? SplitPreTokenizer, let pattern = split.known else { return nil }
-        pipeline.pattern = pattern
-        stages = stages.dropFirst()
-        guard let byteLevel = stages.first as? ByteLevelPreTokenizer, !byteLevel.useRegex, !byteLevel.addPrefixSpace
-        else {
-            return nil
-        }
-        stages = stages.dropFirst()
-        if let digits = stages.first as? SplitPreTokenizer, digits.asciiDigitsIsolated {
-            pipeline.isolateDigits = true
-            stages = stages.dropFirst()
-        }
-        return stages.isEmpty ? pipeline : nil
+        _ = ScalarClassifier.bmpExtra
     }
 
     // MARK: - Pipeline stages (string API)
@@ -206,21 +163,6 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         return decoder.decode(tokens: tokens)
     }
 
-    func fuseUnknown(_ tokens: [String]) -> [String] {
-        guard fuseUnknownTokens, !(model is BPETokenizer), !(model is UnigramTokenizer) else { return tokens }
-        var fused: [String] = []
-        fused.reserveCapacity(tokens.count)
-        var previousIsUnknown = false
-        for token in tokens {
-            let isUnknown = model.convertTokenToId(token) == model.unknownTokenId
-            if !isUnknown || !previousIsUnknown {
-                fused.append(token)
-            }
-            previousIsUnknown = isUnknown
-        }
-        return fused
-    }
-
     /// Clean up a list of simple English tokenization artifacts like spaces before
     /// punctuation and abbreviated forms.
     func cleanUp(text: String) -> String {
@@ -230,37 +172,48 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 
     // MARK: - Tokenization
 
-    /// Sections of `text` around added tokens, in order.
-    private func sections(of text: String) -> [AddedTokenSplitter.Section] {
-        guard !text.isEmpty else { return [] }
-        let rawSections = splitter?.split(text) ?? [.text(Substring(text))]
-        guard normalizer != nil else { return rawSections }
-        return rawSections.flatMap { section -> [AddedTokenSplitter.Section] in
-            switch section {
-            case .token: return [section]
-            case .text(let chunk):
-                let normalized = normalize(String(chunk))
-                guard !normalized.isEmpty else { return [] }
-                return normalizedSplitter?.split(normalized) ?? [.text(Substring(normalized))]
-            }
-        }
+    /// Runs `body` with a pooled scratch object.
+    @inline(__always)
+    private func withScratch<R>(_ body: (EncodeScratch) -> R) -> R {
+        let scratch = scratchPool.take()
+        defer { scratchPool.recycle(scratch) }
+        return body(scratch)
     }
 
     public func tokenize(text: String) -> [String] {
+        var copy = text
         var tokens: [String] = []
-        for (index, section) in sections(of: text).enumerated() {
-            switch section {
-            case let .token(_, id):
-                if let content = model.convertIdToToken(id) { tokens.append(content) }
-            case let .text(chunk):
-                let options: PreTokenizerOptions = index == 0 ? [.firstSection] : []
-                var sectionTokens: [String] = []
-                for piece in preTokenize(String(chunk), options: options) {
-                    sectionTokens.append(contentsOf: fuseUnknown(model.tokenize(text: piece)))
-                }
-                tokens.append(contentsOf: sectionTokens)
+        let fuseUnknownId = pipeline.fuseUnknownId
+        var sectionStart = 0
+        /// Collapses runs of unknown tokens in the current section (`fuse_unk`).
+        func fuse() {
+            guard let fuseUnknownId, sectionStart < tokens.count else { return }
+            var kept: [String] = []
+            var previousIsUnknown = false
+            for token in tokens[sectionStart...] {
+                let isUnknown = model.convertTokenToId(token) == fuseUnknownId
+                if !isUnknown || !previousIsUnknown { kept.append(token) }
+                previousIsUnknown = isUnknown
+            }
+            tokens.removeSubrange(sectionStart...)
+            tokens.append(contentsOf: kept)
+        }
+        withScratch { scratch in
+            copy.withUTF8 { bytes in
+                pipeline.run(
+                    bytes, scratch: scratch,
+                    onToken: { id in
+                        fuse()
+                        if let content = model.convertIdToToken(id) { tokens.append(content) }
+                        sectionStart = tokens.count
+                    },
+                    onPiece: { piece, byteLevel in
+                        let text = byteLevel ? ByteLevelAlphabet.encode(piece) : String(decoding: piece, as: UTF8.self)
+                        tokens.append(contentsOf: model.tokenize(text: text))
+                    })
             }
         }
+        fuse()
         return tokens
     }
 
@@ -278,43 +231,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         guard let fastModel else {
             return tokenize(text: text).compactMap { model.convertTokenToId($0) }
         }
-        if let byteFastPath {
-            return encodeByteLevel(text: text, pipeline: byteFastPath, model: fastModel)
-        }
-
-        var ids: [Int] = []
-        ids.reserveCapacity(text.utf8.count / 3 + 4)
-
         let encoder = fastModel.makeEncoder()
         defer { encoder.finish() }
-
-        var preTokens: [PreToken] = []
-        let unknownId = model.unknownTokenId
-        let fuse = model.fuseUnknownTokens && !(model is BPETokenizer) && !(model is UnigramTokenizer)
-
-        for (index, section) in sections(of: text).enumerated() {
-            switch section {
-            case let .token(_, id):
-                ids.append(id)
-            case let .text(chunk):
-                let sectionStart = ids.count
-                let options: PreTokenizerOptions = index == 0 ? [.firstSection] : []
-                let normalized = chunk  // sections(of:) already normalized non-added text once.
-                preTokens.removeAll(keepingCapacity: true)
-                if let preTokenizer {
-                    preTokenizer.preTokenizeFast(normalized, options: options, into: &preTokens)
-                } else {
-                    preTokens.append(PreToken(text: normalized, byteLevel: false))
-                }
-                for preToken in preTokens {
-                    encoder.encode(piece: preToken.text, byteLevel: preToken.byteLevel, into: &ids)
-                }
-                if fuse, let unknownId {
-                    Self.fuseUnknown(&ids, from: sectionStart, unknownId: unknownId)
-                }
-            }
-        }
-        return ids
+        return withScratch { pipeline.encode(text, encoder: encoder, scratch: $0) }
     }
 
     /// Applies the configured post-processor to a sequence of ids.
@@ -331,136 +250,6 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
                 tokens: tokens, tokensPair: nil, addSpecialTokens: addSpecialTokens)
             ids = processed.compactMap { model.convertTokenToId($0) }
         }
-    }
-
-    /// Allocation-light pipeline over raw UTF-8 for byte-level BPE tokenizers.
-    private func encodeByteLevel(
-        text: String, pipeline: ByteLevelPipeline, model fastModel: any FastTokenizingModel
-    ) -> [Int] {
-        var text = text
-        let encoder = fastModel.makeEncoder()
-        defer { encoder.finish() }
-        let unknownId = model.unknownTokenId
-        let fuse = model.fuseUnknownTokens && !(model is BPETokenizer) && !(model is UnigramTokenizer)
-        let splitter = self.splitter
-        let nfc = byteFastPathNFC
-        let pattern = pipeline.pattern
-        let isolateDigits = pipeline.isolateDigits
-
-        // The output array is created inside the closure and returned, rather than captured, so
-        // appends are not routed through a heap box with dynamic exclusivity checks.
-        return text.withUTF8 { bytes -> [Int] in
-            var ids: [Int] = []
-            ids.reserveCapacity(bytes.count / 3 + 4)
-
-            var sections: [AddedTokenSplitter.ByteSection] = []
-            if let splitter {
-                splitter.split(bytes: bytes, into: &sections)
-            } else {
-                sections.append(.text(0..<bytes.count))
-            }
-
-            var ranges: [Range<Int>] = []
-            var punctuationRanges: [Range<Int>] = []
-
-            /// Encodes one piece, isolating ASCII digits first if the pipeline asks for it.
-            @inline(__always)
-            func encodePiece(_ piece: UnsafeBufferPointer<UInt8>, into ids: inout [Int]) {
-                guard isolateDigits else {
-                    encoder.encode(bytes: piece, byteLevel: true, into: &ids)
-                    return
-                }
-                var start = 0
-                for i in 0..<piece.count where piece[i] >= 0x30 && piece[i] <= 0x39 {
-                    if i > start {
-                        encoder.encode(
-                            bytes: UnsafeBufferPointer(rebasing: piece[start..<i]), byteLevel: true, into: &ids)
-                    }
-                    encoder.encode(bytes: UnsafeBufferPointer(rebasing: piece[i..<i + 1]), byteLevel: true, into: &ids)
-                    start = i + 1
-                }
-                if start < piece.count {
-                    encoder.encode(
-                        bytes: UnsafeBufferPointer(rebasing: piece[start..<piece.count]), byteLevel: true, into: &ids)
-                }
-            }
-
-            /// Splits `chunk` with the known pattern and encodes every piece.
-            func encodeChunk(_ chunk: UnsafeBufferPointer<UInt8>, into ids: inout [Int]) {
-                ranges.removeAll(keepingCapacity: true)
-                pattern.split(chunk, into: &ranges)
-                for pieceRange in ranges {
-                    encodePiece(UnsafeBufferPointer(rebasing: chunk[pieceRange]), into: &ids)
-                }
-            }
-
-            func encodeSection(_ slice: UnsafeBufferPointer<UInt8>, into ids: inout [Int]) {
-                let sectionStart = ids.count
-                ranges.reserveCapacity(slice.count / 4 + 1)
-                if let behavior = pipeline.punctuation {
-                    punctuationRanges.removeAll(keepingCapacity: true)
-                    PunctuationPreTokenizer.splitRanges(slice, behavior: behavior, into: &punctuationRanges)
-                    for chunkRange in punctuationRanges {
-                        encodeChunk(UnsafeBufferPointer(rebasing: slice[chunkRange]), into: &ids)
-                    }
-                } else {
-                    encodeChunk(slice, into: &ids)
-                }
-                if fuse, let unknownId {
-                    Self.fuseUnknown(&ids, from: sectionStart, unknownId: unknownId)
-                }
-            }
-
-            for section in sections {
-                switch section {
-                case let .token(id):
-                    ids.append(id)
-                case let .text(range):
-                    let slice = UnsafeBufferPointer(rebasing: bytes[range])
-                    if nfc, !Self.isASCII(slice) {
-                        // NFC is the identity on ASCII; only non-ASCII sections pay for normalization.
-                        var normalized = String(decoding: slice, as: UTF8.self).precomposedStringWithCanonicalMapping
-                        normalized.withUTF8 { encodeSection($0, into: &ids) }
-                    } else {
-                        encodeSection(slice, into: &ids)
-                    }
-                }
-            }
-            return ids
-        }
-    }
-
-    /// `true` if every byte is < 0x80. Checks eight bytes per step.
-    @inline(__always)
-    private static func isASCII(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
-        guard let base = bytes.baseAddress else { return true }
-        let raw = UnsafeRawPointer(base)
-        var i = 0
-        let n = bytes.count
-        while i + 8 <= n {
-            if raw.loadUnaligned(fromByteOffset: i, as: UInt64.self) & 0x8080_8080_8080_8080 != 0 { return false }
-            i += 8
-        }
-        while i < n {
-            if base[i] >= 0x80 { return false }
-            i += 1
-        }
-        return true
-    }
-
-    /// Collapses runs of the unknown id inside `ids[from...]` into a single id.
-    private static func fuseUnknown(_ ids: inout [Int], from start: Int, unknownId: Int) {
-        var write = start
-        var previousIsUnknown = false
-        for read in start..<ids.count {
-            let id = ids[read]
-            let isUnknown = id == unknownId
-            if isUnknown, previousIsUnknown { continue }
-            ids[write] = id
-            write += 1
-            previousIsUnknown = isUnknown
-        }
-        ids.removeSubrange(write...)
     }
 
     /// Reference pipeline over token strings (used for models without a fast path).
