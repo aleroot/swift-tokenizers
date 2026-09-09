@@ -49,7 +49,10 @@ struct PreTokenizationRunner: Sendable {
         }
         current.append(0..<bytes.count)
         var byteLevel = false
-        let rest = options.subtracting([.firstSection])
+        // Avoid allocating a `Set` per call for the common `[.firstSection]` / `[]` inputs.
+        let rest: PreTokenizerOptions =
+            options.count == 1 && options.contains(.firstSection) || options.isEmpty
+            ? [] : options.subtracting([.firstSection])
 
         for stage in stages {
             switch stage {
@@ -151,10 +154,10 @@ struct PreTokenizationRunner: Sendable {
 }
 
 /// A small pool of reusable buffers handed to pipeline stages for intermediate text and
-/// piece lists.
+/// piece lists. Owned by one encode call at a time, so exclusivity is not enforced dynamically.
 final class ScratchBuffers {
-    private var freeBytes: [[UInt8]] = []
-    private var freeRanges: [[Range<Int>]] = []
+    @exclusivity(unchecked) private var freeBytes: [[UInt8]] = []
+    @exclusivity(unchecked) private var freeRanges: [[Range<Int>]] = []
 
     /// An empty byte buffer (with whatever capacity a previous user left in it).
     @inline(__always)
@@ -306,12 +309,24 @@ struct EncodePipeline: Sendable {
     }
 }
 
-/// Buffers for one encode call. Obtained from ``EncodeScratchPool``.
+/// Buffers for one encode call, plus the model's ``PieceEncoder`` so its working state
+/// (lattice, merge buffers, WordPiece scratch) survives across calls. Obtained from
+/// ``EncodeScratchPool``; used by one caller at a time.
 final class EncodeScratch {
-    var sections: [AddedTokenSplitter.ByteSection] = []
-    var subsections: [AddedTokenSplitter.ByteSection] = []
-    var normalized: [UInt8] = []
+    @exclusivity(unchecked) var sections: [AddedTokenSplitter.ByteSection] = []
+    @exclusivity(unchecked) var subsections: [AddedTokenSplitter.ByteSection] = []
+    @exclusivity(unchecked) var normalized: [UInt8] = []
     let buffers = ScratchBuffers()
+    private var encoder: PieceEncoder?
+
+    /// The pooled encoder for `model`, created on first use.
+    @inline(__always)
+    func encoder(for model: any FastTokenizingModel) -> PieceEncoder {
+        if let encoder { return encoder }
+        let encoder = model.makeEncoder()
+        self.encoder = encoder
+        return encoder
+    }
 }
 
 /// A lock-protected free list of ``EncodeScratch`` objects so concurrent callers never share

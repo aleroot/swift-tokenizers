@@ -569,28 +569,32 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         var ranks: [UInt32] = []
     }
 
-    /// Stateful encoder holding scratch buffers, created once per `encode` call. It tries to
-    /// take ownership of the shared pretoken cache; if another thread holds it, encoding
+    /// Stateful encoder holding scratch buffers, pooled across `encode` calls. Each call tries
+    /// to take ownership of the shared pretoken cache; if another thread holds it, encoding
     /// proceeds without memoisation rather than blocking.
+    ///
+    /// The buffers are only ever touched by the single caller holding the encoder, so dynamic
+    /// exclusivity enforcement on them is pure overhead.
     final class Encoder: PieceEncoder {
         let model: BPETokenizer
-        var symbols: [Symbol] = []
-        var scratch = MergeScratch()
-        var fallbackBytes: [UInt8] = []
-        /// Whether this encoder owns the shared cache for its lifetime (immutable so hot-path
-        /// reads need no exclusivity enforcement).
-        let usesCache: Bool
-        private var finished = false
+        @exclusivity(unchecked) var symbols: [Symbol] = []
+        @exclusivity(unchecked) var scratch = MergeScratch()
+        @exclusivity(unchecked) var fallbackBytes: [UInt8] = []
+        /// Whether this encoder owns the shared cache for the current call.
+        @exclusivity(unchecked) private(set) var usesCache = false
 
         init(model: BPETokenizer) {
             self.model = model
-            usesCache = model.cache.lock.tryLock()
             symbols.reserveCapacity(64)
         }
 
+        override func begin() {
+            usesCache = model.cache.lock.tryLock()
+        }
+
         override func finish() {
-            guard usesCache, !finished else { return }
-            finished = true
+            guard usesCache else { return }
+            usesCache = false
             model.cache.lock.unlock()
         }
 
@@ -726,6 +730,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
     /// Tokenizes an already pre-tokenized (alphabet-encoded) chunk into token strings.
     func tokenize(text: String) -> [String] {
         let encoder = makeEncoder()
+        encoder.begin()
         defer { encoder.finish() }
         var ids: [Int] = []
         encoder.encode(piece: Substring(text), byteLevel: false, into: &ids)

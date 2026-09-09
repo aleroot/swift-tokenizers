@@ -209,19 +209,21 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
     final class Encoder: PieceEncoder {
         let model: UnigramTokenizer
         let lattice = Lattice()
-        private var alphabetScratch: [UInt8] = []
-        /// Whether this encoder owns the shared cache for its lifetime.
-        let usesCache: Bool
-        private var finished = false
+        @exclusivity(unchecked) private var alphabetScratch: [UInt8] = []
+        /// Whether this encoder owns the shared cache for the current call.
+        @exclusivity(unchecked) private(set) var usesCache = false
 
         init(model: UnigramTokenizer) {
             self.model = model
+        }
+
+        override func begin() {
             usesCache = model.cache.lock.tryLock()
         }
 
         override func finish() {
-            guard usesCache, !finished else { return }
-            finished = true
+            guard usesCache else { return }
+            usesCache = false
             model.cache.lock.unlock()
         }
 

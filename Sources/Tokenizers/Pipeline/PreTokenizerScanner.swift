@@ -279,23 +279,9 @@ enum ScalarExtraFlags {
 
 /// Byte-level helpers shared by the encode pipeline.
 enum ASCII {
-    /// `true` if every byte is < 0x80. Checks eight bytes per step.
+    /// `true` if every byte is < 0x80.
     @inline(__always)
-    static func isASCII(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
-        guard let base = bytes.baseAddress else { return true }
-        let raw = UnsafeRawPointer(base)
-        var i = 0
-        let n = bytes.count
-        while i + 8 <= n {
-            if raw.loadUnaligned(fromByteOffset: i, as: UInt64.self) & 0x8080_8080_8080_8080 != 0 { return false }
-            i += 8
-        }
-        while i < n {
-            if base[i] >= 0x80 { return false }
-            i += 1
-        }
-        return true
-    }
+    static func isASCII(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool { ByteKernels.isASCII(bytes) }
 
     /// Appends the UTF-8 of `string` to `output` without an intermediate copy.
     @inline(__always)
@@ -337,6 +323,26 @@ enum UTF8Cursor {
         if b0 < 0xE0 { return 2 }
         if b0 < 0xF0 { return 3 }
         return 4
+    }
+
+    /// Appends the UTF-8 encoding of the scalar `value`.
+    @inlinable
+    static func encode(_ value: UInt32, into output: inout [UInt8]) {
+        if value < 0x80 {
+            output.append(UInt8(value))
+        } else if value < 0x800 {
+            output.append(UInt8(0xC0 | value >> 6))
+            output.append(UInt8(0x80 | value & 0x3F))
+        } else if value < 0x10000 {
+            output.append(UInt8(0xE0 | value >> 12))
+            output.append(UInt8(0x80 | value >> 6 & 0x3F))
+            output.append(UInt8(0x80 | value & 0x3F))
+        } else {
+            output.append(UInt8(0xF0 | value >> 18))
+            output.append(UInt8(0x80 | value >> 12 & 0x3F))
+            output.append(UInt8(0x80 | value >> 6 & 0x3F))
+            output.append(UInt8(0x80 | value & 0x3F))
+        }
     }
 }
 

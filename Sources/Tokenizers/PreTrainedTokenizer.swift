@@ -233,9 +233,12 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         guard let fastModel else {
             return tokenize(text: text).compactMap { model.convertTokenToId($0) }
         }
-        let encoder = fastModel.makeEncoder()
-        defer { encoder.finish() }
-        return withScratch { pipeline.encode(text, encoder: encoder, scratch: $0) }
+        return withScratch { scratch in
+            let encoder = scratch.encoder(for: fastModel)
+            encoder.begin()
+            defer { encoder.finish() }
+            return pipeline.encode(text, encoder: encoder, scratch: scratch)
+        }
     }
 
     /// Applies the configured post-processor to a sequence of ids.

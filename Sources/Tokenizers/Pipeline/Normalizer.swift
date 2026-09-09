@@ -162,33 +162,70 @@ final class ReplaceNormalizer: ByteNormalizer {
     }
 }
 
+/// Per-scalar full lowercase mapping (`char::to_lowercase` in `tokenizers`, `String.lowercased()`
+/// in Swift: no final-sigma context).
 final class LowercaseNormalizer: ByteNormalizer {
     required init(config: Config) {}
 
     func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
-        ASCII.isASCII(bytes) && !bytes.contains { $0 >= 0x41 && $0 <= 0x5A }
+        ByteKernels.isASCII(bytes) && !ByteKernels.containsUppercase(bytes)
     }
 
     func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
-        if ASCII.isASCII(bytes) {
-            output.reserveCapacity(output.count + bytes.count)
-            for byte in bytes { output.append(byte >= 0x41 && byte <= 0x5A ? byte | 0x20 : byte) }
-        } else {
-            ASCII.append(String(decoding: bytes, as: UTF8.self).lowercased(), to: &output)
+        let mark = output.count
+        if Self.appendLowercased(bytes, to: &output) { return }
+        output.removeSubrange(mark...)
+        ASCII.append(String(decoding: bytes, as: UTF8.self).lowercased(), to: &output)
+    }
+
+    /// Appends the lowercase form of `bytes` using the SIMD ASCII kernel and the BMP case
+    /// table. Returns `false` (with `output` in an unspecified state past its previous count)
+    /// when a scalar's mapping is not a single BMP scalar.
+    static func appendLowercased(_ bytes: UnsafeBufferPointer<UInt8>, to output: inout [UInt8]) -> Bool {
+        typealias Property = UnicodeNormalization.Property
+        let n = bytes.count
+        output.reserveCapacity(output.count + n)
+        var i = 0
+        while i < n {
+            let j = ByteKernels.firstNonASCII(bytes, from: i)
+            if j > i {
+                let base = output.count
+                output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<j]))
+                output.withUnsafeMutableBufferPointer {
+                    ByteKernels.lowercaseASCII(UnsafeMutableBufferPointer(rebasing: $0[base...]))
+                }
+                i = j
+                if i >= n { break }
+            }
+            let (value, width) = UTF8Cursor.decode(bytes, at: i)
+            let properties = UnicodeNormalization.properties(of: value)
+            if properties & (Property.lowercaseComplex | Property.supplementary) != 0 { return false }
+            if properties & Property.lowercaseMapped != 0 {
+                UTF8Cursor.encode(UnicodeNormalization.lowercase(value), into: &output)
+            } else {
+                output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<i + width]))
+            }
+            i += width
         }
+        return true
     }
 }
 
-/// A Unicode normalization form. Identity on ASCII; Foundation handles the rest.
+/// A Unicode normalization form. Text that the quick check proves to be in the form already
+/// (all everyday text) is copied; Foundation normalizes the rest.
 protocol UnicodeFormNormalizer: ByteNormalizer {
     static func apply(_ text: String) -> String
+    /// ``UnicodeNormalization/Property`` flags of scalars that are not (certainly) in the form.
+    static var unstable: UInt16 { get }
 }
 
 extension UnicodeFormNormalizer {
-    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool { ASCII.isASCII(bytes) }
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        UnicodeNormalization.isNormalized(bytes, mask: Self.unstable)
+    }
 
     func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
-        if ASCII.isASCII(bytes) {
+        if isIdentity(on: bytes) {
             output.append(contentsOf: bytes)
         } else {
             ASCII.append(Self.apply(String(decoding: bytes, as: UTF8.self)), to: &output)
@@ -198,21 +235,25 @@ extension UnicodeFormNormalizer {
 
 final class NFDNormalizer: UnicodeFormNormalizer {
     required init(config: Config) {}
+    static let unstable = UnicodeNormalization.Property.notNFD
     static func apply(_ text: String) -> String { text.decomposedStringWithCanonicalMapping }
 }
 
 final class NFCNormalizer: UnicodeFormNormalizer {
     required init(config: Config) {}
+    static let unstable = UnicodeNormalization.Property.notNFC
     static func apply(_ text: String) -> String { text.precomposedStringWithCanonicalMapping }
 }
 
 final class NFKDNormalizer: UnicodeFormNormalizer {
     required init(config: Config) {}
+    static let unstable = UnicodeNormalization.Property.notNFKD
     static func apply(_ text: String) -> String { text.decomposedStringWithCompatibilityMapping }
 }
 
 final class NFKCNormalizer: UnicodeFormNormalizer {
     required init(config: Config) {}
+    static let unstable = UnicodeNormalization.Property.notNFKC
     static func apply(_ text: String) -> String { text.precomposedStringWithCompatibilityMapping }
 }
 
@@ -230,57 +271,127 @@ final class BertNormalizer: ByteNormalizer {
     }
 
     func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
-        guard ASCII.isASCII(bytes) else { return false }
-        for byte in bytes {
-            if shouldCleanText, byte < 0x20 || byte == 0x7F { return false }
-            if shouldLowercase, byte >= 0x41, byte <= 0x5A { return false }
-        }
+        guard ByteKernels.isASCII(bytes) else { return false }
+        if shouldCleanText, ByteKernels.containsControl(bytes) { return false }
+        if shouldLowercase, ByteKernels.containsUppercase(bytes) { return false }
         return true
     }
 
     func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
         // Every step (cleaning, CJK padding, NFD + mark removal, lowercasing) is context-free
-        // across an ASCII / non-ASCII boundary, so ASCII runs take the byte loop and only the
-        // non-ASCII runs pay for Foundation. Real text is mostly ASCII with a few dashes,
-        // quotes or accented names, which would otherwise send the whole chunk down the slow path.
+        // across an ASCII / non-ASCII boundary, so ASCII runs take the SIMD kernels and
+        // non-ASCII runs are mapped scalar by scalar through the BMP tables; only scalars the
+        // tables do not cover send their run through Foundation.
         output.reserveCapacity(output.count + bytes.count)
         let n = bytes.count
         var i = 0
-        var run = scratch.take()
-        defer { scratch.recycle(run) }
         while i < n {
-            var j = i
-            while j < n, bytes[j] < 0x80 { j += 1 }
+            let j = ByteKernels.firstNonASCII(bytes, from: i)
             if j > i {
                 normalizeASCII(UnsafeBufferPointer(rebasing: bytes[i..<j]), into: &output)
                 i = j
                 if i >= n { break }
             }
-            while j < n, bytes[j] >= 0x80 { j += 1 }
-            run.removeAll(keepingCapacity: true)
-            normalizeNonASCII(UnsafeBufferPointer(rebasing: bytes[i..<j]), into: &output, run: &run)
-            i = j
+            let k = ByteKernels.firstASCII(bytes, from: i)
+            let run = UnsafeBufferPointer(rebasing: bytes[i..<k])
+            let mark = output.count
+            if !appendNormalizedBMP(run, to: &output) {
+                output.removeSubrange(mark...)
+                normalizeWithFoundation(run, into: &output, scratch: scratch)
+            }
+            i = k
         }
     }
 
     /// ASCII has no CJK ideographs or combining marks, so only cleaning and lowercasing apply.
     @inline(__always)
     private func normalizeASCII(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8]) {
-        for var byte in bytes {
-            if shouldCleanText {
+        if shouldCleanText, ByteKernels.containsControl(bytes) {
+            for var byte in bytes {
                 switch byte {
                 case 0x09, 0x0A, 0x0D: byte = 0x20
                 case 0x00...0x1F, 0x7F: continue
                 default: break
                 }
+                if shouldLowercase, byte >= 0x41, byte <= 0x5A { byte |= 0x20 }
+                output.append(byte)
             }
-            if shouldLowercase, byte >= 0x41, byte <= 0x5A { byte |= 0x20 }
-            output.append(byte)
+            return
+        }
+        let base = output.count
+        output.append(contentsOf: bytes)
+        if shouldLowercase {
+            output.withUnsafeMutableBufferPointer {
+                ByteKernels.lowercaseASCII(UnsafeMutableBufferPointer(rebasing: $0[base...]))
+            }
         }
     }
 
-    private func normalizeNonASCII(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], run: inout [UInt8])
-    {
+    /// Table-driven form of ``normalizeWithFoundation(_:into:scratch:)`` for a non-ASCII run:
+    /// canonical decomposition, `Mn` removal and simple lowercase mapping per scalar. Returns
+    /// `false` (with `output` in an unspecified state past its previous count) when a scalar
+    /// is outside the tables: a non-trivial supplementary-plane scalar, a non-`Mn` scalar
+    /// with a combining class (canonical reordering could interleave it with marks) or a
+    /// multi-scalar lowercase mapping.
+    private func appendNormalizedBMP(_ bytes: UnsafeBufferPointer<UInt8>, to output: inout [UInt8]) -> Bool {
+        typealias Property = UnicodeNormalization.Property
+        var i = 0
+        while i < bytes.count {
+            let (value, width) = UTF8Cursor.decode(bytes, at: i)
+            i += width
+            let properties = UnicodeNormalization.properties(of: value)
+            if properties & Property.supplementary != 0 { return false }
+            if shouldCleanText {
+                if value == 0xFFFD || Self.isControl(value) { continue }
+                if Self.isWhitespace(value) {
+                    output.append(0x20)
+                    continue
+                }
+            }
+            let chinese = shouldHandleChineseChars && Self.isCJKUnifiedIdeograph(value)
+            if chinese { output.append(0x20) }
+            if shouldStripAccents, properties & Property.canonicalDecomposition != 0 {
+                var accepted = true
+                UnicodeNormalization.decompose(value) { part in
+                    if accepted {
+                        accepted = appendStrippedLowercased(
+                            part, UnicodeNormalization.properties(of: part), to: &output)
+                    }
+                }
+                if !accepted { return false }
+            } else if !appendStrippedLowercased(value, properties, to: &output) {
+                return false
+            }
+            if chinese { output.append(0x20) }
+        }
+        return true
+    }
+
+    /// Drops `value` if it is a nonspacing mark (when stripping accents), otherwise appends its
+    /// (lowercased) UTF-8. Returns `false` when the tables cannot decide.
+    @inline(__always)
+    private func appendStrippedLowercased(_ value: UInt32, _ properties: UInt16, to output: inout [UInt8]) -> Bool {
+        typealias Property = UnicodeNormalization.Property
+        if shouldStripAccents {
+            if properties & Property.nonspacingMark != 0 { return true }
+            if properties & Property.combiningClassMask != 0 { return false }
+        }
+        var mapped = value
+        if shouldLowercase {
+            if properties & Property.lowercaseComplex != 0 { return false }
+            if properties & Property.lowercaseMapped != 0 { mapped = UnicodeNormalization.lowercase(value) }
+        }
+        UTF8Cursor.encode(mapped, into: &output)
+        return true
+    }
+
+    /// Reference implementation for runs the tables do not cover: Foundation NFD, mark
+    /// removal and `String.lowercased()`.
+    private func normalizeWithFoundation(
+        _ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers
+    ) {
+        var run = scratch.take()
+        defer { scratch.recycle(run) }
         if shouldCleanText || shouldHandleChineseChars {
             var i = 0
             while i < bytes.count {

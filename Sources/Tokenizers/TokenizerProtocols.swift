@@ -103,11 +103,13 @@ public protocol PreTrainedTokenizerModel: TokenizingModel {
 /// Internal fast path implemented by the bundled models: encodes pre-tokenized pieces
 /// straight into token ids, avoiding intermediate `[String]` materialization.
 protocol FastTokenizingModel: TokenizingModel {
-    /// Creates an encoder holding per-call scratch state. Call `finish()` when done.
+    /// Creates an encoder holding reusable scratch state. Encoders are pooled with the
+    /// tokenizer's ``EncodeScratch`` and bracket every encode call with `begin()` / `finish()`.
     func makeEncoder() -> PieceEncoder
 }
 
-/// Per-call encoding state. Subclassed by each model.
+/// Encoding state reused across calls (buffers, lattice, cache ownership). Subclassed by each
+/// model. Never shared between threads: the pool hands an encoder to one caller at a time.
 class PieceEncoder {
     /// Appends the ids for `piece` to `ids`.
     /// - Parameter byteLevel: `true` when the piece must be interpreted through the GPT-2
@@ -119,7 +121,10 @@ class PieceEncoder {
         encode(piece: Substring(String(decoding: bytes, as: UTF8.self)), byteLevel: byteLevel, into: &ids)
     }
 
-    /// Releases any shared resources (e.g. a cache lock). Must be called exactly once.
+    /// Acquires shared resources for one encode call (e.g. tries to take the cache lock).
+    func begin() {}
+
+    /// Releases what `begin()` acquired. Called exactly once per `begin()`.
     func finish() {}
 }
 

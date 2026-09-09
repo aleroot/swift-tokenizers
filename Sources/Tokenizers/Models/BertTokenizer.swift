@@ -174,8 +174,8 @@ extension BertTokenizer: FastTokenizingModel {
 
     final class Encoder: PieceEncoder {
         let model: BertTokenizer
-        private var scratch = WordpieceTokenizer.Scratch()
-        private var alphabetScratch: [UInt8] = []
+        @exclusivity(unchecked) private var scratch = WordpieceTokenizer.Scratch()
+        @exclusivity(unchecked) private var alphabetScratch: [UInt8] = []
 
         init(model: BertTokenizer) { self.model = model }
 
@@ -411,9 +411,12 @@ final class WordpieceTokenizer: Sendable {
     func encode(_ word: UnsafeBufferPointer<UInt8>, into ids: inout [Int], scratch: inout Scratch) -> Bool {
         let n = word.count
         guard n > 0 else { return true }
-        var scalarCount = 0
-        for byte in word where byte & 0xC0 != 0x80 { scalarCount += 1 }
-        guard scalarCount <= maxInputCharsPerWord else { return false }
+        if n > maxInputCharsPerWord {
+            // Only then can the scalar count exceed the limit.
+            var scalarCount = 0
+            for byte in word where byte & 0xC0 != 0x80 { scalarCount += 1 }
+            guard scalarCount <= maxInputCharsPerWord else { return false }
+        }
 
         let whole = vocabulary.id(of: word)
         if whole >= 0 {
