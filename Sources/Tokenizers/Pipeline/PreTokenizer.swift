@@ -218,7 +218,8 @@ final class WhitespacePreTokenizer: ByteSplitter {
     @inline(__always)
     static func isWord(_ value: UInt32) -> Bool {
         if value < 128 {
-            return (value >= 0x61 && value <= 0x7A) || (value >= 0x41 && value <= 0x5A) || (value >= 0x30 && value <= 0x39)
+            return (value >= 0x61 && value <= 0x7A) || (value >= 0x41 && value <= 0x5A)
+                || (value >= 0x30 && value <= 0x39)
                 || value == 0x5F
         }
         return ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.word != 0

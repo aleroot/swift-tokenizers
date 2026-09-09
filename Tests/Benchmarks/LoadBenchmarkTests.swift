@@ -57,10 +57,16 @@ struct TableBenchmarkTests {
     func tables() {
         var t = DispatchTime.now()
         _ = ScalarClassifier.bmp
-        print(String(format: "  bmp:      %.2f ms", Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1e6))
+        print(
+            String(
+                format: "  bmp:      %.2f ms", Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1e6)
+        )
         t = DispatchTime.now()
         _ = ScalarClassifier.bmpExtra
-        print(String(format: "  bmpExtra: %.2f ms", Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1e6))
+        print(
+            String(
+                format: "  bmpExtra: %.2f ms", Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1e6)
+        )
     }
 }
 
@@ -94,7 +100,8 @@ struct MemoryBreakdownTests {
         }
         try report("PretokenCache") { PretokenCache() }
         try report("UnigramTokenizer") {
-            try UnigramTokenizer(tokenizerConfig: Config([:] as [BinaryDistinctString: Config]), tokenizerData: config, addedTokens: [:])
+            try UnigramTokenizer(
+                tokenizerConfig: Config([:] as [BinaryDistinctString: Config]), tokenizerData: config, addedTokens: [:])
         }
         try report("Normalizer") { try NormalizerFactory.fromConfig(config: config.normalizer)! as AnyObject }
         try report("PreTokenizer") { try PreTokenizerFactory.fromConfig(config: config.preTokenizer)! as AnyObject }
@@ -108,7 +115,8 @@ struct MemoryBreakdownTests {
         try report("from(configuration:)") {
             let configuration = try LocalModelConfiguration(modelFolder: folder)
             return try AutoTokenizer.from(
-                tokenizerConfig: configuration.tokenizerConfig!, tokenizerData: configuration.tokenizerData) as AnyObject
+                tokenizerConfig: configuration.tokenizerConfig!, tokenizerData: configuration.tokenizerData)
+                as AnyObject
         }
         try report("AutoTokenizer.load") {
             try AutoTokenizer.load(from: folder) as AnyObject

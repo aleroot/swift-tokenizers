@@ -494,3 +494,24 @@ struct PreTokenizerTests {
         )
     }
 }
+
+@Suite("Metaspace prepend_scheme first inside a Sequence")
+struct MetaspaceFirstInSequenceTests {
+    /// `tokenizers` prepends only to the split whose original offset is 0, so leading
+    /// whitespace removed by an earlier stage suppresses the prefix:
+    /// Sequence([WhitespaceSplit(), Metaspace(prepend_scheme="first")]).pre_tokenize_str(" hello world")
+    /// == [("hello", (1, 6)), ("world", (7, 12))]
+    @Test("Prefix follows the original offset, not the piece index")
+    func originalOffset() throws {
+        let sequence = try PreTokenizerSequence(
+            config: Config([
+                "pretokenizers": Config([
+                    Config(["type": Config("WhitespaceSplit")]),
+                    Config(["type": Config("Metaspace"), "replacement": Config("▁"), "prepend_scheme": Config("first")]
+                    ),
+                ])
+            ]))
+        #expect(sequence.preTokenize(text: " hello world") == ["hello", "world"])
+        #expect(sequence.preTokenize(text: "hello world") == ["▁hello", "world"])
+    }
+}

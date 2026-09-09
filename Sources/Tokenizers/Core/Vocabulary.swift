@@ -59,7 +59,8 @@ final class Vocabulary: Sendable {
     convenience init(scored: PackedScoredTokens, addedTokens: [String: Int]) throws {
         var ids = [Int32](repeating: 0, count: scored.count)
         for i in 0..<scored.count { ids[i] = Int32(i) }
-        try self.init(packed: PackedStringMap(utf8: scored.utf8, offsets: scored.offsets, ids: ids), addedTokens: addedTokens)
+        try self.init(
+            packed: PackedStringMap(utf8: scored.utf8, offsets: scored.offsets, ids: ids), addedTokens: addedTokens)
     }
 
     private init(packed: PackedStringMap, extra: [(String, Int)]) throws {

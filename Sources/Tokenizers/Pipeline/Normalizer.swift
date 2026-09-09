@@ -279,7 +279,8 @@ final class BertNormalizer: ByteNormalizer {
         }
     }
 
-    private func normalizeNonASCII(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], run: inout [UInt8]) {
+    private func normalizeNonASCII(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], run: inout [UInt8])
+    {
         if shouldCleanText || shouldHandleChineseChars {
             var i = 0
             while i < bytes.count {
@@ -413,7 +414,8 @@ final class PrecompiledNormalizer: ByteNormalizer {
         asciiReplacementOffsets = (0..<128).map { value in
             Self.replacementOffset(for: [UInt8(value)], trie: trie, replacements: replacements) ?? -1
         }
-        crlfReplacementOffset = Self.replacementOffset(for: [UInt8(13), 10], trie: trie, replacements: replacements) ?? -1
+        crlfReplacementOffset =
+            Self.replacementOffset(for: [UInt8(13), 10], trie: trie, replacements: replacements) ?? -1
         asciiIsIdentity = asciiReplacementOffsets.allSatisfy { $0 < 0 } && crlfReplacementOffset < 0
     }
 

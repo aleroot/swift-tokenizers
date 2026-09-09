@@ -30,8 +30,9 @@ struct PreTokenizationRunner: Sendable {
     }
 
     /// Calls `body(piece, byteLevel)` for every piece of `bytes`, in order.
-    /// - Parameter options: `.firstSection` applies to the first piece only, as in
-    ///   `tokenizers` (Metaspace's `prepend_scheme: first` checks the original offset).
+    /// - Parameter options: `.firstSection` is passed on only to the piece that still starts at
+    ///   offset 0 of the text, as in `tokenizers` (Metaspace's `prepend_scheme: first` checks
+    ///   the original offset, so a leading-whitespace split loses it).
     func run(
         _ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, scratch: ScratchBuffers,
         _ body: (UnsafeBufferPointer<UInt8>, Bool) -> Void
@@ -98,9 +99,11 @@ struct PreTokenizationRunner: Sendable {
         _ splitter: any ByteSplitter, _ text: UnsafeBufferPointer<UInt8>, _ pieces: [Range<Int>],
         _ first: PreTokenizerOptions, _ rest: PreTokenizerOptions, into output: inout [Range<Int>]
     ) {
-        for (index, range) in pieces.enumerated() {
+        for range in pieces {
             let mark = output.count
-            splitter.split(UnsafeBufferPointer(rebasing: text[range]), options: index == 0 ? first : rest, into: &output)
+            splitter.split(
+                UnsafeBufferPointer(rebasing: text[range]), options: range.lowerBound == 0 ? first : rest, into: &output
+            )
             Self.offset(&output, from: mark, by: range.lowerBound)
         }
     }
@@ -112,12 +115,12 @@ struct PreTokenizationRunner: Sendable {
         _ first: PreTokenizerOptions, _ rest: PreTokenizerOptions, into rewritten: inout [UInt8],
         pieces output: inout [Range<Int>]
     ) {
-        for (index, range) in pieces.enumerated() {
+        for range in pieces {
             let base = rewritten.count
             let mark = output.count
             rewriter.rewrite(
-                UnsafeBufferPointer(rebasing: text[range]), options: index == 0 ? first : rest, into: &rewritten,
-                pieces: &output)
+                UnsafeBufferPointer(rebasing: text[range]), options: range.lowerBound == 0 ? first : rest,
+                into: &rewritten, pieces: &output)
             Self.offset(&output, from: mark, by: base)
         }
     }

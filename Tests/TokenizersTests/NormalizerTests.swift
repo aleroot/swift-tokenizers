@@ -15,7 +15,9 @@ struct NormalizerTests {
             ("a \u{3099} ", "a \u{3099}", "a \u{3099} ", "a \u{3099}"),
         ] {
             for (stripLeft, stripRight, expected) in [(true, true, both), (true, false, left), (false, true, right)] {
-                let normalizer = StripNormalizer(config: ["strip_left": Config(stripLeft), "strip_right": Config(stripRight)])
+                let normalizer = StripNormalizer(config: [
+                    "strip_left": Config(stripLeft), "strip_right": Config(stripRight),
+                ])
                 #expect(normalizer.normalize(text: input).utf8.elementsEqual(expected.utf8))
             }
         }

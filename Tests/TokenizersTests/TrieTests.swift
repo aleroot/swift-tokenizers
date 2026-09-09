@@ -126,7 +126,8 @@ struct DoubleArrayTrieTests {
         var random: [String] = []
         for _ in 0..<20_000 {
             let length = Int.random(in: 1...12, using: &generator)
-            random.append(String(String.UnicodeScalarView((0..<length).map { _ in alphabet.randomElement(using: &generator)! })))
+            random.append(
+                String(String.UnicodeScalarView((0..<length).map { _ in alphabet.randomElement(using: &generator)! })))
         }
         let unique = Array(Set(random))
         let big = makeTrie(unique)

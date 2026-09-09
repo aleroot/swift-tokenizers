@@ -75,7 +75,9 @@ public struct PackedStringPairs: Sendable, Hashable {
     }
 
     @inline(__always)
-    func withPair<R>(at index: Int, _ body: (UnsafeBufferPointer<UInt8>, UnsafeBufferPointer<UInt8>) throws -> R)
+    func withPair<R>(
+        at index: Int, _ body: (UnsafeBufferPointer<UInt8>, UnsafeBufferPointer<UInt8>) throws -> R
+    )
         rethrows -> R
     {
         let leftLo = Int(offsets[2 * index])

@@ -540,7 +540,8 @@ enum TokenizationCleanup {
         (" ' ", "'"), (" n't", "n't"), (" 'm", "'m"), (" 's", "'s"), (" 've", "'ve"), (" 're", "'re"),
     ].map { (Array($0.0.utf8), Array($0.1.utf8)) }
 
-    private static let wordPieceReplacements = Array(replacements.prefix(7))
+    private static let wordPieceReplacements =
+        Array(replacements.prefix(7))
         + [(pattern: Array(" do not".utf8), replacement: Array(" don't".utf8))]
         + Array(replacements.suffix(3))
 

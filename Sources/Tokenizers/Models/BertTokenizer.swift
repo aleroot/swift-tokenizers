@@ -193,7 +193,9 @@ extension BertTokenizer: FastTokenizingModel {
                 return
             }
             if model.serializedWordPiece {
-                if !model.wordpieceTokenizer.encode(bytes, into: &ids, scratch: &scratch), let unknown = model.unknownTokenId {
+                if !model.wordpieceTokenizer.encode(bytes, into: &ids, scratch: &scratch),
+                    let unknown = model.unknownTokenId
+                {
                     ids.append(unknown)
                 }
                 return
