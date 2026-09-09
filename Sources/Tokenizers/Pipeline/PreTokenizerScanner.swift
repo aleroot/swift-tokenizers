@@ -131,14 +131,18 @@ enum ScalarFlags {
 enum ScalarClassifier {
     /// Precomputed flags for the Basic Multilingual Plane (64 KiB), built on first use.
     @usableFromInline
-    static let bmp: [UInt8] = {
+    static let bmp: [UInt8] = UnicodeTables.expand(\.flags)
+
+    /// Computes the BMP table from scalar properties (the source of truth for
+    /// ``UnicodeTables``; see `UnicodeTablesTests`).
+    static func computeBMP() -> [UInt8] {
         var table = [UInt8](repeating: ScalarFlags.other, count: 0x10000)
         for v in 0..<0x10000 {
             guard let scalar = Unicode.Scalar(UInt32(v)) else { continue }
             table[v] = flagsSlow(scalar)
         }
         return table
-    }()
+    }
 
     @inlinable
     static func classify(_ scalar: Unicode.Scalar) -> ScalarClass {
@@ -204,7 +208,10 @@ enum ScalarClassifier {
 
     /// Precomputed ``ScalarExtraFlags`` for the Basic Multilingual Plane, built on first use.
     @usableFromInline
-    static let bmpExtra: [UInt8] = {
+    static let bmpExtra: [UInt8] = UnicodeTables.expand(\.extraFlags)
+
+    /// Computes the extra BMP table from scalar properties (source of truth for ``UnicodeTables``).
+    static func computeBMPExtra() -> [UInt8] {
         var table = [UInt8](repeating: 0, count: 0x10000)
         for v in 0..<0x10000 {
             guard let scalar = Unicode.Scalar(UInt32(v)) else {
@@ -214,7 +221,7 @@ enum ScalarClassifier {
             table[v] = extraFlagsSlow(scalar)
         }
         return table
-    }()
+    }
 
     @inlinable
     static func extraFlags(value v: UInt32) -> UInt8 {

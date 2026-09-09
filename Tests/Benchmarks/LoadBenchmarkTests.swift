@@ -50,3 +50,16 @@ struct LoadBenchmarkTests {
         }
     }
 }
+
+@Suite(.serialized, .enabled(if: ProcessInfo.processInfo.environment["RUN_BENCHMARKS"] == "1"))
+struct TableBenchmarkTests {
+    @Test("Unicode classification tables (first access in this process)")
+    func tables() {
+        var t = DispatchTime.now()
+        _ = ScalarClassifier.bmp
+        print(String(format: "  bmp:      %.2f ms", Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1e6))
+        t = DispatchTime.now()
+        _ = ScalarClassifier.bmpExtra
+        print(String(format: "  bmpExtra: %.2f ms", Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1e6))
+    }
+}
