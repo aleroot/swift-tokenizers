@@ -76,10 +76,29 @@ enum ByteKernels {
         range(v, 0x21, 0x30) | range(v, 0x3A, 0x41) | range(v, 0x5B, 0x61) | range(v, 0x7B, 0x7F)
     }
 
+    /// Lanes holding ASCII letters.
+    @inline(__always)
+    static func letters(_ v: Vector) -> Vector {
+        range(v, 0x41, 0x5B) | range(v, 0x61, 0x7B)
+    }
+
+    /// Lanes holding ASCII digits.
+    @inline(__always)
+    static func digits(_ v: Vector) -> Vector {
+        range(v, 0x30, 0x3A)
+    }
+
     /// Lanes holding ASCII word characters (regex `\w`: letters, digits, `_`).
     @inline(__always)
     static func word(_ v: Vector) -> Vector {
-        range(v, 0x30, 0x3A) | range(v, 0x41, 0x5B) | range(v, 0x61, 0x7B) | equals(v, 0x5F)
+        letters(v) | digits(v) | equals(v, 0x5F)
+    }
+
+    /// ASCII lanes that are neither letters, digits nor whitespace (regex `[^\s\p{L}\p{N}]`
+    /// restricted to ASCII: punctuation, symbols and control bytes).
+    @inline(__always)
+    static func others(_ v: Vector) -> Vector {
+        ~(letters(v) | digits(v) | whitespace(v) | nonASCII(v)) & 0x80
     }
 
     /// The 16 bytes at `offset` when they are all ASCII, or `nil` (fewer than 16 bytes remain or

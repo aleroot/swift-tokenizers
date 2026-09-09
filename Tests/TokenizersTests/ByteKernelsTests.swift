@@ -91,6 +91,14 @@ struct ByteKernelsTests {
                 || (value >= 123 && value <= 126)
             #expect(ByteKernels.bits(ByteKernels.punctuation(v)) == (punctuation ? 0xFFFF : 0), "punctuation \(value)")
             #expect(ByteKernels.bits(ByteKernels.nonASCII(v)) == (ascii ? 0 : 0xFFFF), "nonASCII \(value)")
+            // The scanner classes must agree with the Unicode flag table used by the scalar path.
+            let flags = ascii ? ScalarClassifier.bmp[value] : 0
+            #expect(ByteKernels.bits(ByteKernels.letters(v)) == (flags & ScalarFlags.letter != 0 ? 0xFFFF : 0))
+            #expect(ByteKernels.bits(ByteKernels.digits(v)) == (flags & ScalarFlags.number != 0 ? 0xFFFF : 0))
+            #expect(ByteKernels.bits(ByteKernels.others(v)) == (flags & ScalarFlags.other != 0 ? 0xFFFF : 0))
+            #expect(ByteKernels.bits(ByteKernels.whitespace(v)) == (flags & ScalarFlags.whitespace != 0 ? 0xFFFF : 0))
+            let isWord = ascii && WhitespacePreTokenizer.isWord(UInt32(value))
+            #expect(ByteKernels.bits(ByteKernels.word(v)) == (isWord ? 0xFFFF : 0))
         }
         // Bit order: lane i ↔ bit i.
         var lanes = ByteKernels.Vector(repeating: 0x61)

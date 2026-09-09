@@ -24,30 +24,49 @@ final class PretokenCache: @unchecked Sendable {
         var used: Bool = false
     }
 
-    private static let slotCount = 1 << 15
+    /// Table and arena sizes. Bounded, so the cache never grows past a few hundred
+    /// kilobytes (`.compact`) or a few megabytes (`.standard`) however much text is encoded.
+    struct Configuration {
+        /// `1 << slotBits` slots of 16 bytes.
+        var slotBits: Int
+        var keyArenaCapacity: Int
+        /// In 32-bit ids.
+        var idsArenaCapacity: Int
+
+        /// Large BPE / Unigram vocabularies: ~2.5 MB.
+        static let standard = Configuration(slotBits: 15, keyArenaCapacity: 1 << 20, idsArenaCapacity: 1 << 18)
+        /// Short, few pre-tokens (WordPiece words): ~0.4 MB.
+        static let compact = Configuration(slotBits: 12, keyArenaCapacity: 1 << 16, idsArenaCapacity: 1 << 16)
+    }
+
     private static let maxProbes = 8
     private static let maxKeyLength = 64
     private static let maxIdsCount = 64
-    private static let keyArenaCapacity = 1 << 20
-    private static let idsArenaCapacity = 1 << 18
 
     private let slots: UnsafeMutablePointer<Slot>
     private let keyArena: UnsafeMutablePointer<UInt8>
     /// Token ids are stored as 32-bit values (vocabularies are far below 2³¹ entries).
     private let idsArena: UnsafeMutablePointer<Int32>
+    private let slotCount: Int
+    private let keyArenaCapacity: Int
+    private let idsArenaCapacity: Int
     private var keyCount = 0
     private var idsCount = 0
-    private let mask = slotCount - 1
+    private let mask: Int
 
-    init() {
-        slots = .allocate(capacity: Self.slotCount)
-        slots.initialize(repeating: Slot(), count: Self.slotCount)
-        keyArena = .allocate(capacity: Self.keyArenaCapacity)
-        idsArena = .allocate(capacity: Self.idsArenaCapacity)
+    init(_ configuration: Configuration = .standard) {
+        slotCount = 1 << configuration.slotBits
+        mask = slotCount - 1
+        keyArenaCapacity = configuration.keyArenaCapacity
+        idsArenaCapacity = configuration.idsArenaCapacity
+        slots = .allocate(capacity: slotCount)
+        slots.initialize(repeating: Slot(), count: slotCount)
+        keyArena = .allocate(capacity: keyArenaCapacity)
+        idsArena = .allocate(capacity: idsArenaCapacity)
     }
 
     deinit {
-        slots.deinitialize(count: Self.slotCount)
+        slots.deinitialize(count: slotCount)
         slots.deallocate()
         keyArena.deallocate()
         idsArena.deallocate()
@@ -82,7 +101,7 @@ final class PretokenCache: @unchecked Sendable {
         guard n <= Self.maxKeyLength, ids.count <= Self.maxIdsCount, !ids.isEmpty, let base = bytes.baseAddress else {
             return
         }
-        if keyCount + n > Self.keyArenaCapacity || idsCount + ids.count > Self.idsArenaCapacity {
+        if keyCount + n > keyArenaCapacity || idsCount + ids.count > idsArenaCapacity {
             reset()
         }
         let hash = ByteHash.hash(bytes)
@@ -118,7 +137,7 @@ final class PretokenCache: @unchecked Sendable {
     }
 
     private func reset() {
-        for i in 0..<Self.slotCount { slots[i].used = false }
+        for i in 0..<slotCount { slots[i].used = false }
         keyCount = 0
         idsCount = 0
     }

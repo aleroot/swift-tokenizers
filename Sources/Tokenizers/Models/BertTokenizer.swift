@@ -18,6 +18,10 @@ public final class BertTokenizer: Sendable {
     /// Vocabulary keyed by exact byte sequence (no Unicode canonical folding).
     private let vocabulary: Vocabulary
 
+    /// Memoises word → ids. Words are short and few, so a compact cache keeps the footprint
+    /// well under a megabyte while repeated words (most of natural language) skip the search.
+    let cache = PretokenCache(.compact)
+
     public let bosToken: String?
     public let bosTokenId: Int?
     public let eosToken: String?
@@ -176,8 +180,20 @@ extension BertTokenizer: FastTokenizingModel {
         let model: BertTokenizer
         @exclusivity(unchecked) private var scratch = WordpieceTokenizer.Scratch()
         @exclusivity(unchecked) private var alphabetScratch: [UInt8] = []
+        /// Whether this encoder owns the shared cache for the current call.
+        @exclusivity(unchecked) private(set) var usesCache = false
 
         init(model: BertTokenizer) { self.model = model }
+
+        override func begin() {
+            usesCache = model.cache.lock.tryLock()
+        }
+
+        override func finish() {
+            guard usesCache else { return }
+            usesCache = false
+            model.cache.lock.unlock()
+        }
 
         override func encode(piece: Substring, byteLevel: Bool, into ids: inout [Int]) {
             var copy = piece
@@ -192,20 +208,23 @@ extension BertTokenizer: FastTokenizingModel {
                 alphabetScratch.withUnsafeBufferPointer { encode(bytes: $0, byteLevel: false, into: &ids) }
                 return
             }
+            let mark = ids.count
+            if usesCache, model.cache.lookup(bytes, byteLevel: false, into: &ids) { return }
             if model.serializedWordPiece {
                 if !model.wordpieceTokenizer.encode(bytes, into: &ids, scratch: &scratch),
                     let unknown = model.unknownTokenId
                 {
                     ids.append(unknown)
                 }
-                return
-            }
-            // Legacy configuration: run the built-in basic tokenizer on the piece.
-            for token in model.tokenize(text: String(decoding: bytes, as: UTF8.self)) {
-                if let id = model.convertTokenToId(token) {
-                    ids.append(id)
+            } else {
+                // Legacy configuration: run the built-in basic tokenizer on the piece.
+                for token in model.tokenize(text: String(decoding: bytes, as: UTF8.self)) {
+                    if let id = model.convertTokenToId(token) {
+                        ids.append(id)
+                    }
                 }
             }
+            if usesCache { model.cache.insert(bytes, byteLevel: false, ids: ids[mark...]) }
         }
     }
 }
@@ -347,8 +366,6 @@ final class WordpieceTokenizer: Sendable {
     struct Scratch {
         /// `##` + candidate bytes.
         var continuation: [UInt8] = []
-        /// Ids of the word being segmented (committed only when the whole word succeeds).
-        var pieces: [Int] = []
     }
 
     init(vocabulary: Vocabulary, unkToken: String = "[UNK]", prefix: String = "##", maximum: Int = 100) {
@@ -424,13 +441,18 @@ final class WordpieceTokenizer: Sendable {
             return true
         }
 
-        scratch.pieces.removeAll(keepingCapacity: true)
+        // Ids go straight into `ids` and are rolled back if the word turns out not to be
+        // segmentable: no intermediate buffer and no copy on success.
+        let mark = ids.count
         let prefixCount = continuationPrefix.count
         var start = 0
         while start < n {
             // No token starts with this scalar: the word cannot be segmented.
             let starts = start == 0 ? initialStarts : continuationStarts
-            guard starts.mayContain(UTF8Cursor.decode(word, at: start).value) else { return false }
+            guard starts.mayContain(UTF8Cursor.decode(word, at: start).value) else {
+                ids.removeSubrange(mark...)
+                return false
+            }
             // Longest candidate first, never longer than the longest vocabulary entry.
             let limit = start == 0 ? maxTokenBytes : maxTokenBytes - prefixCount
             var end = min(n, start + max(limit, 1))
@@ -456,11 +478,13 @@ final class WordpieceTokenizer: Sendable {
                     }
                 }
             }
-            guard found >= 0 else { return false }
-            scratch.pieces.append(Int(found))
+            guard found >= 0 else {
+                ids.removeSubrange(mark...)
+                return false
+            }
+            ids.append(Int(found))
             start = end
         }
-        ids.append(contentsOf: scratch.pieces)
         return true
     }
 }

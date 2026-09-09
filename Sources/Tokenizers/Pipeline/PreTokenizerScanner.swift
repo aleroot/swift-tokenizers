@@ -433,6 +433,15 @@ enum ByteLevelScanner {
         }
     }
 
+    /// ASCII lanes of `v` whose ``ScalarFlags`` intersect `mask` (ASCII has no marks, so the
+    /// class is decided by the letter / number / other bit).
+    @inline(__always)
+    static func asciiLanes(_ v: ByteKernels.Vector, _ mask: UInt8) -> ByteKernels.Vector {
+        if mask & ScalarFlags.letter != 0 { return ByteKernels.letters(v) }
+        if mask & ScalarFlags.number != 0 { return ByteKernels.digits(v) }
+        return ByteKernels.others(v)
+    }
+
     /// Decodes and classifies the scalar at `p`. Returns (value, width, flags).
     @inline(__always)
     static func decodeClassified(
@@ -458,11 +467,23 @@ enum ByteLevelScanner {
         @inline(__always)
         func at(_ p: Int) -> (UInt32, Int, UInt8) { decodeClassified(bytes, p, table) }
 
-        /// Advances over scalars whose flags intersect `mask`.
+        /// Advances over scalars whose flags intersect `mask`. Sixteen bytes at a time while
+        /// the run is ASCII; a non-ASCII scalar is classified through the tables.
         @inline(__always)
         func consumeRun(from p: Int, _ mask: UInt8) -> Int {
             var j = p
             while j < end {
+                if j + ByteKernels.width <= end {
+                    let v = ByteKernels.load(bytes.baseAddress!, j)
+                    // Lanes that end the run: ASCII bytes outside the class, plus non-ASCII bytes
+                    // (`asciiLanes` is zero there), which the scalar step below classifies.
+                    let stop = ~ByteKernels.bits(asciiLanes(v, mask))
+                    if stop == 0 {
+                        j += ByteKernels.width
+                        continue
+                    }
+                    j += stop.trailingZeroBitCount
+                }
                 let b0 = bytes[j]
                 if b0 < 0x80 {
                     if table[Int(b0)] & mask == 0 { break }

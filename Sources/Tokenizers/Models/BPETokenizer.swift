@@ -663,14 +663,18 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
             }
             let start = ids.count
             if model.ignoreMerges {
+                // `ignore_merges` (Llama 3): a word that is itself a token skips the merges.
                 let id: Int32
                 if byteLevel {
-                    id = Int32(model.vocab.id(of: ByteLevelAlphabet.encode(bytes)) ?? -1)
+                    fallbackBytes.removeAll(keepingCapacity: true)
+                    ByteLevelAlphabet.appendEncoded(bytes, to: &fallbackBytes)
+                    id = fallbackBytes.withUnsafeBufferPointer { model.vocab.id(of: $0) }
                 } else {
                     id = model.vocab.id(of: bytes)
                 }
                 if id >= 0 {
                     ids.append(Int(id))
+                    if usesCache { model.cache.insert(bytes, byteLevel: byteLevel, ids: ids[start...]) }
                     return
                 }
             }

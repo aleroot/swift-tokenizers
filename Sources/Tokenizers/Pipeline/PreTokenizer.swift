@@ -286,6 +286,10 @@ final class MetaspacePreTokenizer: ByteRewriter {
     let stringReplacement: String
     private let replacementBytes: [UInt8]
     private let stringReplacementBytes: [UInt8]
+    /// `str_rep` differs from a plain space, so spaces are substituted rather than copied.
+    private let substitutesSpace: Bool
+    /// `str_rep` equals the multi-byte `replacement`: substitution and split fuse into one pass.
+    private let fusesMarker: Bool
 
     enum PrependScheme: String {
         case first
@@ -313,6 +317,8 @@ final class MetaspacePreTokenizer: ByteRewriter {
         split = config.split.boolean(or: true)
         replacementBytes = Array(replacement.utf8)
         stringReplacementBytes = Array(stringReplacement.utf8)
+        substitutesSpace = stringReplacementBytes != [0x20]
+        fusesMarker = stringReplacementBytes.elementsEqual(replacementBytes) && replacementBytes.count > 1
 
         // `prepend_scheme` supersedes `add_prefix_space` (tokenizers PR #1357).
         if let scheme = config.prependScheme.string() {
@@ -341,14 +347,14 @@ final class MetaspacePreTokenizer: ByteRewriter {
             bytes.starts(with: replacementBytes)
             || (bytes[0] == 0x20 && stringReplacementBytes.starts(with: replacementBytes))
         let prefix = needsPrefix && !startsWithReplacement
-        if stringReplacementBytes == replacementBytes, replacementBytes.count > 1 {
+        if fusesMarker {
             rewriteFused(bytes, prefix: prefix, into: &output, pieces: &pieces)
             return
         }
         if prefix {
             output.append(contentsOf: stringReplacementBytes)
         }
-        if stringReplacementBytes == [0x20] {
+        if !substitutesSpace {
             output.append(contentsOf: bytes)
         } else {
             StringReplacePattern.replaceLiteral(bytes, pattern: [0x20], with: stringReplacementBytes, into: &output)
@@ -387,6 +393,15 @@ final class MetaspacePreTokenizer: ByteRewriter {
     ) {
         let n = bytes.count
         let m = replacementBytes.count
+        // Nothing to substitute (the rule after a `WhitespaceSplit` stage, and for most words):
+        // copy the piece as it stands instead of reserving and re-trimming a worst-case buffer.
+        if ByteKernels.firstIndex(of: 0x20, or: replacementBytes[0], in: bytes, from: 0) == n {
+            let base = output.count
+            if prefix { output.append(contentsOf: replacementBytes) }
+            output.append(contentsOf: bytes)
+            pieces.append(0..<(output.count - base))
+            return
+        }
         replacementBytes.withUnsafeBufferPointer { marker in
             let lead = marker[0]
             let split = self.split
