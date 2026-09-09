@@ -1,8 +1,8 @@
 # Benchmarks
 
-Every number on this page was measured on one machine, in one sitting, against the same inputs —
-including the numbers for the other implementations. Nothing is a vendor figure, a projection, or
-copied from an older release.
+The main comparison tables were measured on one machine, in one sitting, against the same inputs,
+including the other implementations. The [JSON parser follow-up](#json-parser-follow-up) separately
+records a later before/after experiment on an M2. All figures are measurements, not projections.
 
 | | |
 |---|---|
@@ -152,6 +152,39 @@ Stage breakdown for the two interesting cases:
 | Expand generated Unicode tables (historical implementation) | 0.05 ms | 0.05 ms |
 | **Total `AutoTokenizer.load`** | **25.9 ms** | **49.9 ms** |
 
+### JSON parser follow-up
+
+Measured on an **Apple M2, macOS 26.6.2, Swift 6.3.3**, using release builds. The baseline is
+the parser at `2ca1f36`; the optimized parser uses an eight-byte word scan for short strings,
+16-byte SIMD scans for longer runs, and direct UTF-8 validation before creating Swift strings.
+Ordinary strings and packed vocabulary entries now share one escape decoder.
+
+Five baseline/optimized pairs ran in alternating order from preserved binaries, with no builds
+running during measurement. Each figure is the median of five per-run medians, with 15 timed
+iterations and three warm-ups per run. Model loads use warm filesystem and runtime caches.
+
+| Tokenizer | Packed parse, before → after | Complete load, before → after |
+|---|---:|---:|
+| `mlx-community/Qwen3-0.6B-Base-DQ5` | 15.590 → 15.393 ms | 32.509 → 32.267 ms |
+| `intfloat/multilingual-e5-small` | 35.535 → 34.573 ms | 72.869 → 71.757 ms |
+| `google-bert/bert-base-uncased` | 0.975 → 0.979 ms | 2.203 → 2.191 ms |
+
+The complete-load differences are only 0.5–1.5%, within ordinary timing variation. These
+measurements do **not** establish a meaningful end-to-end loading speedup. String-heavy synthetic
+inputs show where the change helps: each case contains 2,048 scored vocabulary entries.
+
+| Packed JSON string workload | Before | After | Speedup |
+|---|---:|---:|---:|
+| Short ASCII, 5 bytes/string | 0.101 ms | 0.095 ms | 1.06× |
+| Short Unicode, 11 bytes/string | 0.123 ms | 0.112 ms | 1.10× |
+| Long ASCII, 1,024 bytes/string | 2.087 ms | 0.317 ms | 6.58× |
+| Long Unicode, 960 bytes/string | 3.144 ms | 1.572 ms | 2.00× |
+| Escaped strings, 768 decoded bytes/string | 3.928 ms | 3.685 ms | 1.07× |
+
+Generic JSON parsing of the long ASCII and Unicode cases improved by 2.88× and 2.16× respectively.
+The implementation remains pure Swift, uses bounded unaligned loads, and requires no input padding.
+Run the same workloads with `RUN_BENCHMARKS=1 swift test -c release --filter JSONBenchmarkTests`.
+
 ## Memory footprint
 
 Live heap and `phys_footprint` retained after `AutoTokenizer.load`, measured with `task_info` in a
@@ -288,7 +321,8 @@ hand-written over UTF-8 with NEON lane masks instead of being expressed as regul
   whose properties changed. Classification uses the runtime directly when building its caches.
   Tests check every BMP scalar and every
   non-trivial supplementary scalar against the runtime without assuming that all OS versions
-  ship identical Unicode data. See [Unicode compatibility](UNICODE.md) for regeneration.
+  ship identical Unicode data. Regenerate the compatibility ranges with
+  `python3 scripts/unicode_compatibility.py --ucd-dir <ucd-dir>`; the script pins its input checksums.
 * **Zero-allocation hot path.** Added tokens are found with a double-array trie (and `memchr`
   when they share a first byte), sections and pieces are byte ranges, model encoders and their
   working state (Viterbi lattice, merge buffers, WordPiece scratch) are pooled with the

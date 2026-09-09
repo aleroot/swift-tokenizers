@@ -134,6 +134,56 @@ enum ByteKernels {
 
     // MARK: ASCII scans
 
+    /// Finds a quote, backslash, or forbidden JSON control byte; tracks ASCII only before it.
+    @inline(__always)
+    static func jsonStringEnd(_ bytes: UnsafeBufferPointer<UInt8>, from start: Int) -> (end: Int, ascii: Bool) {
+        let n = bytes.count
+        var i = start
+        var high = Vector(repeating: 0)
+        if i + 8 <= n {
+            // Token spellings are usually short. Eight bytes fit in a general-purpose
+            // register; subtraction finds the first zero byte without a vector reduction.
+            let word = UnsafeRawPointer(bytes.baseAddress!).loadUnaligned(fromByteOffset: i, as: UInt64.self)
+                .littleEndian
+            let quote = word ^ 0x2222_2222_2222_2222
+            let slash = word ^ 0x5C5C_5C5C_5C5C_5C5C
+            // Subtraction can mark later lanes after a borrow; only the first hit is used.
+            // The control test uses carry-free addition so non-ASCII bytes cannot borrow
+            // into an adjacent space and incorrectly mark it as a control.
+            let stop =
+                (((quote &- 0x0101_0101_0101_0101) & ~quote)
+                    | ((slash &- 0x0101_0101_0101_0101) & ~slash)
+                    | (~((word & 0x7F7F_7F7F_7F7F_7F7F) &+ 0x6060_6060_6060_6060) & ~word))
+                & 0x8080_8080_8080_8080
+            if stop != 0 {
+                let bit = stop.trailingZeroBitCount & ~7
+                let prefix = (UInt64(1) << bit) &- 1
+                return (i + bit / 8, word & prefix & 0x8080_8080_8080_8080 == 0)
+            }
+            if word & 0x8080_8080_8080_8080 != 0 { high = Vector(repeating: 0x80) }
+            i += 8
+        }
+        while i + width <= n {
+            let v = load(bytes.baseAddress!, i)
+            let stop = equals(v, 0x22) | equals(v, 0x5C) | range(v, 0, 0x20)
+            if anyLane(stop) {
+                let lane = bits(stop).trailingZeroBitCount
+                let prefix = (UInt16(1) << lane) &- 1
+                return (i + lane, !anyLane(high) && bits(nonASCII(v)) & prefix == 0)
+            }
+            high |= nonASCII(v)
+            i += width
+        }
+        var ascii = !anyLane(high)
+        while i < n {
+            let c = bytes[i]
+            if c == 0x22 || c == 0x5C || c < 0x20 { break }
+            ascii = ascii && c < 0x80
+            i += 1
+        }
+        return (i, ascii)
+    }
+
     /// Index of the first byte ≥ 0x80 at or after `start`, or `bytes.count`.
     @inline(__always)
     static func firstNonASCII(_ bytes: UnsafeBufferPointer<UInt8>, from start: Int = 0) -> Int {

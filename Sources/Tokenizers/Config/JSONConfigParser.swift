@@ -373,22 +373,12 @@ struct JSONConfigParser {
         pos += 1  // opening quote
         let start = pos
 
-        // Fast scan: find closing quote, detect escapes and non-ASCII bytes.
-        var hasEscape = false
-        var isASCII = true
-        var i = pos
+        let (i, isASCII) = ByteKernels.jsonStringEnd(bytes, from: pos)
         let n = bytes.count
-        while i < n {
-            let c = bytes[i]
-            if c == UInt8(ascii: "\"") { break }
-            if c == UInt8(ascii: "\\") {
-                hasEscape = true
-                break
-            }
-            guard c >= 0x20 else { throw JSONConfigError.unexpectedCharacter(c, offset: i) }
-            if c >= 0x80 { isASCII = false }
-            i += 1
+        if i < n, bytes[i] < 0x20 {
+            throw JSONConfigError.unexpectedCharacter(bytes[i], offset: i)
         }
+        let hasEscape = i < n && bytes[i] == 0x5C
 
         if !hasEscape {
             guard i < n else { throw JSONConfigError.unexpectedEnd }
@@ -397,61 +387,7 @@ struct JSONConfigParser {
             return try Self.makeString(from: slice, offset: start, ascii: isASCII)
         }
 
-        // Slow path with escapes: copy into scratch buffer.
-        scratch.removeAll(keepingCapacity: true)
-        scratch.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[start..<i]))
-        pos = i
-        while pos < n {
-            let c = bytes[pos]
-            if c == UInt8(ascii: "\"") {
-                pos += 1
-                return try scratch.withUnsafeBufferPointer {
-                    try Self.makeString(from: $0, offset: start, ascii: $0.allSatisfy { $0 < 0x80 })
-                }
-            }
-            if c == UInt8(ascii: "\\") {
-                pos += 1
-                guard pos < n else { throw JSONConfigError.unexpectedEnd }
-                let e = bytes[pos]
-                pos += 1
-                switch e {
-                case UInt8(ascii: "\""): scratch.append(0x22)
-                case UInt8(ascii: "\\"): scratch.append(0x5C)
-                case UInt8(ascii: "/"): scratch.append(0x2F)
-                case UInt8(ascii: "b"): scratch.append(0x08)
-                case UInt8(ascii: "f"): scratch.append(0x0C)
-                case UInt8(ascii: "n"): scratch.append(0x0A)
-                case UInt8(ascii: "r"): scratch.append(0x0D)
-                case UInt8(ascii: "t"): scratch.append(0x09)
-                case UInt8(ascii: "u"):
-                    var scalar = try parseHex4()
-                    if scalar >= 0xD800, scalar <= 0xDBFF {
-                        // High surrogate: expect a low surrogate.
-                        if pos + 1 < n, bytes[pos] == UInt8(ascii: "\\"), bytes[pos + 1] == UInt8(ascii: "u") {
-                            pos += 2
-                            let low = try parseHex4()
-                            if low >= 0xDC00, low <= 0xDFFF {
-                                scalar = 0x10000 + ((scalar - 0xD800) << 10) + (low - 0xDC00)
-                            } else {
-                                throw JSONConfigError.invalidEscape(offset: pos - 4)
-                            }
-                        } else {
-                            throw JSONConfigError.invalidEscape(offset: pos)
-                        }
-                    } else if scalar >= 0xDC00, scalar <= 0xDFFF {
-                        throw JSONConfigError.invalidEscape(offset: pos - 4)
-                    }
-                    appendUTF8(scalar)
-                default:
-                    throw JSONConfigError.invalidEscape(offset: pos - 1)
-                }
-            } else {
-                guard c >= 0x20 else { throw JSONConfigError.unexpectedCharacter(c, offset: pos) }
-                scratch.append(c)
-                pos += 1
-            }
-        }
-        throw JSONConfigError.unexpectedEnd
+        return try parseStringFromEscape(start: start, firstEscape: i)
     }
 
     private enum PackedShapeError: Error { case mismatch }
@@ -690,21 +626,12 @@ struct JSONConfigParser {
     private mutating func appendJSONString(to buffer: inout [UInt8]) throws {
         pos += 1  // opening quote
         let start = pos
-        var hasEscape = false
-        var isASCII = true
-        var i = pos
+        let (i, isASCII) = ByteKernels.jsonStringEnd(bytes, from: pos)
         let n = bytes.count
-        while i < n {
-            let c = bytes[i]
-            if c == UInt8(ascii: "\"") { break }
-            if c == UInt8(ascii: "\\") {
-                hasEscape = true
-                break
-            }
-            guard c >= 0x20 else { throw JSONConfigError.unexpectedCharacter(c, offset: i) }
-            if c >= 0x80 { isASCII = false }
-            i += 1
+        if i < n, bytes[i] < 0x20 {
+            throw JSONConfigError.unexpectedCharacter(bytes[i], offset: i)
         }
+        let hasEscape = i < n && bytes[i] == 0x5C
         if !hasEscape {
             guard i < n else { throw JSONConfigError.unexpectedEnd }
             let slice = UnsafeBufferPointer(rebasing: bytes[start..<i])
@@ -720,7 +647,7 @@ struct JSONConfigParser {
         copy.withUTF8 { buffer.append(contentsOf: $0) }
     }
 
-    /// Continues `parseString` after the first backslash, using the existing unescape loop.
+    /// Shared escape decoder for ordinary strings and packed tokenizer tables.
     private mutating func parseStringFromEscape(start: Int, firstEscape: Int) throws -> String {
         scratch.removeAll(keepingCapacity: true)
         scratch.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[start..<firstEscape]))
@@ -731,7 +658,7 @@ struct JSONConfigParser {
             if c == UInt8(ascii: "\"") {
                 pos += 1
                 return try scratch.withUnsafeBufferPointer {
-                    try Self.makeString(from: $0, offset: start, ascii: $0.allSatisfy { $0 < 0x80 })
+                    try Self.makeString(from: $0, offset: start, ascii: ByteKernels.isASCII($0))
                 }
             }
             if c == UInt8(ascii: "\\") {
@@ -813,22 +740,14 @@ struct JSONConfigParser {
         return true
     }
 
-    /// Builds a Swift string from JSON string contents.
-    ///
-    /// ASCII skips the extra UTF-8 round-trip check. Non-ASCII still compares the decoded
-    /// scalars against the source bytes so a leading U+FEFF inside a vocabulary key is
-    /// preserved (Foundation's `String(data:encoding:)` would strip it) and repaired
-    /// sequences throw.
+    /// Validate bytes before decoding, preserving a leading BOM without a String round trip.
     private static func makeString(
         from slice: UnsafeBufferPointer<UInt8>, offset: Int, ascii: Bool
     ) throws -> String {
-        if slice.isEmpty { return "" }
-        let string = String(decoding: slice, as: UTF8.self)
-        if ascii { return string }
-        guard string.utf8.elementsEqual(slice) else {
+        guard ascii || isValidUTF8(slice) else {
             throw JSONConfigError.invalidUTF8(offset: offset)
         }
-        return string
+        return String(decoding: slice, as: UTF8.self)
     }
 
     private mutating func parseHex4() throws -> UInt32 {
