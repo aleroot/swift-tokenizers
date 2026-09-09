@@ -370,7 +370,8 @@ final class WordpieceTokenizer: Sendable {
         }
         maxTokenBytes = longest
         self.initialStarts = initialStarts
-        self.continuationStarts = continuationStarts
+        // With an empty prefix every token can continue a word.
+        self.continuationStarts = prefixBytes.isEmpty ? initialStarts : continuationStarts
     }
 
     /// Greedy longest-match-first segmentation of a single word into WordPiece subwords.
