@@ -59,23 +59,26 @@ final class Vocabulary: @unchecked Sendable {
     // MARK: - Construction
 
     convenience init(vocab: [BinaryDistinctString: Config], addedTokens: [String: Int]) throws {
+        try self.init(vocab: vocab, extra: addedTokens.map { ($0.key, $0.value) })
+    }
+
+    private convenience init(vocab: [BinaryDistinctString: Config], extra: [(String, Int)]) throws {
         var entries: [(String, Int)] = []
-        entries.reserveCapacity(vocab.count + addedTokens.count)
+        entries.reserveCapacity(vocab.count + extra.count)
         for (key, value) in vocab {
             guard let id = value.integer() else { continue }
             entries.append((key.string, id))
         }
-        for (token, id) in addedTokens {
-            entries.append((token, id))
-        }
+        entries.append(contentsOf: extra)
         try self.init(entries: entries)
     }
 
-    convenience init(vocab: Config, addedTokens: [String: Int]) throws {
+    convenience init(vocab: Config, addedTokens: [String: Int], addedTokenConfig: Config = Config()) throws {
+        let extra = Self.addedTokenEntries(addedTokens, config: addedTokenConfig)
         if let packed = vocab.asPackedStringMap() {
-            try self.init(packed: packed, addedTokens: addedTokens)
+            try self.init(packed: packed, extra: extra)
         } else if let dict = vocab.dictionary() {
-            try self.init(vocab: dict, addedTokens: addedTokens)
+            try self.init(vocab: dict, extra: extra)
         } else {
             throw TokenizerError.missingVocab
         }
@@ -89,11 +92,24 @@ final class Vocabulary: @unchecked Sendable {
     }
 
     /// Builds from a packed Unigram vocabulary (`id == index`) plus added tokens.
-    convenience init(scored: PackedScoredTokens, addedTokens: [String: Int]) throws {
+    convenience init(scored: PackedScoredTokens, addedTokens: [String: Int], addedTokenConfig: Config = Config()) throws
+    {
         var ids = [Int32](repeating: 0, count: scored.count)
         for i in 0..<scored.count { ids[i] = Int32(i) }
         try self.init(
-            packed: PackedStringMap(utf8: scored.utf8, offsets: scored.offsets, ids: ids), addedTokens: addedTokens)
+            packed: PackedStringMap(utf8: scored.utf8, offsets: scored.offsets, ids: ids),
+            extra: Self.addedTokenEntries(addedTokens, config: addedTokenConfig))
+    }
+
+    /// Serialized IDs preserve distinct spellings that a Swift String dictionary can collapse.
+    private static func addedTokenEntries(_ fallback: [String: Int], config: Config) -> [(String, Int)] {
+        var byId: [Int: String] = [:]
+        for (token, id) in fallback { byId[id] = token }
+        for token in config.array(or: []) {
+            guard let id = token["id"].integer(), let content = token.content.string() else { continue }
+            byId[id] = content
+        }
+        return byId.map { ($0.value, $0.key) }
     }
 
     private init(packed: PackedStringMap, extra: [(String, Int)]) throws {

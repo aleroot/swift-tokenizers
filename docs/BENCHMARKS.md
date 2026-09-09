@@ -185,6 +185,56 @@ Generic JSON parsing of the long ASCII and Unicode cases improved by 2.88× and 
 The implementation remains pure Swift, uses bounded unaligned loads, and requires no input padding.
 Run the same workloads with `RUN_BENCHMARKS=1 swift test -c release --filter JSONBenchmarkTests`.
 
+### Lampo workload follow-up
+
+Measured on **Apple M2, macOS 26.6.2, Swift 6.3.3**, in release mode against `91961b0`.
+These replay Lampo's tokenizer calls for streaming, token inspection, and prefixed retrieval
+queries/passages; they do not measure the whole app or GPU inference. Five pairs of preserved
+binaries ran in alternating order without concurrent builds. Values are medians of per-run
+medians: nine fresh tokenizer instances for first decode, 15 iterations for warm workloads,
+and five iterations for repeated large documents. Loads use cached local files.
+
+| Qwen3-0.6B workload | Before | After |
+|---|---:|---:|
+| First decode, 16 IDs | 14.292 ms | 3.837 ms |
+| Inspect each paragraph token separately | 0.027 ms | 0.027 ms |
+| Decode every growing paragraph prefix | 0.148 ms | 0.148 ms |
+
+Decode-table construction now initializes added-token flags directly from IDs and avoids
+allocating and hashing a String for each vocabulary entry. Empty decoding leaves the table
+uninitialized. Vocabulary loading also preserves exact serialized added-token spellings and IDs
+when Swift's canonical String equality would otherwise combine distinct entries.
+
+| Tokenizer | 256 queries, before → after | 64 passages, before → after | 2.24 MiB document, before → after |
+|---|---:|---:|---:|
+| `mlx-community/Qwen3-0.6B-Base-DQ5` | 0.183 → 0.184 ms | 0.250 → 0.248 ms | 13.739 → 13.896 ms |
+| `intfloat/multilingual-e5-small` | 0.215 → 0.212 ms | 0.196 → 0.192 ms | 14.814 → 14.804 ms |
+| `google-bert/bert-base-uncased` | 0.208 → 0.204 ms | 0.167 → 0.157 ms | 12.170 → 12.274 ms |
+
+Queries repeat the same short question; passages repeat a numbered 64-item batch. Both use warm
+pretoken caches. Scratch buffers remain reusable for inputs up to 1 MiB and are released after
+larger inputs. The measured repeated-document cost is about 1% for Qwen/BERT, with E5 unchanged.
+Normal query/passage throughput remains similar; the small timing differences are not broad
+speedup claims.
+
+After encoding the 2,351,104-byte document and discarding its output, baseline live-heap growth
+was **12.0 MiB Qwen, 20.2 MiB E5, and 14.5 MiB BERT**. The new version had no retained growth
+(deltas of −3.8, −10.5, and −3.5 KiB as earlier small buffers were released). This uses
+`malloc_zone_statistics` in fresh processes running only the encoding benchmark; it measures
+live allocations, not peak memory or pages immediately returned to the OS. The input threshold
+is a scratch-reuse policy, not a strict total-memory limit.
+
+Lampo's Jina fallback loader, used when `tokenizer_config.json` is absent, now uses
+`Config(tokenizerJSONFile:)`. Replaying its construction with the Qwen fixture already in memory
+took **803.515 ms through JSONSerialization + generic Config versus 30.976 ms through packed
+Config**, about **26× faster** (one run, nine timed iterations after three warm-ups per path).
+This is a loader-path comparison on a Qwen-sized vocabulary, not a measured Jina model load.
+The normal configured loader already uses packed parsing.
+
+Run `RUN_BENCHMARKS=1 swift test -c release --filter LampoWorkloadBenchmarks` for timing.
+For retained-heap measurements, run only `LampoWorkloadBenchmarks/encoding` in a fresh process
+so unrelated Foundation work cannot affect the allocation deltas.
+
 ## Memory footprint
 
 Live heap and `phys_footprint` retained after `AutoTokenizer.load`, measured with `task_info` in a
@@ -328,6 +378,8 @@ hand-written over UTF-8 with NEON lane masks instead of being expressed as regul
   working state (Viterbi lattice, merge buffers, WordPiece scratch) are pooled with the
   per-call scratch, and the pretoken → ids cache (WordPiece, BPE and Unigram) is an
   arena-backed table with a `tryLock` so concurrent encodes never block.
+  Scratch used by inputs larger than 1 MiB is released so document-sized outliers do not
+  permanently enlarge a live tokenizer's buffer pool.
 * **WordPiece on bytes.** A word costs one hash probe when it is in the vocabulary; otherwise
   candidates are bounded by the longest vocabulary entry, the `##` continuation is assembled
   once per position, words starting with a scalar no token begins with are rejected

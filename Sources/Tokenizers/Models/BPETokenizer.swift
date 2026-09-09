@@ -230,7 +230,8 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
     }
 
     required init(tokenizerConfig: Config, tokenizerData: Config, addedTokens: [String: Int]) throws {
-        let vocab = try Vocabulary(vocab: tokenizerData.model.vocab, addedTokens: addedTokens)
+        let vocab = try Vocabulary(
+            vocab: tokenizerData.model.vocab, addedTokens: addedTokens, addedTokenConfig: tokenizerData.addedTokens)
         self.vocab = vocab
         continuingPrefix = tokenizerData.model.continuingSubwordPrefix.string(or: "")
         endSuffix = tokenizerData.model.endOfWordSuffix.string(or: "")

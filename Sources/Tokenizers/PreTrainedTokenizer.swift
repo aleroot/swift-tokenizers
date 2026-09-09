@@ -63,6 +63,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     public required init(tokenizerConfig: Config, tokenizerData: Config, strict: Bool = true) throws {
         var addedTokens: [String: Int] = [:]
         var specialTokens: [String: Int] = [:]
+        var specialTokenIds: Set<Int> = []
         var splitterTokens: [AddedTokenSplitter.Token] = []
 
         var normalizedTokens: [AddedTokenSplitter.Token] = []
@@ -74,6 +75,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             addedTokens[content] = id
             if addedToken["special"].boolean(or: false) {
                 specialTokens[content] = id
+                specialTokenIds.insert(id)
             }
             let normalized = addedToken["normalized"].boolean(or: false) && normalizer != nil
             let match = normalized ? normalizer!.normalize(text: content) : content
@@ -95,7 +97,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 
         normalizedAddedTokenSpellings = normalizedSpellings
         self.specialTokens = specialTokens
-        specialTokenIds = Set(specialTokens.values)
+        self.specialTokenIds = specialTokenIds
         self.addedTokens = Set(addedTokens.keys)
 
         let preTokenizer = try PreTokenizerFactory.fromConfig(config: tokenizerData["preTokenizer"])
@@ -131,8 +133,8 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         }
 
         if decoder is ByteLevelDecoder, normalizedSpellings.isEmpty, let bpe = model as? BPETokenizer {
-            let addedTokens = self.addedTokens
-            byteLevelDecodeTable = Lazy { ByteLevelDecodeTable(vocabulary: bpe.vocab, addedTokens: addedTokens) }
+            let addedTokenIds = splitterTokens.map(\.id) + normalizedTokens.map(\.id)
+            byteLevelDecodeTable = Lazy { ByteLevelDecodeTable(vocabulary: bpe.vocab, addedTokenIds: addedTokenIds) }
         } else {
             byteLevelDecodeTable = nil
         }
@@ -265,6 +267,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 
     public func decode(tokens: [Int], skipSpecialTokens: Bool = false) -> String {
         if let byteLevelDecodeTable {
+            guard !tokens.isEmpty else { return "" }
             return cleanUp(
                 text: byteLevelDecodeTable.value.decode(tokens, skipping: skipSpecialTokens ? specialTokenIds : []))
         }
@@ -463,18 +466,18 @@ final class ByteLevelDecodeTable: Sendable {
     private let isAddedToken: [Bool]
     private let count: Int
 
-    init(vocabulary: Vocabulary, addedTokens: Set<String>) {
+    init(vocabulary: Vocabulary, addedTokenIds: [Int]) {
         count = vocabulary.count
         var storage: [UInt8] = []
         var offsets = [UInt32](repeating: 0, count: count + 1)
         var isAdded = [Bool](repeating: false, count: count)
+        for id in addedTokenIds where id >= 0 && id < count { isAdded[id] = true }
         for id in 0..<count {
             offsets[id] = UInt32(storage.count)
             guard vocabulary.contains(id: id) else { continue }
             vocabulary.withBytes(of: id) { bytes in
                 // Added tokens are stored verbatim; everything else is alphabet-encoded.
-                if !addedTokens.isEmpty, addedTokens.contains(String(decoding: bytes, as: UTF8.self)) {
-                    isAdded[id] = true
+                if isAdded[id] {
                     storage.append(contentsOf: bytes)
                     return
                 }
@@ -491,7 +494,7 @@ final class ByteLevelDecodeTable: Sendable {
             }
         }
         offsets[count] = UInt32(storage.count)
-        self.storage = storage
+        self.storage = storage.trimmed()
         self.offsets = offsets
         isAddedToken = isAdded
     }

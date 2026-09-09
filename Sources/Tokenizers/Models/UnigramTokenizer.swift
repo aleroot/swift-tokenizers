@@ -53,7 +53,8 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         unknownToken = packed.token(at: unknownTokenId)
         unknownTokenScore = minScore - 10
 
-        let vocabulary = try Vocabulary(scored: packed, addedTokens: addedTokens)
+        let vocabulary = try Vocabulary(
+            scored: packed, addedTokens: addedTokens, addedTokenConfig: tokenizerData.addedTokens)
         self.vocabulary = vocabulary
         trie = packed.utf8.withUnsafeBufferPointer { utf8 in
             packed.offsets.withUnsafeBufferPointer { offsets in

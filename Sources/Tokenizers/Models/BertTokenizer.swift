@@ -42,14 +42,8 @@ public final class BertTokenizer: Sendable {
 
     public required convenience init(tokenizerConfig: Config, tokenizerData: Config, addedTokens: [String: Int]) throws
     {
-        var extra = addedTokens
-        if let pairs = tokenizerData.addedTokens.array() {
-            for element in pairs {
-                guard let id = element["id"].integer(), let key = element["content"].string() else { continue }
-                if extra[key] == nil { extra[key] = id }
-            }
-        }
-        let vocabulary = try Vocabulary(vocab: tokenizerData.model.vocab, addedTokens: extra)
+        let vocabulary = try Vocabulary(
+            vocab: tokenizerData.model.vocab, addedTokens: addedTokens, addedTokenConfig: tokenizerData.addedTokens)
 
         let maximum = tokenizerData.model.maxInputCharsPerWord.integer(or: 100)
         guard maximum >= 0 else { throw TokenizerError.invalidConfiguration("Negative WordPiece word limit") }

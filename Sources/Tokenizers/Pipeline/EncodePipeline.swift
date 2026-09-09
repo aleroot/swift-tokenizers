@@ -202,6 +202,7 @@ struct EncodePipeline: Sendable {
         _ bytes: UnsafeBufferPointer<UInt8>, scratch: EncodeScratch,
         onToken: (Int) -> Void, onPiece: (UnsafeBufferPointer<UInt8>, Bool) -> Void
     ) {
+        scratch.reusable = bytes.count <= EncodeScratch.maximumReusableInputBytes
         scratch.sections.removeAll(keepingCapacity: true)
         if let splitter {
             splitter.split(bytes: bytes, into: &scratch.sections)
@@ -309,6 +310,9 @@ struct EncodePipeline: Sendable {
 /// (lattice, merge buffers, WordPiece scratch) survives across calls. Obtained from
 /// ``EncodeScratchPool``; used by one caller at a time.
 final class EncodeScratch {
+    /// Reuse normal prompt/batch buffers without retaining document-sized outliers indefinitely.
+    static let maximumReusableInputBytes = 1 << 20
+    var reusable = true
     @exclusivity(unchecked) var sections: [AddedTokenSplitter.ByteSection] = []
     @exclusivity(unchecked) var subsections: [AddedTokenSplitter.ByteSection] = []
     @exclusivity(unchecked) var normalized: [UInt8] = []
@@ -337,6 +341,7 @@ final class EncodeScratchPool: @unchecked Sendable {
 
     @inline(__always)
     func recycle(_ scratch: EncodeScratch) {
+        guard scratch.reusable else { return }
         free.withLock { pool in
             if pool.count < 4 { pool.append(scratch) }
         }
