@@ -73,8 +73,8 @@ struct SplitterFastPathTests {
     }
 
     @Test("BertPreTokenizer")
-    func bert() throws {
-        let splitter = try BertPreTokenizer(config: Config([String: Config]()))
+    func bert() {
+        let splitter = BertPreTokenizer(config: Config([String: Config]()))
         for text in Self.texts {
             #expect(
                 splitter.preTokenize(text: text) == Self.referenceBert(text), Comment(rawValue: text.debugDescription))
@@ -82,9 +82,9 @@ struct SplitterFastPathTests {
     }
 
     @Test("WhitespaceSplit and Whitespace")
-    func whitespace() throws {
-        let split = try WhitespacePreTokenizer(config: Config(["type": Config("WhitespaceSplit")]))
-        let words = try WhitespacePreTokenizer(config: Config(["type": Config("Whitespace")]))
+    func whitespace() {
+        let split = WhitespacePreTokenizer(config: Config(["type": Config("WhitespaceSplit")]))
+        let words = WhitespacePreTokenizer(config: Config(["type": Config("Whitespace")]))
         for text in Self.texts {
             #expect(
                 split.preTokenize(text: text) == Self.referenceWhitespace(text, splitWords: false),

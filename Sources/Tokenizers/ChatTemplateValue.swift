@@ -1,27 +1,7 @@
-// Conversion of chat-template inputs (`[String: any Sendable]` messages, tools and extra
-// context) into Jinja values, with deterministic and *schema-aware* key ordering.
-//
-// Why this exists
-// ---------------
-// Python `transformers` renders `tools | tojson` in dictionary insertion order — the order
-// in which the caller wrote the JSON. A Swift `Dictionary` has no insertion order, so a
-// naïve conversion (such as swift-jinja's `Value(any:)`) sorts keys
-// alphabetically and renders `{"function": {"description": …, "name": …}, "type": …}` —
-// a different prompt despite equivalent JSON data.
-//
-// Tool specifications are not arbitrary JSON, though: they follow the OpenAI
-// function-calling schema, and `transformers.utils.get_json_schema` — the generator whose
-// output follows conventional schema ordering — provides the default ordering used here.
-// `Dictionary` inputs are laid out in that deterministic order. This does not establish
-// every model's training format or match arbitrary Python dictionary insertion order. Keys that are not
-// schema keywords, and the user-named children of `properties` / `arguments` / `$defs`,
-// have no canonical order; they keep the caller's order when it is available (see below)
-// and fall back to alphabetical otherwise.
-//
-// Callers who need full control can nest order-preserving values anywhere inside a
-// message or tool: `KeyValuePairs<String, any Sendable>` (standard library; dictionary-
-// literal syntax, keeps literal order, `Sendable`) or a pre-built `Jinja.Value`. These
-// render exactly in the order given.
+// Converts chat-template inputs (`[String: any Sendable]` messages, tools and extra context)
+// into Jinja values. `Dictionary` keys are laid out in the canonical order of
+// `transformers.utils.get_json_schema` (user-named keys alphabetically); `KeyValuePairs` and
+// pre-built `Jinja.Value`s render in the order given.
 
 import Foundation
 import Jinja
@@ -93,7 +73,6 @@ enum ChatTemplateValue {
         case let float as Float:
             return .double(Double(float))
 
-        // Order-preserving containers.
         case let pairs as KeyValuePairs<String, any Sendable>:
             return try object(pairs.map { ($0.key, $0.value as Any?) })
         case let pairs as KeyValuePairs<String, Any>:
@@ -102,8 +81,6 @@ enum ChatTemplateValue {
             return try object(pairs.map { ($0.key, $0.value) })
 
         // Unordered containers: canonical schema order, or alphabetical for user-named keys.
-        // Match the concrete dictionary/array types callers actually pass (`Message` is
-        // `[String: any Sendable]`) so conversion does not depend on NSDictionary bridging.
         case let dict as [String: any Sendable]:
             return try convertDictionary(dict.mapValues { $0 as Any? }, userKeyed: userKeyed)
         case let dict as [String: Any]:

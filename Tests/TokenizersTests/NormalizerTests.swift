@@ -149,7 +149,6 @@ struct NormalizerTests {
             ("département", "departement")
         ]
 
-        // TODO: test combinations with/without lowercase
         let config = Config(["stripAccents": true])
         let normalizer = BertNormalizer(config: config)
         for (arg, expect) in testCases {

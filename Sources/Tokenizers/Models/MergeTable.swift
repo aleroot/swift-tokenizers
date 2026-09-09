@@ -1,9 +1,5 @@
-// Maps a pair of symbol ids to its merge rank and the id of the merged symbol.
-//
-// Entries live in dense arrays (pair, rank, merged id) and an open-addressing index of
-// 32-bit entry references resolves lookups: 4 bytes per slot instead of a 16-byte
-// key/value pair, which halves the footprint of a 150k-merge table (Qwen: 8.4 → 4.4 MB)
-// while a lookup stays one hash, one probe sequence and no allocation.
+// Maps a pair of symbol ids to its merge rank and merged id. Entries live in dense arrays and
+// an open-addressing index of 32-bit entry references resolves lookups.
 
 struct MergeTable: Sendable {
     /// `left << 32 | right` per entry.

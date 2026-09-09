@@ -1,11 +1,7 @@
-// SentencePiece Unigram model (T5, XLM-RoBERTa, …). Segmentation is a Viterbi search for
-// the highest-scoring path through the lattice of vocabulary matches. The lattice is
-// computed with a forward dynamic program over UTF-8 byte offsets: `best[i]` is the best
-// score reaching byte `i`, together with the token and start offset that achieved it.
-// Candidate tokens at each position are enumerated with a double-array trie walk over the
-// raw bytes, so no scalar decoding or string allocation happens on the hot path.
-// Ties resolve to the first candidate encountered (earlier start, then shorter token),
-// matching the reference implementation's node ordering.
+// SentencePiece Unigram model (T5, XLM-RoBERTa, …): Viterbi search over the lattice of
+// vocabulary matches, computed by a forward dynamic program over UTF-8 byte offsets with
+// candidates enumerated by a double-array trie walk. Ties resolve to the first candidate
+// encountered (earlier start, then shorter token), as in the reference implementation.
 
 import Foundation
 

@@ -14,8 +14,6 @@ private enum TestError: Error {
 
 private struct Dataset: Decodable {
     let text: String
-    // Bad naming, not just for bpe.
-    // We are going to replace this testing method anyway.
     let bpe_tokens: [String]
     let token_ids: [Int]
     let decoded_text: String
@@ -225,9 +223,6 @@ struct TokenizerTests {
         //   U+20E3 COMBINING ENCLOSING KEYCAP
         // SentencePiece Unigram lookups operate per scalar, so HF Python tokenizes
         // this as ▁1 <unk> </s> — the digit `1` matches; the VS-16 + keycap tail UNKs.
-        // Pre-fix, the Swift tokenizer iterated by `Character`, so the whole grapheme
-        // became one lattice slot that never matched any vocab entry and the digit was
-        // silently lost (▁ <unk> </s>).
         let tokenizerOpt = try await HubFixtures.tokenizer(for: "google-t5/t5-small") as? PreTrainedTokenizer
         #expect(tokenizerOpt != nil)
         let tokenizer = tokenizerOpt!
@@ -280,9 +275,8 @@ struct TokenizerTests {
         #expect(ids == expected)
     }
 
-    /// `NllbTokenizer` is not a registered class. swift-transformers refused it in strict
-    /// mode; we resolve the model through `tokenizer.json`'s `model.type` (BPE) like the
-    /// `tokenizers` library does, so it loads — and tokenizes correctly — in both modes.
+    /// `NllbTokenizer` is not a registered class; the model resolves through `tokenizer.json`'s
+    /// `model.type` (BPE), as the `tokenizers` library does, so it loads in both modes.
     @Test
     func nllbTokenizer() async throws {
         let expected = [256047, 24185, 4077, 349, 1001, 22690, 83580, 349, 82801, 248130, 2]
@@ -388,9 +382,8 @@ struct TokenizerTests {
         let encoded = tokenizer.encode(text: text)
         #expect(encoded == [101, 1048, 1005, 7327, 2890, 102])
         let decoded = tokenizer.decode(tokens: encoded, skipSpecialTokens: true)
-        // Matches the Hugging Face fast tokenizer: `clean_up_tokenization_spaces` is not set for
-        // this model and transformers >= 4.45 defaults it to false. swift-transformers defaulted
-        // to true and produced "l'eure".
+        // `clean_up_tokenization_spaces` is unset for this model; transformers >= 4.45 defaults
+        // it to false.
         #expect(decoded == "l ' eure")
 
         // Reading added_tokens from tokenizer.json

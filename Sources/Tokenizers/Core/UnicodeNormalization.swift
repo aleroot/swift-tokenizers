@@ -1,18 +1,10 @@
-// Unicode normalization data for the byte-level normalizers: canonical combining class,
-// NFC / NFD / NFKC / NFKD quick-check status, canonical decompositions and simple lowercase
-// mappings of the Basic Multilingual Plane, plus the sparse ranges of supplementary-plane
-// scalars that are not trivially normalized (everything else outside the BMP — emoji, CJK
-// extensions — is a starter with no decomposition and no case mapping).
+// Unicode normalization data for the byte-level normalizers: combining classes, NF* quick-check
+// status, canonical decompositions and simple lowercase mappings of the BMP, plus the sparse
+// supplementary-plane ranges that are not trivially normalized. Scalars the tables do not cover
+// fall back to Foundation.
 //
-// With this data the normalizers decide `isIdentity` exactly and without Foundation for
-// already-normalized text (the overwhelmingly common case), and `BertNormalizer` strips
-// accents and lowercases BMP text scalar by scalar. Anything the tables do not cover
-// (supplementary-plane marks, the one multi-scalar lowercase mapping) falls back to
-// Foundation, so the fast paths never change a result.
-//
-// `UnicodeNormalization.generated.swift` is produced by `UnicodeNormalizationTests`
-// (REGENERATE_UNICODE_TABLES=1); the same test fails if the toolchain's Unicode data ever
-// disagrees with the checked-in tables.
+// `UnicodeNormalization.generated.swift` is produced and verified by `UnicodeNormalizationTests`
+// (`REGENERATE_UNICODE_TABLES=1`).
 
 enum UnicodeNormalization {
     /// Per-scalar properties: the canonical combining class in the low byte, flags above.

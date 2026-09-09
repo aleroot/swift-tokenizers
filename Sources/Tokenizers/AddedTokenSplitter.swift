@@ -1,10 +1,7 @@
-// Splits input text around added / special tokens before normalization and pre-tokenization.
-//
-// The reference implementation compiles every added token into one alternation regex
-// (`\s*(<tok1>)\s*|(<tok2>)|…`, longest content first) and splits on it. This type
-// reproduces those semantics — leftmost match, longest content wins, `lstrip`/`rstrip`
-// swallow adjacent whitespace, only the content is emitted — with a double-array trie over
-// the token bytes and a single pass over the input that allocates nothing.
+// Splits input text around added / special tokens before normalization and pre-tokenization,
+// reproducing the reference `\s*(<tok>)\s*|…` alternation semantics (leftmost match, longest
+// content wins, `lstrip`/`rstrip` swallow whitespace) with a double-array trie and one
+// allocation-free pass.
 
 import Foundation
 
@@ -139,7 +136,6 @@ final class AddedTokenSplitter: Sendable {
                             best = match
                         }
                         guard lstripStartsWithWhitespace else { break }
-                        // Step back one scalar.
                         start -= 1
                         while start > i, bytes[start] & 0xC0 == 0x80 { start -= 1 }
                         if start == i { break }

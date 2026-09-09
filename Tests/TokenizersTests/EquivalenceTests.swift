@@ -22,7 +22,7 @@ struct SeededGenerator: RandomNumberGenerator {
 enum Fuzz {
     /// Building blocks covering every class the scanners distinguish. `\u{0B}` and `\u{85}` are
     /// excluded on purpose: ICU's `\s` (`[\t\n\f\r\p{Z}]`) does not include them while Unicode
-    /// White_Space (used by Rust `tokenizers` and by our scanner) does.
+    /// White_Space (used by Rust `tokenizers` and by the scanners) does.
     static let atoms: [String] = [
         " ", "  ", "\t", "\n", "\r", "\r\n", "\u{0C}", "\u{A0}", "\u{2003}", "\u{3000}", "\u{2028}",
         "a", "Z", "hello", "World", "über", "naïve", "Zürich", "日本", "語", "한", "ж", "Ω", "ﬁ",

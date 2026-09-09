@@ -1,10 +1,6 @@
-// The encode pipeline over raw UTF-8: added-token splitting → normalization →
-// pre-tokenization → model, with no intermediate strings.
-//
-// `EncodePipeline` owns the immutable stage configuration; `EncodeScratch` holds the buffers
-// one encode call needs (pooled per tokenizer so steady-state encoding allocates only the
-// result array). `PreTokenizationRunner` executes the pre-tokenization stages over lists of
-// byte ranges and is shared with the public `[String]` pre-tokenizer API.
+// The encode pipeline over raw UTF-8: added-token splitting → normalization → pre-tokenization
+// → model, with no intermediate strings. `EncodeScratch` holds the per-call buffers, pooled per
+// tokenizer; `PreTokenizationRunner` executes the pre-tokenization stages over byte ranges.
 
 import Foundation
 

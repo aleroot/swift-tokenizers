@@ -1,11 +1,5 @@
-// A string wrapper whose equality and hashing are defined over the exact UTF-8
-// scalar sequence rather than Unicode canonical equivalence.
-//
-// Swift's `String` treats "à" (U+0061 U+0300) and "à" (U+00E0) as equal. Tokenizer
-// vocabularies frequently contain both spellings as *different* tokens, so a
-// vocabulary keyed by plain `String` would silently collapse entries. This type
-// preserves the distinction while keeping the compact native `String` storage
-// (small strings stay inline, no extra allocation per key).
+// A string wrapper whose equality and hashing use the exact scalar sequence rather than Unicode
+// canonical equivalence: vocabularies contain "à" (U+00E0) and "a\u{300}" as different tokens.
 
 import Foundation
 

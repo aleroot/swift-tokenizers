@@ -1,10 +1,8 @@
-// Run-length encoded Basic Multilingual Plane classification (``ScalarFlags`` and
-// ``ScalarExtraFlags``), expanded into the 64 KiB lookup tables at first use in ~30 µs
-// instead of querying 65 536 scalar properties (~6 ms) on every launch.
+// Run-length encoded BMP classification (``ScalarFlags`` and ``ScalarExtraFlags``), expanded
+// into 64 KiB lookup tables at first use.
 //
-// `UnicodeTables.generated.swift` is produced from `ScalarClassifier.computeBMP()` /
-// `computeBMPExtra()` by `UnicodeTablesTests` (REGENERATE_UNICODE_TABLES=1); the same test
-// fails if the toolchain's Unicode data ever disagrees with the checked-in runs.
+// `UnicodeTables.generated.swift` is produced and verified by `UnicodeTablesTests`
+// (`REGENERATE_UNICODE_TABLES=1`).
 
 enum UnicodeTables {
     /// One run of scalars sharing the same flags: `start << 16 | flags << 8 | extraFlags`.

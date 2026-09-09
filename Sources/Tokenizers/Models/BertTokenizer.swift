@@ -2,10 +2,6 @@
 // pre-tokenized word. With a serialized `tokenizer.json` (`model.type == "WordPiece"`) the
 // normalizer and pre-tokenizer pipeline does the basic tokenization; the legacy
 // `vocab.txt` path keeps a built-in basic tokenizer for compatibility.
-//
-// The hot path (`Encoder.encode(bytes:)`) works on the UTF-8 bytes of a word: one hash probe
-// for the whole word, then longest-first candidates bounded by the longest vocabulary entry,
-// with the `##` continuation prefix assembled in a reusable scratch buffer.
 
 import Foundation
 

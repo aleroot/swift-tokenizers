@@ -34,8 +34,7 @@ struct PreTokenizerTests {
             preTokenizer.preTokenize(text: "Hey friend!") == ["Hey friend", "!"]
         )
         // Default behaviour is `Isolated` (each punctuation scalar on its own), as in
-        // `tokenizers.pre_tokenizers.Punctuation()`. The upstream swift-transformers test
-        // expected "?!?" grouped, which is the `Contiguous` behaviour.
+        // `tokenizers.pre_tokenizers.Punctuation()`.
         #expect(
             preTokenizer.preTokenize(text: "Hey friend!     How are you?!?") == [
                 "Hey friend", "!", "     How are you", "?", "!", "?",
@@ -293,7 +292,6 @@ struct PreTokenizerTests {
                 "prepend_scheme": "always",
             ]))
 
-        // TODO: different sections on <s>
         let text = "Hey my friend <s>how▁are you"
         let tokens =
             text
@@ -456,7 +454,7 @@ struct PreTokenizerTests {
                 "prepend_scheme": "always",
             ]))
         // `tokenizers` never prepends to an empty string (`NormalizedString::prepend` is a no-op),
-        // so an empty input yields no pieces. swift-transformers returned ["▁"].
+        // so an empty input yields no pieces.
         #expect(
             always.preTokenize(text: "") == []
         )

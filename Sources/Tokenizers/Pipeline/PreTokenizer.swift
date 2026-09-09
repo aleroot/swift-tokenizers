@@ -1,13 +1,7 @@
-// Pre-tokenization: splitting normalized text into the chunks the model tokenizes
-// independently.
-//
-// Built-in pre-tokenizers operate on raw UTF-8 and describe themselves as a list of
-// ``PreTokenizationStage``s: a *splitter* emits byte ranges of a chunk, a *rewriter* first
-// transforms the text (Metaspace's `▁` substitution) and then splits the result, and the
-// `byteLevel` marker asks the model to read a piece through the GPT-2 byte alphabet. The
-// pipeline (``PreTokenizationRunner``) executes stages over lists of ranges, so a section of
-// text is pre-tokenized without allocating a string per piece. The public `[String]` API is
-// derived from the same stages, so every rule is implemented exactly once.
+// Pre-tokenization: splitting normalized text into the chunks the model tokenizes independently.
+// Built-in pre-tokenizers work on raw UTF-8 as a list of ``PreTokenizationStage``s (splitters,
+// rewriters and the `byteLevel` marker) executed by ``PreTokenizationRunner``; the public
+// `[String]` API is derived from the same stages.
 
 import Foundation
 

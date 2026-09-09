@@ -1,7 +1,4 @@
-// A small, allocation-conscious JSON parser that produces `Config` trees directly from
-// UTF-8 bytes. `tokenizer.json` files for modern models are 5–20 MB with 100K+ vocabulary
-// entries; going through `JSONSerialization` and then re-walking an `NSDictionary` tree
-// is several times slower than building the target representation in a single pass.
+// An allocation-conscious JSON parser that produces `Config` trees directly from UTF-8 bytes.
 
 import Foundation
 

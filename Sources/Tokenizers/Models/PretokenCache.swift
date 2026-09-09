@@ -1,12 +1,7 @@
-// Memoises pretoken → token ids. Natural language is highly repetitive (Zipf), so most
-// words in a document have already been merged once; a hit costs one hash, one byte
-// compare and a memcpy, versus a full BPE merge loop.
-//
-// The cache is a fixed-size open-addressing table over two append-only arenas held in
-// manually managed buffers (no bounds checks, no exclusivity checks, no copy-on-write). It
-// performs no allocation on lookup or insert until an arena fills and the table is reset.
-// Access must be serialised by the owner: callers acquire `lock` with `tryLock()` for the
-// duration of one `encode` call and simply skip the cache when another thread holds it.
+// Memoises pretoken → token ids in a fixed-size open-addressing table over two append-only
+// arenas: no allocation on lookup or insert until an arena fills and the table is reset. Access
+// is serialised by the owner, which holds `lock` (`tryLock()`) for one `encode` call and skips
+// the cache when another thread has it.
 
 import Foundation
 

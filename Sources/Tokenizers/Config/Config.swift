@@ -1,6 +1,5 @@
-// A JSON-like configuration tree with dynamic member lookup. API-compatible with the
-// `Config` type historically exported by swift-transformers' `Hub` module, so tokenizer
-// configuration code written against that type keeps compiling.
+// A JSON-like configuration tree with dynamic member lookup, source-compatible with
+// swift-transformers' `Config`.
 
 import Foundation
 import Jinja
@@ -96,7 +95,7 @@ public struct Config: Hashable, Sendable,
         }
 
         // Loose equality: numeric / string kinds compare by converted value, so that
-        // `Config(1) == Config(true)` and `Config("1") == Config(1)` hold like upstream.
+        // `Config(1) == Config(true)` and `Config("1") == Config(1)` hold.
         public static func == (lhs: Data, rhs: Data) -> Bool {
             switch (lhs, rhs) {
             case (.null, .null):
@@ -108,8 +107,7 @@ public struct Config: Hashable, Sendable,
             case let (.boolean(l), _):
                 if let r = rhs.boolean() { return l == r }
             case let (.floating(l), _):
-                // Floating values compare at Float precision (source compatibility with the
-                // original Float-backed representation).
+                // Floating values compare at Float precision.
                 if let r = rhs.double() { return Float(l) == Float(r) }
             case let (.dictionary(l), .dictionary(r)):
                 return l == r

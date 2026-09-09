@@ -1,5 +1,4 @@
-// Public protocol surface. Kept source-compatible with swift-transformers' `Tokenizers`
-// module so existing consumers (e.g. mlx-swift-lm's tokenizer bridge) compile unchanged.
+// Public protocol surface, source-compatible with swift-transformers' `Tokenizers` module.
 
 import Foundation
 

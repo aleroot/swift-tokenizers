@@ -1,14 +1,6 @@
-// Packed, immutable token vocabulary.
-//
-// * Token strings are stored back-to-back in one UTF-8 buffer with an offsets table, so
-//   `id → token` is two reads and a String materialization (no dictionary probe,
-//   no NSString bridging).
-// * `token → id` is served by an open-addressing hash index over the raw UTF-8 bytes,
-//   which makes lookups binary-distinct (no Unicode canonical folding) and allows
-//   querying directly from a byte slice without allocating a `String`.
-// * Every table is allocated with its exact size and filled once during `init`, then read
-//   through raw pointers: a probe is a hash, two loads and a `memcmp`, with no reference
-//   counting, exclusivity checking or copy-on-write traffic. Presence is one bit per id.
+// Packed, immutable token vocabulary: token UTF-8 stored back-to-back with an offsets table for
+// `id → token`, and an open-addressing byte-hash index for binary-distinct `token → id` lookups
+// straight from byte slices.
 
 import Foundation
 

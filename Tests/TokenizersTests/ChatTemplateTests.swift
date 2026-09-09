@@ -37,8 +37,7 @@ struct ChatTemplateTests {
         let tokenizer = try await Self.sharedPhiTokenizer()
         let encoded = try tokenizer.applyChatTemplate(messages: messages)
         // Ground truth from `transformers.AutoTokenizer.apply_chat_template` (Phi-3 keeps its
-        // `Prepend "▁"` normalizer, which applies per section). swift-transformers expected
-        // [32010, 4002, 29581, …] because it replaced the normalizer with a Metaspace pre-tokenizer.
+        // `Prepend "▁"` normalizer, which applies per section).
         let encodedTarget = [32010, 20355, 915, 278, 14156, 8720, 4086, 29889, 32007, 32001]
         let decoded = tokenizer.decode(tokens: encoded)
         let decodedTarget = "<|user|> Describe the Swift programming language.<|end|><|assistant|>"
@@ -117,7 +116,7 @@ struct ChatTemplateTests {
     @Test("Named template from argument")
     func namedTemplateFromArgument() async throws {
         let tokenizer = try await Self.sharedTokenizerWithTemplateArray()
-        // Normally it is not necessary to specify the name `default`, but I'm not aware of models with lists of templates in the config that are not `default` or `tool_use`
+        // `default` is the conventional name of the primary template in a template list.
         let encoded = try tokenizer.applyChatTemplate(
             messages: messages, chatTemplate: .name("default")
         )
@@ -180,9 +179,8 @@ struct ChatTemplateTests {
             messages: messages, chatTemplate: whitespaceSensitiveTemplate
         )
         let decoded = tokenizer.decode(tokens: encoded)
-        // Deviation from swift-transformers: the rendered template ends with "assistant\n" and the
-        // final `<0x0A>` byte-fallback token is decoded (upstream's ByteFallback decoder dropped a
-        // trailing byte run; huggingface/tokenizers flushes it).
+        // Ground truth from `transformers`: the rendered template ends with "assistant\n" and the
+        // trailing `<0x0A>` byte-fallback token is decoded.
         let expected = """
             Describe the Swift programming language.
             assistant
@@ -357,7 +355,6 @@ struct ChatTemplateTests {
             Issue.record("Expected error was not thrown")
         } catch let tokenizerError as TokenizerError {
             if case .missingChatTemplate = tokenizerError {
-                // Correct error caught, test passes
             } else {
                 Issue.record("Expected .missingChatTemplate, but got \(tokenizerError)")
             }
@@ -366,7 +363,7 @@ struct ChatTemplateTests {
         }
     }
 
-    /// Performance: cached vs uncached template application
+    /// Cached template application
     @Test("Apply chat template performance with caching")
     func applyChatTemplatePerformanceCached() async throws {
         let tokenizer = try await Self.sharedPhiTokenizer()
@@ -375,20 +372,17 @@ struct ChatTemplateTests {
         let mistral7BDefaultTemplate =
             "{{bos_token}}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if message['role'] == 'user' %}{{ ' [INST] ' + message['content'] + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ ' ' + message['content'] + ' ' + eos_token}}{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}{% endif %}{% endfor %}"
 
-        // Prime cache once
         _ = try tokenizer.applyChatTemplate(
             messages: messages, chatTemplate: mistral7BDefaultTemplate
         )
 
-        // Note: Performance measurement would need to be adapted for Swift Testing
-        // For now, we'll just verify the cached call works
         let result = try tokenizer.applyChatTemplate(
             messages: messages, chatTemplate: mistral7BDefaultTemplate
         )
         #expect(result.count > 0)
     }
 
-    /// Performance: simulate uncached runs by varying the template to bypass memoization
+    /// Uncached template application (a unique template bypasses memoization)
     @Test("Apply chat template performance without caching")
     func applyChatTemplatePerformanceUncached() async throws {
         let tokenizer = try await Self.sharedPhiTokenizer()
@@ -396,8 +390,6 @@ struct ChatTemplateTests {
         let baseTemplate =
             "{{bos_token}}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if message['role'] == 'user' %}{{ ' [INST] ' + message['content'] + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ ' ' + message['content'] + ' ' + eos_token}}{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}{% endif %}{% endfor %}"
 
-        // Note: Performance measurement would need to be adapted for Swift Testing
-        // For now, we'll just verify the uncached call works
         let uniqueTemplate = baseTemplate + "{# perf \(UUID().uuidString) #}"
         let result = try tokenizer.applyChatTemplate(
             messages: messages, chatTemplate: uniqueTemplate

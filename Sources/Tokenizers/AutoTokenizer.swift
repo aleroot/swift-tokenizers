@@ -131,7 +131,7 @@ final class LlamaPreTrainedTokenizer: PreTrainedTokenizer, @unchecked Sendable {
         isLegacy = tokenizerConfig.legacy.boolean(or: true)
         var configDictionary = tokenizerData.dictionary(or: [:])
         // Some exported Llama configs omit BOS metadata but provide a complete serialized
-        // processor. Upstream loads these; an implicit default must not make them unloadable.
+        // processor. Hugging Face loads these; an implicit default must not make them unloadable.
         if updatePostProcessor,
             addedTokenAsString(tokenizerConfig.bosToken) != nil || tokenizerConfig.addBosToken.boolean() != nil
         {

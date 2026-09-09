@@ -1,16 +1,7 @@
-// Byte-Pair Encoding model.
-//
-// Design notes
-// ------------
-// * Symbols are token ids, not strings. A pretoken is turned into its initial symbol ids in
-//   one pass (per UTF-8 byte for byte-level vocabularies, per Unicode scalar otherwise) and
-//   merges are resolved through ``MergeTable`` keyed on `(leftId, rightId)`.
-// * Merge products that are not vocabulary entries receive synthetic ids `>= vocab.count`
-//   so they can still participate in later merges exactly like the reference algorithm;
-//   at output time such pieces go through the byte-fallback (`<0xNN>`) path.
-// * Short words use a linear "find min rank" loop (like tiktoken); long words switch to a
-//   heap with lazy deletion (like huggingface/tokenizers). Both produce identical output:
-//   lowest rank first, leftmost on ties.
+// Byte-Pair Encoding model. Symbols are token ids; merges resolve through ``MergeTable`` keyed on
+// `(leftId, rightId)`. Merge products outside the vocabulary get synthetic ids `>= vocab.count`
+// and take the byte-fallback path at output. Short words use a linear lowest-rank loop, long
+// words a heap with lazy deletion; both pick the lowest rank first, leftmost on ties.
 
 import Foundation
 
@@ -90,10 +81,8 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
                 guard pair.count == 2, let a = pair[0].string(), let b = pair[1].string() else { continue }
                 result.append([a, b])
             } else if let s = element.string() {
-                // Legacy "a b" strings. Hugging Face's `convert_merges_to_hashmap` rejects a
-                // line unless it splits into exactly two space-separated parts; we are more
-                // lenient and split on the first space only (a piece may itself contain
-                // spaces, as in the two-element list format) and skip lines without one.
+                // Legacy "a b" strings: split on the first space only (a piece may itself
+                // contain spaces) and skip lines without one.
                 if let idx = s.unicodeScalars.firstIndex(of: " ") {
                     let a = String(s.unicodeScalars[..<idx])
                     let b = String(s.unicodeScalars[s.unicodeScalars.index(after: idx)...])
@@ -264,7 +253,6 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         metaspaceChunking = built.chunking
         metaspaceChunkGuards = built.guards
 
-        // Symbol tables.
         var byteIds = [Int32](repeating: -1, count: 256)
         for b in 0..<256 {
             byteIds[b] = vocab.id(ofScalar: Unicode.Scalar(ByteLevelAlphabet.byteToScalar[b])!)
@@ -284,7 +272,6 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         }
         hexaTokenIds = hexa
 
-        // Special tokens.
         if let unk = TokenizerModel.unknownToken(from: tokenizerConfig) ?? tokenizerData.model.unkToken.string() {
             unknownToken = unk
             unknownTokenId = vocab.id(of: unk)
@@ -456,7 +443,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         }
     }
 
-    /// tiktoken-style loop: repeatedly find the lowest-rank adjacent pair (leftmost on ties).
+    /// Linear loop: repeatedly find the lowest-rank adjacent pair (leftmost on ties).
     func mergeLinear(_ symbols: inout [Symbol], scratch: inout MergeScratch) {
         var ranks = scratch.ranks
         defer { scratch.ranks = ranks }

@@ -181,7 +181,7 @@ final class RobertaProcessing: PostProcessor, FastPostProcessor {
 
         outTokens = [cls.1] + outTokens + [sep.1]
         if let tokensPair, !tokensPair.isEmpty {
-            // Yes, it adds another `sep`.
+            // RoBERTa pairs carry a second `sep`:
             // https://github.com/facebookresearch/fairseq/blob/main/fairseq/models/roberta/hub_interface.py#L58-L65
             outTokens += [sep.1] + tokensPair + [sep.1]
         }

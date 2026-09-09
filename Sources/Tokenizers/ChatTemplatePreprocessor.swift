@@ -110,9 +110,9 @@ enum ChatTemplatePreprocessor {
     /// a `{%-` after a comment never strips whitespace that precedes the comment.
     /// Emitting an empty comment preserves that segmentation while the strip
     /// markers are applied here. Plain (undashed) comments keep their surroundings;
-    /// swift-jinja's own `lstrip_blocks` / `trim_blocks` (which we always enable,
-    /// like transformers) then apply to the empty comment exactly as jinja2
-    /// applies them to the original one.
+    /// swift-jinja's own `lstrip_blocks` / `trim_blocks` (always enabled, as in
+    /// transformers) then apply to the empty comment exactly as jinja2 applies
+    /// them to the original one.
     private static func skipComment(_ scalars: inout Substring, into out: inout String) {
         scalars = scalars.dropFirst(2)  // past `{#`
         let stripLeft = scalars.hasPrefix("-")
@@ -134,8 +134,8 @@ enum ChatTemplatePreprocessor {
             previous = c
         }
         guard closed else {
-            // Unterminated comment: emit what we consumed and leave the rest so
-            // swift-jinja reports the same lexer error it would have without us.
+            // Unterminated comment: emit the consumed text and leave the rest to swift-jinja's
+            // own lexer error.
             out += stripLeft ? "{#-" : "{#"
             out += scalars
             scalars = Substring()

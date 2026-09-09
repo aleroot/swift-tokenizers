@@ -1,17 +1,10 @@
-// Vectorised scans over UTF-8 buffers. Swift's `SIMD16<UInt8>` lowers to a single NEON
-// register on Apple silicon (and to SSE/AVX on x86), so these kernels process 16 bytes per
-// step instead of taking a branch per byte.
+// Vectorised scans over UTF-8 buffers: 16 bytes per `SIMD16<UInt8>` step.
 //
-// Only the lane-wise arithmetic and bitwise operators of `SIMD16<UInt8>` compile to vector
-// instructions in the current standard library; the pointwise comparisons (`.<`, `.==`) and
-// the horizontal reductions (`any`, `max()`, `wrappedSum()`) expand to a scalar loop over
-// the lanes. The kernels therefore build lane masks (`0x80` in a matching lane, `0` elsewhere)
-// from additions and XORs — exact for ASCII lanes, which is all the classifications need —
-// and reduce a vector by viewing it as two 64-bit words.
-//
-// Every kernel is exact for arbitrary bytes: the vector loop handles full chunks, the last
-// partial chunk is either re-read as an overlapping vector (for idempotent operations) or
-// finished with a scalar loop. Callers pass `UnsafeBufferPointer`s so no copy is made.
+// Only the lane-wise arithmetic and bitwise operators of `SIMD16` compile to vector
+// instructions; pointwise comparisons and horizontal reductions expand to scalar loops. The
+// kernels therefore build `0x80` lane masks from additions and XORs (exact for ASCII lanes) and
+// reduce a vector as two 64-bit words. A partial tail chunk is re-read as an overlapping vector
+// or finished with a scalar loop, so every kernel is exact for arbitrary bytes.
 
 import Foundation
 

@@ -1,12 +1,5 @@
-// Text normalization applied before pre-tokenization (lowercasing, Unicode normalization,
-// accent stripping, …).
-//
-// Every built-in normalizer works on raw UTF-8: `normalize(_:into:scratch:)` appends the
-// normalized bytes of a chunk to a caller-owned buffer, so the encode pipeline never
-// materialises intermediate strings. ASCII input — the bulk of real prompts — is handled
-// with byte loops; only non-ASCII chunks fall back to the Unicode machinery of the
-// standard library and Foundation. The public `normalize(text:)` is derived from the byte
-// form, so each rule is implemented exactly once.
+// Text normalization applied before pre-tokenization. Every built-in normalizer works on raw
+// UTF-8 (`normalize(_:into:scratch:)`); the public `normalize(text:)` is derived from it.
 
 import Foundation
 

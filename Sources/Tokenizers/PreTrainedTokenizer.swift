@@ -374,9 +374,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             context["tools"] = try .array(tools.map { try ChatTemplateValue.make($0) })
         }
         if let additionalContext {
-            // Additional keys and values to be added to the context provided to the prompt
-            // templating engine. For example, the app could set "tools_in_user_message" to
-            // false for Llama 3.1 and 3.2 if a system message is provided.
+            // Extra template context, e.g. `tools_in_user_message` for Llama 3.1 / 3.2.
             for (key, value) in additionalContext {
                 context[key] = try ChatTemplateValue.make(value)
             }
@@ -435,7 +433,6 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 
         let valueFromConfig: Config = tokenizerConfig.chatTemplate
         if let arrayValue = valueFromConfig.array() {
-            // A list of named templates.
             var templateDict: [String: String] = [:]
             for item in arrayValue {
                 guard let name = item["name"].string(), let template = item["template"].string() else { continue }

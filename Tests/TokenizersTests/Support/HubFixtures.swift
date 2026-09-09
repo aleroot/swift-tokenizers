@@ -1,9 +1,6 @@
-// Test-only helper that fetches tokenizer files from the Hugging Face Hub into a local
-// cache directory. The library itself has no download code; the upstream swift-transformers
-// test-suite relies on `HubApi`, so this minimal fetcher keeps those tests runnable.
-//
-// Set `HF_TOKEN` to access gated repositories. Files are cached under
-// `~/Library/Caches/swift-tokenizers-tests/<repo>` (or `SWIFT_TOKENIZERS_FIXTURES`).
+// Test-only helper that fetches tokenizer files from the Hugging Face Hub into a local cache;
+// the library itself has no download code. Set `HF_TOKEN` for gated repositories. Files are
+// cached under `~/Library/Caches/swift-tokenizers-tests/<repo>` (or `SWIFT_TOKENIZERS_FIXTURES`).
 
 import Foundation
 import Tokenizers

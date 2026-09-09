@@ -106,11 +106,9 @@ struct BertTokenizerTests {
         let tokens = ["brave", "gaillard", ",", "d", "\'", "ou", "[UNK]", "etes", "vous", "?"]
 
         #expect(basicTokenizer.tokenize(text: text) == tokens)
-        // Verify that `#expect` does what deep equality checks on arrays of strings.
-        #expect(["foo", "bar"] == ["foo", "bar"])
     }
 
-    /// For each Squad question tokenized by python, check that we get the same output through the `BasicTokenizer`
+    /// Every SQuAD question tokenized by Python matches `BasicTokenizer`.
     @Test("Full basic tokenizer matches Python output on Squad questions")
     func fullBasicTokenizer() {
         let url = Bundle.module.url(forResource: "basic_tokenized_questions", withExtension: "json")!
@@ -128,7 +126,7 @@ struct BertTokenizerTests {
         }
     }
 
-    /// For each Squad question tokenized by python, check that we get the same output through the whole `BertTokenizer`
+    /// Every SQuAD question tokenized by Python matches the whole `BertTokenizer`.
     @Test("Full BERT tokenizer matches Python output on Squad questions")
     func fullBertTokenizer() {
         let url = Bundle.module.url(forResource: "tokenized_questions", withExtension: "json")!
@@ -239,7 +237,6 @@ struct BertTokenizerTests {
             Why'd you leave the keys upon the table? You wanted to
             """
 
-        // Not sure if there's a way to achieve a non-destructive round-trip
         let decoded = """
             wake up ( wake up )
             grab a brush and put a little makeup

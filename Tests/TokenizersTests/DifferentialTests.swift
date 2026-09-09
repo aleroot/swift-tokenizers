@@ -1,11 +1,7 @@
-// Differential testing over ~300 adversarial inputs (`scripts/differential_corpus.py`) for
-// 24 tokenizers against two references:
-//
-// * `Resources/differential/hf__*.json` — ground truth produced by Hugging Face `transformers`
-//   (Rust `tokenizers` core) via `scripts/hf_golden.py`. We must match exactly.
-// * `Resources/differential/upstream__*.json` — swift-transformers' output. Wherever we differ from
-//   it, we must agree with Hugging Face: every deviation is a documented correctness fix,
-//   never a regression.
+// Differential testing over ~300 adversarial inputs (`scripts/differential_corpus.py`) for 24
+// tokenizers. `Resources/differential/hf__*.json` is ground truth from Hugging Face `transformers`
+// (`scripts/hf_golden.py`) and must match exactly; `upstream__*.json` is swift-transformers'
+// output, and every deviation from it must agree with Hugging Face.
 
 import Foundation
 import Testing
