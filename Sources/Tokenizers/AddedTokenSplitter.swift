@@ -1,7 +1,7 @@
 // Splits input text around added / special tokens before normalization and pre-tokenization,
-// reproducing the reference `\s*(<tok>)\s*|…` alternation semantics (leftmost match, longest
-// content wins, `lstrip`/`rstrip` swallow whitespace) with a double-array trie and one
-// allocation-free pass.
+// matching contents leftmost-longest before applying single-word and whitespace rules,
+// as in Hugging Face added_vocabulary.rs. Rejected single-word matches still consume their
+// content in the matcher; whitespace stripping does not hide later content matches.
 
 import Foundation
 
@@ -32,14 +32,8 @@ final class AddedTokenSplitter: Sendable {
     private let trie: DoubleArrayTrie
     /// Bytes that start some token's content.
     private let tokenFirstBytes: [Bool]
-    /// Some token's content begins with whitespace (so whitespace runs cannot be skipped wholesale).
-    private let tokenStartsWithWhitespace: Bool
     /// When every token starts with the same byte, `memchr` skips straight to candidates.
     private let singleFirstByte: UInt8?
-    private let hasLstrip: Bool
-    /// Some `lstrip` token's content itself begins with whitespace, so a match may start
-    /// inside a whitespace run rather than right after it.
-    private let lstripStartsWithWhitespace: Bool
     private let hasSingleWord: Bool
 
     init?(tokens: [Token]) {
@@ -49,32 +43,17 @@ final class AddedTokenSplitter: Sendable {
         var utf8: [UInt8] = []
         var offsets: [UInt32] = [0]
         var firstBytes = [Bool](repeating: false, count: 256)
-        var hasLstrip = false
-        var lstripStartsWithWhitespace = false
-        var tokenStartsWithWhitespace = false
         for token in tokens {
             utf8.append(contentsOf: token.content.utf8)
             offsets.append(UInt32(utf8.count))
-            guard let firstByte = token.content.utf8.first, let first = token.content.unicodeScalars.first else {
-                continue
-            }
-            firstBytes[Int(firstByte)] = true
-            let startsWithWhitespace = ScalarClassifier.flags(value: first.value) & ScalarFlags.whitespace != 0
-            if startsWithWhitespace { tokenStartsWithWhitespace = true }
-            if token.lstrip {
-                hasLstrip = true
-                if startsWithWhitespace { lstripStartsWithWhitespace = true }
-            }
+            if let firstByte = token.content.utf8.first { firstBytes[Int(firstByte)] = true }
         }
         tokenFirstBytes = firstBytes
-        self.tokenStartsWithWhitespace = tokenStartsWithWhitespace
         trie = utf8.withUnsafeBufferPointer { utf8 in
             offsets.withUnsafeBufferPointer { offsets in
                 DoubleArrayTrie(utf8: utf8, offsets: offsets, count: tokens.count)
             }
         }
-        self.hasLstrip = hasLstrip
-        self.lstripStartsWithWhitespace = lstripStartsWithWhitespace
         hasSingleWord = tokens.contains(where: \.singleWord)
         let candidates = firstBytes.enumerated().filter(\.element).map { UInt8($0.offset) }
         singleFirstByte = candidates.count == 1 ? candidates[0] : nil
@@ -82,6 +61,13 @@ final class AddedTokenSplitter: Sendable {
 
     /// Byte-offset variant of ``split(_:)`` operating on well-formed UTF-8.
     func split(bytes: UnsafeBufferPointer<UInt8>, into sections: inout [ByteSection]) {
+        scan(bytes: bytes, onText: { sections.append(.text($0)) },
+             onToken: { id, _ in sections.append(.token(id: id)) })
+    }
+
+    /// Shared matcher; only the opt-in caller retains matched source ranges.
+    func scan(bytes: UnsafeBufferPointer<UInt8>, onText: (Range<Int>) -> Void,
+              onToken: (Int, Range<Int>) -> Void) {
         let end = bytes.count
         var sectionStart = 0
         var i = 0
@@ -98,92 +84,54 @@ final class AddedTokenSplitter: Sendable {
                 }
             }
             guard candidate < end else { break }
-            // … then, for `\s*(<tok>)`, back up to the start of the whitespace run before it:
-            // whitespace matters only when a token follows it, so every other run is skipped.
-            if hasLstrip {
-                var runStart = candidate
-                while runStart > i {
-                    var previous = runStart - 1
-                    while previous > i, bytes[previous] & 0xC0 == 0x80 { previous -= 1 }
-                    guard whitespace(bytes, at: previous).0 else { break }
-                    runStart = previous
-                }
-                candidate = runStart
-            }
-            i = candidate
-
-            var best = tokenFirstBytes[Int(bytes[i])] ? longestMatch(bytes, from: i, requireLstrip: false) : nil
-            var skipTo = -1
-
-            if hasLstrip {
-                let (isWhitespace, width) = whitespace(bytes, at: i)
-                if isWhitespace {
-                    // `\s*(<tok>)`: the token may start right after the whitespace run — or, when a
-                    // token's own content starts with whitespace, anywhere inside it. Later starts
-                    // are checked first, so ties keep the leftmost regex alternative's behaviour.
-                    var runEnd = i + width
-                    while runEnd < end {
-                        let (ws, w) = whitespace(bytes, at: runEnd)
-                        guard ws else { break }
-                        runEnd += w
-                    }
-                    var start = runEnd
-                    while start > i {
-                        if start < end, tokenFirstBytes[Int(bytes[start])],
-                            let match = longestMatch(bytes, from: start, requireLstrip: true),
-                            best == nil || tokens[Int(match.token)].scalarCount > tokens[Int(best!.token)].scalarCount
-                        {
-                            best = match
-                        }
-                        guard lstripStartsWithWhitespace else { break }
-                        start -= 1
-                        while start > i, bytes[start] & 0xC0 == 0x80 { start -= 1 }
-                        if start == i { break }
-                    }
-                    // Nothing can start inside the run unless a token itself begins with whitespace.
-                    if !tokenStartsWithWhitespace { skipTo = runEnd }
-                }
-            }
-
-            guard let match = best else {
-                i = skipTo > i ? skipTo : i + UTF8Cursor.width(bytes[i])
+            guard let match = longestMatch(bytes, from: candidate) else {
+                i = candidate + UTF8Cursor.width(bytes[candidate])
                 continue
             }
-
-            if sectionStart < i {
-                sections.append(.text(sectionStart..<i))
-            }
+            // Content matching advances independently of acceptance and whitespace stripping.
+            i = match.contentEnd
             let token = tokens[Int(match.token)]
-            sections.append(.token(id: token.id))
-
+            if hasSingleWord, token.singleWord,
+                !isolatedWord(bytes, start: candidate, end: match.contentEnd)
+            {
+                continue
+            }
+            var start = candidate
+            if token.lstrip {
+                while start > sectionStart {
+                    var previous = start - 1
+                    while previous > sectionStart, bytes[previous] & 0xC0 == 0x80 { previous -= 1 }
+                    guard whitespace(bytes, at: previous).0 else { break }
+                    start = previous
+                }
+                start = max(start, sectionStart)
+            }
+            if sectionStart < start { onText(sectionStart..<start) }
             var next = match.contentEnd
             if token.rstrip {
                 while next < end {
-                    let (ws, w) = whitespace(bytes, at: next)
+                    let (ws, width) = whitespace(bytes, at: next)
                     guard ws else { break }
-                    next += w
+                    next += width
                 }
             }
+            onToken(token.id, min(start, next)..<next)
             sectionStart = next
-            i = next
         }
 
         if sectionStart < end {
-            sections.append(.text(sectionStart..<end))
+            onText(sectionStart..<end)
         }
     }
 
-    /// Longest token whose content starts at `start` (and satisfies `lstrip` / `single_word`
-    /// constraints), with the offset just past it.
+    /// Select content before checking flags: a rejected longest match must not fall back
+    /// to a shorter or overlapping added token.
     @inline(__always)
     private func longestMatch(
-        _ bytes: UnsafeBufferPointer<UInt8>, from start: Int, requireLstrip: Bool
+        _ bytes: UnsafeBufferPointer<UInt8>, from start: Int
     ) -> (token: Int32, contentEnd: Int)? {
         var best: (token: Int32, contentEnd: Int)?
         trie.forEachPrefix(of: bytes, from: start) { length, index in
-            let token = tokens[Int(index)]
-            if requireLstrip, !token.lstrip { return }
-            if hasSingleWord, token.singleWord, !isolatedWord(bytes, start: start, end: start + length) { return }
             best = (index, start + length)
         }
         return best

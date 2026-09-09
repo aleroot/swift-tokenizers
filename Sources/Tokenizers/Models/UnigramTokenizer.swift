@@ -63,7 +63,10 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         }
 
         byteFallback = tokenizerData.model.byteFallback.boolean(or: false)
-        byteFallbackIds = BPETokenizer.hexaTokenStrings.map { vocabulary.id(of: $0) ?? -1 }
+        byteFallbackIds = BPETokenizer.hexaTokenStrings.map {
+            guard let id = vocabulary.id(of: $0), id < packed.count else { return -1 }
+            return id
+        }
 
         bosToken = addedTokenAsString(tokenizerConfig.bosToken)
         bosTokenId = bosToken.flatMap { vocabulary.id(of: $0) }

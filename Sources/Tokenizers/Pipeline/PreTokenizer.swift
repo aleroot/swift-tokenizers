@@ -118,7 +118,9 @@ struct PreTokenizerFactory {
         case .Digits: return DigitsPreTokenizer(config: config)
         case .Split: return try SplitPreTokenizer(config: config)
         case .Whitespace, .WhitespaceSplit: return WhitespacePreTokenizer(config: config)
-        case .Metaspace: return MetaspacePreTokenizer(config: config)
+        case .Metaspace:
+            try MetaspacePreTokenizer.validate(config)
+            return MetaspacePreTokenizer(config: config)
         case .BertPreTokenizer: return BertPreTokenizer(config: config)
         default: throw TokenizerError.unsupportedComponent("pre-tokenizer `\(typeName)`")
         }
@@ -275,6 +277,11 @@ final class WhitespacePreTokenizer: ByteSplitter {
 /// Replaces spaces with a replacement character (SentencePiece's `▁`) and optionally
 /// prepends it, then splits so every chunk starts with the replacement.
 final class MetaspacePreTokenizer: ByteRewriter {
+    static func validate(_ config: Config) throws {
+        if !config.replacement.isNull(), config.replacement.string()?.unicodeScalars.count != 1 {
+            throw TokenizerError.invalidConfiguration("Metaspace replacement must be one Unicode scalar")
+        }
+    }
     let addPrefixSpace: Bool
     let replacement: String
     let stringReplacement: String
@@ -612,7 +619,7 @@ final class DigitsPreTokenizer: ByteSplitter {
 /// `Split`: a regex or literal delimiter with a `SplitDelimiterBehavior`. Well-known
 /// byte-level regexes run through the hand-written scanners; literals are matched on raw
 /// UTF-8; anything else goes through `NSRegularExpression` on a materialised string.
-final class SplitPreTokenizer: ByteSplitter, ByteRewriter {
+final class SplitPreTokenizer: ByteSplitter {
     let pattern: StringSplitPattern?
     let invert: Bool
     /// Set when the regex is one of the hand-optimised byte-level patterns.
@@ -622,13 +629,14 @@ final class SplitPreTokenizer: ByteSplitter, ByteRewriter {
     /// A literal (`pattern.String`) delimiter, split on raw UTF-8 with `behavior`.
     let literal: [UInt8]?
     let behavior: PunctuationPreTokenizer.Behavior
+    private let fallbackRegex: NSRegularExpression?
 
     required init(config: Config) throws {
         pattern = try StringSplitPattern.from(config: config)
         invert = config.invert.boolean(or: false)
         behavior = config.behavior.string().flatMap(PunctuationPreTokenizer.Behavior.init(rawValue:)) ?? .isolated
         let source = config.pattern.Regex.string()
-        if let source, !config.invert.boolean(or: false) {
+        if let source, !invert, behavior == .isolated {
             known = KnownSplitPattern(regexSource: source)
         } else {
             known = nil
@@ -641,10 +649,20 @@ final class SplitPreTokenizer: ByteSplitter, ByteRewriter {
         } else {
             literal = nil
         }
+        if known == nil, !asciiDigitsIsolated, literal == nil, let pattern {
+            switch pattern {
+            case .regexp(let regex): fallbackRegex = regex
+            case .string(let string):
+                fallbackRegex = try compileRegex(
+                    NSRegularExpression.escapedPattern(for: string), component: "Split pre-tokenizer")
+            }
+        } else {
+            fallbackRegex = nil
+        }
     }
 
     var stages: [PreTokenizationStage] {
-        known != nil || asciiDigitsIsolated || literal != nil || pattern == nil ? [.split(self)] : [.rewrite(self)]
+        [.split(self)]
     }
 
     func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
@@ -654,28 +672,62 @@ final class SplitPreTokenizer: ByteSplitter, ByteRewriter {
             Self.splitASCIIDigits(bytes, into: &pieces)
         } else if let literal {
             splitLiteral(bytes, literal, into: &pieces)
+        } else if let fallbackRegex {
+            splitRegex(bytes, regex: fallbackRegex, into: &pieces)
         } else {
             pieces.append(0..<bytes.count)
         }
     }
 
-    /// Generic regex path: the matches are materialised as strings and re-emitted contiguously.
-    func rewrite(
-        _ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into output: inout [UInt8],
-        pieces: inout [Range<Int>]
+    /// Generic patterns partition the original text into matches and gaps. Inversion flips
+    /// their flags, then delimiter behavior merges or removes partitions. Keeping ranges in
+    /// the original buffer also preserves Metaspace's first-section check after removed gaps.
+    private func splitRegex(
+        _ bytes: UnsafeBufferPointer<UInt8>, regex: NSRegularExpression, into pieces: inout [Range<Int>]
     ) {
-        guard let pattern else {
-            let base = output.count
-            output.append(contentsOf: bytes)
-            pieces.append(0..<(output.count - base))
-            return
+        guard !bytes.isEmpty else { return }
+        let text = String(decoding: bytes, as: UTF8.self)
+        // ICU reports UTF-16 offsets; convert all boundaries in one scalar pass.
+        var byteOffsets = [Int](repeating: -1, count: text.utf16.count + 1)
+        var utf16Offset = 0
+        var byteOffset = 0
+        for scalar in text.unicodeScalars {
+            byteOffsets[utf16Offset] = byteOffset
+            utf16Offset += scalar.value > 0xFFFF ? 2 : 1
+            byteOffset += scalar.utf8.count
         }
-        let base = output.count
-        for piece in pattern.split(String(decoding: bytes, as: UTF8.self), invert: invert) {
-            let start = output.count - base
-            ASCII.append(piece, to: &output)
-            pieces.append(start..<(output.count - base))
+        byteOffsets[utf16Offset] = byteOffset
+        var partitions: [(range: Range<Int>, matched: Bool)] = []
+        var cursor = 0
+        for match in regex.matches(in: text, range: NSRange(location: 0, length: utf16Offset)) {
+            let start = byteOffsets[match.range.location]
+            let end = byteOffsets[NSMaxRange(match.range)]
+            guard start >= 0, end >= 0 else { continue }
+            if start > cursor { partitions.append((cursor..<start, invert)) }
+            partitions.append((start..<end, !invert))
+            cursor = end
         }
+        if cursor < bytes.count { partitions.append((cursor..<bytes.count, invert)) }
+        if behavior == .mergedWithNext { partitions.reverse() }
+        var result: [Range<Int>] = []
+        var previousMatch = false
+        for (range, matched) in partitions {
+            if behavior == .removed {
+                if !matched { result.append(range) }
+            } else if let last = result.last,
+                (behavior == .contiguous && matched == previousMatch)
+                    || ((behavior == .mergedWithPrevious || behavior == .mergedWithNext)
+                        && matched && !previousMatch)
+            {
+                result[result.count - 1] =
+                    min(last.lowerBound, range.lowerBound)..<max(last.upperBound, range.upperBound)
+            } else {
+                result.append(range)
+            }
+            previousMatch = matched
+        }
+        if behavior == .mergedWithNext { result.reverse() }
+        pieces.append(contentsOf: result.filter { !$0.isEmpty })
     }
 
     /// Splits on a literal delimiter, byte-wise, honouring `behavior` exactly like

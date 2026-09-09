@@ -37,7 +37,9 @@ struct DecoderFactory {
         case .ByteFallback: return ByteFallbackDecoder(config: config)
         case .Fuse: return FuseDecoder(config: config)
         case .Strip: return try StripDecoder(config: config)
-        case .Metaspace: return MetaspaceDecoder(config: config)
+        case .Metaspace:
+            try MetaspacePreTokenizer.validate(config)
+            return MetaspaceDecoder(config: config)
         case .BPEDecoder: return BPEDecoder(config: config)
         case .CTC: return CTCDecoder(config: config)
         case .WordPiece: return try WordPieceDecoder(config: config)
@@ -254,11 +256,11 @@ final class MetaspaceDecoder: Decoder {
     }
 
     func decode(tokens: [String]) -> [String] {
-        var replaced = tokens.map { $0.replacingBytes(of: replacement, with: " ") }
-        if addPrefixSpace, replaced.first?.hasBytePrefix(" ") ?? false {
-            replaced[0] = String(replaced[0].droppingBytePrefix(" "))
+        // HF removes every replacement character in the first token, including interior
+        // markers. Literal spaces in that token are retained.
+        tokens.enumerated().map { index, token in
+            token.replacingBytes(of: replacement, with: index == 0 && addPrefixSpace ? "" : " ")
         }
-        return replaced
     }
 }
 

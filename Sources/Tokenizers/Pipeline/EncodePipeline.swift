@@ -49,6 +49,7 @@ struct PreTokenizationRunner: Sendable {
         let rest: PreTokenizerOptions =
             options.count == 1 && options.contains(.firstSection) || options.isEmpty
             ? [] : options.subtracting([.firstSection])
+        var first = options
 
         for stage in stages {
             switch stage {
@@ -58,20 +59,24 @@ struct PreTokenizationRunner: Sendable {
             case let .split(splitter):
                 next.removeAll(keepingCapacity: true)
                 if rewritten {
-                    text.withUnsafeBufferPointer { Self.split(splitter, $0, current, options, rest, into: &next) }
+                    text.withUnsafeBufferPointer { Self.split(splitter, $0, current, first, rest, into: &next) }
                 } else {
-                    Self.split(splitter, bytes, current, options, rest, into: &next)
+                    Self.split(splitter, bytes, current, first, rest, into: &next)
                 }
             case let .rewrite(rewriter):
+                // Rewriters compact surviving pieces into a new buffer. Once a split has
+                // removed the original start, its new byte offset zero is not the start
+                // of the input. Ordinary split-only pipelines need no extra origin check.
+                if current.first?.lowerBound != 0 { first = rest }
                 next.removeAll(keepingCapacity: true)
                 var output = scratch.take()
                 if rewritten {
                     text.withUnsafeBufferPointer {
-                        Self.rewrite(rewriter, $0, current, options, rest, into: &output, pieces: &next)
+                        Self.rewrite(rewriter, $0, current, first, rest, into: &output, pieces: &next)
                     }
                     scratch.recycle(text)
                 } else {
-                    Self.rewrite(rewriter, bytes, current, options, rest, into: &output, pieces: &next)
+                    Self.rewrite(rewriter, bytes, current, first, rest, into: &output, pieces: &next)
                 }
                 text = output
                 rewritten = true

@@ -12,9 +12,9 @@
 
 swift-tokenizers is a native Swift 6 implementation of the tokenizers used by today's language
 models: byte-level and SentencePiece **BPE**, **Unigram** and **WordPiece**, engineered for
-speed. It encodes at 200+ MB/s on a single Apple silicon core, well beyond the Rust
-implementations, with sub-microsecond latency on short inputs. It loads the `tokenizer.json` files published on the
-Hugging Face Hub and reproduces the output of Hugging Face `tokenizers` token for token. It ships
+speed. It loads `tokenizer.json` files published on the Hugging Face Hub, with encode and decode
+parity checked against pinned Hugging Face references. Performance depends on the model, text,
+and cache state; see the [benchmarks](docs/BENCHMARKS.md). It ships
 as a drop-in replacement for the `Tokenizers` product of
 [swift-transformers](https://github.com/huggingface/swift-transformers), plugs seamlessly into
 [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm), and is the tokenizer behind
@@ -34,21 +34,22 @@ let prompt = try tokenizer.applyChatTemplate(messages: [
 
 ## Highlights
 
-- **Bit-exact with Hugging Face.** Every token, offset and special-token rule matches
-  `transformers` / Rust `tokenizers`, verified on 24 tokenizer families × 300 adversarial inputs,
-  on real embedding, reranker and LLM model folders, and through the complete swift-transformers
-  test-suite.
-- **Extremely fast.** 200+ MB/s single-threaded on Apple silicon: 30-40x the Rust `tokenizers`
-  core, 4-6x tiktoken and two orders of magnitude faster than swift-transformers, with
-  sub-microsecond latency on short queries. A 150k-token vocabulary loads in about 25 ms.
-- **Complete.** Added and special tokens, every normalizer, pre-tokenizer, post-processor and
-  decoder that modern `tokenizer.json` files use, chat templates with tools, and O(1) vocabulary
-  reflection for guided generation.
+- **Differentially tested.** Encode and decode tests cover 24 tokenizer families and roughly
+  300 adversarial inputs per family. Focused boundary and offset regressions, plus 814 component
+  cases, use Rust-backed `tokenizers` 0.23.2 reference outputs with byte-exact string comparisons.
+  Exhaustive Unicode testing still finds unresolved normalization differences.
+- **Fast inference.** SIMD scans, packed vocabulary storage, reusable buffers, and bounded
+  pretoken caches. Published performance comparisons specify their workloads and reference versions.
+- **Inference components.** Added and special tokens, common normalization and pre-tokenization
+  pipelines, post-processors, decoders, chat templates with tools, and O(1) vocabulary lookup.
+  Original-source offsets are available through an opt-in `encode` overload.
+  This is not the full Hugging Face training/Encoding API: pair encodings, padding,
+  and stochastic tokenization are outside the supported surface.
 - **Drop-in.** Same `Tokenizer`, `PreTrainedTokenizer`, `AutoTokenizer`, `Config` and
   `TokenizerError` API as swift-transformers; existing consumers compile unchanged.
 - **Lean.** A single dependency, [swift-jinja](https://github.com/huggingface/swift-jinja), for
-  chat templates. No Hub client, no downloader. Every tokenizer is `Sendable`; malformed input is a
-  `TokenizerError`, never a trap.
+  chat templates. No Hub client, no downloader. Every tokenizer is `Sendable`; configuration
+  validation and sanitizer tests cover malformed input and unsafe storage boundaries.
 
 ## Installation
 
@@ -91,6 +92,18 @@ let text = tokenizer.decode(tokens: ids, skipSpecialTokens: true)
 tokenizer.bosToken, tokenizer.eosTokenId, tokenizer.unknownToken
 tokenizer.convertTokenToId("Hello"), tokenizer.convertIdToToken(9707)
 ```
+
+### Source offsets
+
+```swift
+let encoding = try tokenizer.encode(text: "Hello world", withOffsets: true)
+let ids = encoding.ids
+let ranges = encoding.utf16Ranges(expandingToGraphemeClusters: true)
+```
+
+`encoding.offsets` contains UTF-8 byte ranges in the original input, before normalization.
+Inserted special tokens have nil ranges; multiple tokens can overlap the same source text.
+The existing IDs-only overload avoids alignment work.
 
 ### Chat templates and tools
 

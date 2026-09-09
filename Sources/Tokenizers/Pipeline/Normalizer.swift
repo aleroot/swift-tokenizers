@@ -591,6 +591,14 @@ final class PrecompiledNormalizer: ByteNormalizer {
         return nil
     }
 
+    /// Used only by the opt-in alignment pipeline.
+    func offsetReplacement(_ text: String) -> String? {
+        guard let offset = replacementOffset(for: text.utf8) else { return nil }
+        var bytes: [UInt8] = []
+        appendReplacement(at: offset, to: &bytes)
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
     private func replacementOffset<C: Collection>(for bytes: C) -> Int32? where C.Element == UInt8 {
         Self.replacementOffset(for: bytes, trie: trie, replacements: replacements)
     }
@@ -804,7 +812,9 @@ enum StringReplacePattern: Sendable {
             let text = String(decoding: bytes, as: UTF8.self)
             let range = NSRange(text.startIndex..., in: text)
             ASCII.append(
-                regexp.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: replacement),
+                regexp.stringByReplacingMatches(
+                    in: text, options: [], range: range,
+                    withTemplate: NSRegularExpression.escapedTemplate(for: replacement)),
                 to: &output)
         case let .string(pattern, replacement):
             Self.replaceLiteral(bytes, pattern: pattern, with: replacement, into: &output)
@@ -836,6 +846,7 @@ enum StringReplacePattern: Sendable {
         case .regexp:
             return true  // unknown without running the engine; treat as a potential match
         case let .string(pattern, _):
+            if pattern.isEmpty { return !bytes.isEmpty }
             guard let first = pattern.first, pattern.count <= bytes.count, let base = bytes.baseAddress else {
                 return false
             }
@@ -876,6 +887,19 @@ enum StringReplacePattern: Sendable {
     ) {
         let n = bytes.count
         let m = pattern.count
+        if m == 0 {
+            // Replace's empty pattern matches every scalar boundary on nonempty input.
+            guard n > 0 else { return }
+            var i = 0
+            while i < n {
+                output.append(contentsOf: replacement)
+                let end = i + UTF8Cursor.width(bytes[i])
+                output.append(contentsOf: bytes[i..<end])
+                i = end
+            }
+            output.append(contentsOf: replacement)
+            return
+        }
         guard m > 0, m <= n, let base = bytes.baseAddress else {
             output.append(contentsOf: bytes)
             return

@@ -225,6 +225,19 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         return ids
     }
 
+    /// Encodes with source alignment, without changing the IDs-only encode path.
+    public func encode(text: String, addSpecialTokens: Bool = true, withOffsets: Bool) throws -> TokenEncoding {
+        guard withOffsets else {
+            return TokenEncoding(text: text, ids: encode(text: text, addSpecialTokens: addSpecialTokens))
+        }
+        var tokens = try pipeline.encode(text, model: model)
+        if let postProcessor {
+            tokens = try postProcessor.processOffsets(tokens, addSpecialTokens: addSpecialTokens,
+                resolve: model.convertTokenToId, spelling: convertIdToToken)
+        }
+        return TokenEncoding(text: text, tokens: tokens)
+    }
+
     /// Runs the pipeline up to (excluding) the post-processor.
     func encodeWithoutPostProcessing(text: String) -> [Int] {
         guard let fastModel else {

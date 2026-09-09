@@ -63,7 +63,7 @@ jobs:
         run: swift test --sanitize=thread --filter "Concurrency|Differential|OptimizationRegression|UnicodeTablesTests"
 
       - name: Address sanitizer (byte kernels and raw storage)
-        run: swift test --sanitize=address --filter "ByteKernels|OptimizationRegression|ConfigTests|TrieTests|UnicodeTablesTests|UnicodeNormalizationTests"
+        run: swift test --sanitize=address --filter "ByteKernels|OptimizationRegression|ConfigTests|TrieTests|UnicodeTablesTests|UnicodeNormalizationTests|CorrectnessAuditTests"
 
   ios:
     name: Build (iOS)

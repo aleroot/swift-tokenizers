@@ -37,7 +37,8 @@ enum StringSplitPattern {
 /// configuration error rather than crashing.
 func compileRegex(_ pattern: String, component: String) throws -> NSRegularExpression {
     do {
-        return try NSRegularExpression(pattern: pattern, options: [])
+        // ICU rejects an empty source; the empty group has the same zero-width matches.
+        return try NSRegularExpression(pattern: pattern.isEmpty ? "(?:)" : pattern, options: [])
     } catch {
         throw TokenizerError.invalidConfiguration(
             "\(component): invalid regular expression \(pattern.debugDescription)")

@@ -23,6 +23,7 @@ struct BytePair: Hashable, Sendable {
 
 final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendable {
     let vocab: Vocabulary
+    let modelVocabulary: ModelVocabulary
     let merges: MergeTable
 
     /// Ids of the single-alphabet-character tokens for every byte value (`-1` if missing).
@@ -230,9 +231,18 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
     }
 
     required init(tokenizerConfig: Config, tokenizerData: Config, addedTokens: [String: Int]) throws {
+        if !tokenizerData.model.dropout.isNull() {
+            guard let dropout = tokenizerData.model.dropout.double(), dropout >= 0, dropout <= 1 else {
+                throw TokenizerError.invalidConfiguration("BPE dropout must be between zero and one")
+            }
+            guard dropout == 0 else {
+                throw TokenizerError.unsupportedComponent("BPE dropout (stochastic tokenization)")
+            }
+        }
         let vocab = try Vocabulary(
             vocab: tokenizerData.model.vocab, addedTokens: addedTokens, addedTokenConfig: tokenizerData.addedTokens)
         self.vocab = vocab
+        modelVocabulary = try ModelVocabulary(vocab, config: tokenizerData.model.vocab)
         continuingPrefix = tokenizerData.model.continuingSubwordPrefix.string(or: "")
         endSuffix = tokenizerData.model.endOfWordSuffix.string(or: "")
         ignoreMerges = tokenizerData.model.ignoreMerges.boolean(or: false)
@@ -256,20 +266,20 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
 
         var byteIds = [Int32](repeating: -1, count: 256)
         for b in 0..<256 {
-            byteIds[b] = vocab.id(ofScalar: Unicode.Scalar(ByteLevelAlphabet.byteToScalar[b])!)
+            byteIds[b] = modelVocabulary.id(ofScalar: Unicode.Scalar(ByteLevelAlphabet.byteToScalar[b])!)
         }
         byteSymbolIds = byteIds
 
         var scalarIds = [Int32](repeating: -1, count: Int(Self.scalarTableLimit))
         for v in 0..<Self.scalarTableLimit {
             guard let scalar = Unicode.Scalar(v) else { continue }
-            scalarIds[Int(v)] = vocab.id(ofScalar: scalar)
+            scalarIds[Int(v)] = modelVocabulary.id(ofScalar: scalar)
         }
         scalarSymbolIds = scalarIds
 
         var hexa = [Int32](repeating: -1, count: 256)
         for b in 0..<256 {
-            hexa[b] = Int32(vocab.id(of: Self.hexaTokenStrings[b]) ?? -1)
+            hexa[b] = Int32(modelVocabulary.id(of: Self.hexaTokenStrings[b]) ?? -1)
         }
         hexaTokenIds = hexa
 
@@ -383,7 +393,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
             if value < Self.scalarTableLimit {
                 id = scalarSymbolIds[Int(value)]
             } else if let scalar = Unicode.Scalar(value) {
-                id = vocab.id(ofScalar: scalar)
+                id = modelVocabulary.id(ofScalar: scalar)
             } else {
                 id = -1
             }
@@ -410,7 +420,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
             var spelling = String(Unicode.Scalar(value)!)
             if i > 0 { spelling = continuingPrefix + spelling }
             if end == bytes.count { spelling += endSuffix }
-            if let id = vocab.id(of: spelling) {
+            if let id = modelVocabulary.id(of: spelling) {
                 if let pendingUnknown { symbols.append(pendingUnknown) }
                 pendingUnknown = nil
                 symbols.append(Symbol(id: Int32(id), start: Int32(i), end: Int32(end)))
@@ -656,9 +666,9 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
                 if byteLevel {
                     fallbackBytes.removeAll(keepingCapacity: true)
                     ByteLevelAlphabet.appendEncoded(bytes, to: &fallbackBytes)
-                    id = fallbackBytes.withUnsafeBufferPointer { model.vocab.id(of: $0) }
+                    id = fallbackBytes.withUnsafeBufferPointer { model.modelVocabulary.id(of: $0) }
                 } else {
-                    id = model.vocab.id(of: bytes)
+                    id = model.modelVocabulary.id(of: bytes)
                 }
                 if id >= 0 {
                     ids.append(Int(id))

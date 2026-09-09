@@ -9,7 +9,7 @@ public final class BertTokenizer: Sendable {
     private let basicTokenizer: BasicTokenizer
     private let wordpieceTokenizer: WordpieceTokenizer
     private let tokenizeChineseChars: Bool
-    private let serializedWordPiece: Bool
+    let serializedWordPiece: Bool
 
     /// Vocabulary keyed by exact byte sequence (no Unicode canonical folding).
     private let vocabulary: Vocabulary
@@ -54,6 +54,7 @@ public final class BertTokenizer: Sendable {
             eosToken: tokenizerConfig.eosToken.string(),
             fuseUnknownTokens: tokenizerConfig.fuseUnk.boolean(or: false),
             doLowerCase: tokenizerConfig.doLowerCase.boolean(or: true),
+            modelVocabulary: try ModelVocabulary(vocabulary, config: tokenizerData.model.vocab),
             // A serialized pipeline (normalizer / pre-tokenizer in `tokenizer.json`) already
             // basic-tokenizes; pre-2020 exports omit `model.type` but are WordPiece models too.
             serializedWordPiece: tokenizerData.model.type.string() == "WordPiece"
@@ -70,13 +71,15 @@ public final class BertTokenizer: Sendable {
         eosToken: String?,
         fuseUnknownTokens: Bool,
         doLowerCase: Bool,
+        modelVocabulary: ModelVocabulary? = nil,
         serializedWordPiece: Bool = false, unkToken: String = "[UNK]", prefix: String = "##", maximum: Int = 100
     ) {
         self.serializedWordPiece = serializedWordPiece
         self.vocabulary = vocabulary
         basicTokenizer = BasicTokenizer(doLowerCase: doLowerCase)
         wordpieceTokenizer = WordpieceTokenizer(
-            vocabulary: vocabulary, unkToken: unkToken, prefix: prefix, maximum: maximum)
+            vocabulary: vocabulary, unkToken: unkToken, prefix: prefix, maximum: maximum,
+            modelVocabulary: modelVocabulary)
         self.tokenizeChineseChars = tokenizeChineseChars
         self.bosToken = bosToken
         bosTokenId = bosToken.flatMap { vocabulary.id(of: $0) }
@@ -93,6 +96,95 @@ public final class BertTokenizer: Sendable {
             tokens.append(contentsOf: wordpieceTokenizer.tokenize(word: token))
         }
         return tokens
+    }
+
+    /// WordPiece's vocabulary spelling gives exact lengths in the normalized word.
+    func encode(_ text: AlignedText, into output: inout [AlignedToken]) throws {
+        if !serializedWordPiece {
+            for piece in try legacyAlignedPieces(text) { encodeAlignedWord(piece, into: &output) }
+        } else { encodeAlignedWord(text, into: &output) }
+    }
+
+    func appendOffsets(_ text: AlignedText, ids: [Int], into output: inout [AlignedToken]) {
+        if ids.count == 1, ids[0] == unknownTokenId {
+            output.append(AlignedToken(id: ids[0], offset: text.sourceRange(0..<text.bytes.count)))
+            return
+        }
+        var start = 0
+        for id in ids {
+            let length = vocabulary.byteCount(of: id) - (start == 0 ? 0 : wordpieceTokenizer.prefix.utf8.count)
+            let end = start + length
+            output.append(AlignedToken(id: id, offset: text.sourceRange(start..<end)))
+            start = end
+        }
+    }
+
+    private func encodeAlignedWord(_ text: AlignedText, into output: inout [AlignedToken]) {
+        var ids: [Int] = []
+        var scratch = WordpieceTokenizer.Scratch()
+        let success = text.bytes.withUnsafeBufferPointer {
+            wordpieceTokenizer.encode($0, into: &ids, scratch: &scratch)
+        }
+        guard success else {
+            if let id = unknownTokenId { output.append(AlignedToken(id: id, offset: text.sourceRange(0..<text.bytes.count))) }
+            return
+        }
+        appendOffsets(text, ids: ids, into: &output)
+    }
+
+    /// Preserve the older vocab.txt basic-tokenizer semantics, including its
+    /// whitespace set and never-split words, while retaining original positions.
+    private func legacyAlignedPieces(_ input: AlignedText) throws -> [AlignedText] {
+        var text = input
+        if tokenizeChineseChars {
+            let units = text.units
+            var output: [AlignedText.Unit] = []
+            var index = 0
+            for character in text.text {
+                let count = character.unicodeScalars.count
+                let chinese = character.unicodeScalars.first.map { BertNormalizer.isCJKUnifiedIdeograph($0.value) } ?? false
+                if chinese { output.append(.init(scalar: " ", origin: units[index].origin)) }
+                output.append(contentsOf: units[index..<index + count])
+                if chinese { output.append(.init(scalar: " ", origin: units[index + count - 1].origin)) }
+                index += count
+            }
+            text = AlignedText(output)
+        }
+        if basicTokenizer.doLowerCase {
+            text = try text.normalized(by: BertNormalizer(config: [
+                "clean_text": false, "handle_chinese_chars": false, "strip_accents": true, "lowercase": false,
+            ]))
+        }
+        var words: [AlignedText] = []
+        var start = 0
+        var byte = 0
+        for scalar in text.text.unicodeScalars {
+            let end = byte + scalar.utf8.count
+            if CharacterSet.whitespaces.contains(scalar) {
+                if start < byte { words.append(text.slice(start..<byte)) }
+                start = end
+            }
+            byte = end
+        }
+        if start < byte { words.append(text.slice(start..<byte)) }
+        var pieces: [AlignedText] = []
+        for var word in words {
+            if basicTokenizer.neverSplit.contains(word.text) { pieces.append(word); continue }
+            if basicTokenizer.doLowerCase { word = try word.normalized(by: LowercaseNormalizer(config: [:])) }
+            var start = 0
+            var byte = 0
+            for character in word.text {
+                let end = byte + character.utf8.count
+                if character.isExtendedPunctuation {
+                    if start < byte { pieces.append(word.slice(start..<byte)) }
+                    pieces.append(word.slice(byte..<end))
+                    start = end
+                }
+                byte = end
+            }
+            if start < byte { pieces.append(word.slice(start..<byte)) }
+        }
+        return pieces
     }
 
     /// Tokenizes and maps to ids in one step (tokens absent from the vocabulary are dropped,
@@ -343,6 +435,7 @@ final class WordpieceTokenizer: Sendable {
     let prefix: String
     private let maxInputCharsPerWord: Int
     private let vocabulary: Vocabulary
+    private let modelVocabulary: ModelVocabulary
     private let continuationPrefix: [UInt8]
     /// Byte length of the longest vocabulary entry: no candidate longer than this can match.
     private let maxTokenBytes: Int
@@ -358,12 +451,16 @@ final class WordpieceTokenizer: Sendable {
         var continuation: [UInt8] = []
     }
 
-    init(vocabulary: Vocabulary, unkToken: String = "[UNK]", prefix: String = "##", maximum: Int = 100) {
+    init(
+        vocabulary: Vocabulary, unkToken: String = "[UNK]", prefix: String = "##", maximum: Int = 100,
+        modelVocabulary: ModelVocabulary? = nil
+    ) {
         self.unkToken = unkToken
         self.prefix = prefix
         maxInputCharsPerWord = maximum
         continuationPrefix = Array(prefix.utf8)
         self.vocabulary = vocabulary
+        self.modelVocabulary = modelVocabulary ?? ModelVocabulary(vocabulary)
         unkId = vocabulary.id(of: unkToken)
         var longest = 0
         var initialStarts = ScalarBitmap()
@@ -425,7 +522,7 @@ final class WordpieceTokenizer: Sendable {
             guard scalarCount <= maxInputCharsPerWord else { return false }
         }
 
-        let whole = vocabulary.id(of: word)
+        let whole = modelVocabulary.id(of: word)
         if whole >= 0 {
             ids.append(Int(whole))
             return true
@@ -450,7 +547,7 @@ final class WordpieceTokenizer: Sendable {
             var found: Int32 = -1
             if start == 0 {
                 while end > start {
-                    found = vocabulary.id(of: UnsafeBufferPointer(rebasing: word[start..<end]))
+                    found = modelVocabulary.id(of: UnsafeBufferPointer(rebasing: word[start..<end]))
                     if found >= 0 { break }
                     end = Self.previousScalarBoundary(word, before: end, floor: start)
                 }
@@ -462,7 +559,7 @@ final class WordpieceTokenizer: Sendable {
                 scratch.continuation.withUnsafeBufferPointer { candidate in
                     while end > start {
                         let length = prefixCount + (end - start)
-                        found = vocabulary.id(of: UnsafeBufferPointer(rebasing: candidate[0..<length]))
+                        found = modelVocabulary.id(of: UnsafeBufferPointer(rebasing: candidate[0..<length]))
                         if found >= 0 { break }
                         end = Self.previousScalarBoundary(word, before: end, floor: start)
                     }

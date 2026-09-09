@@ -140,7 +140,13 @@ final class TemplateProcessing: PostProcessor, FastPostProcessor {
 }
 
 final class ByteLevelPostProcessor: PostProcessor, FastPostProcessor {
-    required init(config: Config) {}
+    let trimOffsets: Bool
+    let addPrefixSpace: Bool
+
+    required init(config: Config) {
+        trimOffsets = config.trimOffsets.boolean(or: true)
+        addPrefixSpace = config.addPrefixSpace.boolean(or: true)
+    }
 
     func postProcess(tokens: [String], tokensPair: [String]? = nil, addSpecialTokens: Bool = true) -> [String] {
         tokens
@@ -150,17 +156,17 @@ final class ByteLevelPostProcessor: PostProcessor, FastPostProcessor {
 }
 
 final class RobertaProcessing: PostProcessor, FastPostProcessor {
-    private let sep: (UInt, String)
-    private let cls: (UInt, String)
+    let sep: (UInt, String)
+    let cls: (UInt, String)
     /// Trim all remaining space, or leave one space character if `addPrefixSpace` is `true`.
-    private let trimOffset: Bool
+    let trimOffset: Bool
     /// Keep one space character on each side. Depends on `trimOffsets` being `true`.
-    private let addPrefixSpace: Bool
+    let addPrefixSpace: Bool
 
     required init(config: Config) throws {
         sep = try require(config.sep.token(), "RobertaProcessing", field: "sep")
         cls = try require(config.cls.token(), "RobertaProcessing", field: "cls")
-        trimOffset = config.trimOffset.boolean(or: true)
+        trimOffset = config.trimOffsets.boolean() ?? config.trimOffset.boolean(or: true)
         addPrefixSpace = config.addPrefixSpace.boolean(or: true)
     }
 
@@ -218,8 +224,8 @@ final class RobertaProcessing: PostProcessor, FastPostProcessor {
 }
 
 final class BertProcessing: PostProcessor, FastPostProcessor {
-    private let sep: (UInt, String)
-    private let cls: (UInt, String)
+    let sep: (UInt, String)
+    let cls: (UInt, String)
 
     required init(config: Config) throws {
         sep = try require(config.sep.token(), "BertProcessing", field: "sep")
@@ -243,7 +249,7 @@ final class BertProcessing: PostProcessor, FastPostProcessor {
 }
 
 final class SequenceProcessing: PostProcessor, FastPostProcessor {
-    private let processors: [any PostProcessor]
+    let processors: [any PostProcessor]
 
     required init(config: Config) throws {
         let configs = try require(config.processors.array(), "Sequence post-processor", field: "processors")

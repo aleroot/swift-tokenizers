@@ -86,6 +86,15 @@ struct TokenizerBenchmarkTests {
         benchmarkMeasure(label: "JSONSerialization", iterations: 5, warmup: 1) {
             _ = try! JSONSerialization.jsonObject(with: json)
         }
+        let parsed = try Config(jsonData: json)
+        let tokenizerConfig =
+            (try? Config(jsonFile: folder.appendingPathComponent("tokenizer_config.json"))) ?? Config()
+        benchmarkMeasure(label: "BPETokenizer.init", iterations: 5, warmup: 1) {
+            _ = try! BPETokenizer(tokenizerConfig: tokenizerConfig, tokenizerData: parsed, addedTokens: [:])
+        }
+        benchmarkMeasure(label: "PreTrainedTokenizer", iterations: 5, warmup: 1) {
+            _ = try! PreTrainedTokenizer(tokenizerConfig: tokenizerConfig, tokenizerData: parsed)
+        }
     }
 
     @Test("BPE encode throughput across input sizes")
