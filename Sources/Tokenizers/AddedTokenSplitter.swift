@@ -35,12 +35,10 @@ final class AddedTokenSplitter: Sendable {
     private let trie: DoubleArrayTrie
     /// Bytes that start some token's content.
     private let tokenFirstBytes: [Bool]
-    /// `tokenFirstBytes` plus whitespace lead bytes when any token has `lstrip`.
-    private let candidateFirstBytes: [Bool]
     /// Some token's content begins with whitespace (so whitespace runs cannot be skipped wholesale).
     private let tokenStartsWithWhitespace: Bool
     /// When every token starts with the same byte, `memchr` skips straight to candidates.
-    private let singleCandidateByte: UInt8?
+    private let singleFirstByte: UInt8?
     private let hasLstrip: Bool
     /// Some `lstrip` token's content itself begins with whitespace, so a match may start
     /// inside a whitespace run rather than right after it.
@@ -81,14 +79,8 @@ final class AddedTokenSplitter: Sendable {
         self.hasLstrip = hasLstrip
         self.lstripStartsWithWhitespace = lstripStartsWithWhitespace
         hasSingleWord = tokens.contains(where: \.singleWord)
-        if hasLstrip {
-            // Whitespace may precede an lstrip token; ASCII whitespace plus lead bytes of
-            // non-ASCII whitespace (U+0085, U+00A0, U+1680, U+2000–U+200A, U+2028/9, U+202F, U+205F, U+3000).
-            for b in [0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x20, 0xC2, 0xE1, 0xE2, 0xE3] { firstBytes[b] = true }
-        }
-        candidateFirstBytes = firstBytes
         let candidates = firstBytes.enumerated().filter(\.element).map { UInt8($0.offset) }
-        singleCandidateByte = candidates.count == 1 ? candidates[0] : nil
+        singleFirstByte = candidates.count == 1 ? candidates[0] : nil
     }
 
     /// Byte-offset variant of ``split(_:)`` operating on well-formed UTF-8.
@@ -98,17 +90,30 @@ final class AddedTokenSplitter: Sendable {
         var i = 0
 
         while i < end {
-            if let single = singleCandidateByte {
-                // Jump to the next possible token start.
-                guard let hit = memchr(bytes.baseAddress! + i, Int32(single), end - i) else { break }
-                i = UnsafePointer<UInt8>(hit.assumingMemoryBound(to: UInt8.self)) - bytes.baseAddress!
+            // Jump to the next byte that starts some token's content …
+            var candidate: Int
+            if let single = singleFirstByte {
+                candidate = ByteKernels.firstIndex(of: single, in: bytes, from: i)
             } else {
-                let firstByte = bytes[i]
-                guard candidateFirstBytes[Int(firstByte)] else {
-                    i += UTF8Cursor.width(firstByte)
-                    continue
+                candidate = i
+                while candidate < end, !tokenFirstBytes[Int(bytes[candidate])] {
+                    candidate += UTF8Cursor.width(bytes[candidate])
                 }
             }
+            guard candidate < end else { break }
+            // … then, for `\s*(<tok>)`, back up to the start of the whitespace run before it:
+            // whitespace matters only when a token follows it, so every other run is skipped.
+            if hasLstrip {
+                var runStart = candidate
+                while runStart > i {
+                    var previous = runStart - 1
+                    while previous > i, bytes[previous] & 0xC0 == 0x80 { previous -= 1 }
+                    guard whitespace(bytes, at: previous).0 else { break }
+                    runStart = previous
+                }
+                candidate = runStart
+            }
+            i = candidate
 
             var best = tokenFirstBytes[Int(bytes[i])] ? longestMatch(bytes, from: i, requireLstrip: false) : nil
             var skipTo = -1

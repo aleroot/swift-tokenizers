@@ -143,6 +143,23 @@ final class BertPreTokenizer: ByteSplitter {
             var start = 0
             let end = bytes.count
             while i < end {
+                // All-ASCII chunk: classify 16 bytes at once and visit only the boundaries
+                // (whitespace transitions and punctuation, which is always its own piece).
+                if let v = ByteKernels.asciiChunk(bytes, at: i) {
+                    let whitespace = ByteKernels.bits(ByteKernels.whitespace(v))
+                    let punctuation = ByteKernels.bits(ByteKernels.punctuation(v))
+                    var boundaries = whitespace | punctuation
+                    while boundaries != 0 {
+                        let lane = boundaries.trailingZeroBitCount
+                        boundaries &= boundaries - 1
+                        let position = i + lane
+                        if start < position { pieces.append(start..<position) }
+                        if punctuation & (1 << lane) != 0 { pieces.append(position..<position + 1) }
+                        start = position + 1
+                    }
+                    i += ByteKernels.width
+                    continue
+                }
                 let (_, width, flags) = ByteLevelScanner.decodeClassified(bytes, i, table)
                 if flags & ScalarFlags.whitespace != 0 {
                     if start < i { pieces.append(start..<i) }
@@ -181,6 +198,11 @@ final class WhitespacePreTokenizer: ByteSplitter {
         var start = -1
         var previousWord = false
         while i < n {
+            if let v = ByteKernels.asciiChunk(bytes, at: i) {
+                splitASCIIChunk(v, at: i, start: &start, previousWord: &previousWord, into: &pieces)
+                i += ByteKernels.width
+                continue
+            }
             let b0 = bytes[i]
             let value: UInt32
             let width: Int
@@ -212,6 +234,36 @@ final class WhitespacePreTokenizer: ByteSplitter {
             i += width
         }
         if start >= 0 { pieces.append(start..<n) }
+    }
+
+    /// Sixteen ASCII bytes at `offset`: the class of every lane comes from three lane masks,
+    /// and only lanes where the class changes are visited. `start` / `previousWord` carry the
+    /// scanner state across chunks exactly as the scalar loop does.
+    @inline(__always)
+    private func splitASCIIChunk(
+        _ v: ByteKernels.Vector, at offset: Int, start: inout Int, previousWord: inout Bool,
+        into pieces: inout [Range<Int>]
+    ) {
+        let whitespace = ByteKernels.bits(ByteKernels.whitespace(v))
+        let word = splitWords ? ByteKernels.bits(ByteKernels.word(v)) : ~whitespace
+        // Lanes whose class differs from the previous lane's (the lane before the chunk being
+        // the scanner state: inside a piece of the `previousWord` class, or in whitespace).
+        let inside: UInt16 = start >= 0 ? 1 : 0
+        let previousIsWord: UInt16 = start >= 0 && (previousWord || !splitWords) ? 1 : 0
+        var changes = (whitespace ^ (whitespace << 1 | (inside ^ 1))) | (word ^ (word << 1 | previousIsWord))
+        while changes != 0 {
+            let lane = changes.trailingZeroBitCount
+            changes &= changes - 1
+            let position = offset + lane
+            if start >= 0 {
+                pieces.append(start..<position)
+                start = -1
+            }
+            if whitespace & (1 << lane) == 0 {
+                start = position
+                previousWord = word & (1 << lane) != 0
+            }
+        }
     }
 
     /// Regex `\w`: alphabetic, marks, decimal numbers, connector punctuation, join controls.

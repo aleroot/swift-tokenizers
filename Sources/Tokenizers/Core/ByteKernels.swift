@@ -76,6 +76,21 @@ enum ByteKernels {
         range(v, 0x21, 0x30) | range(v, 0x3A, 0x41) | range(v, 0x5B, 0x61) | range(v, 0x7B, 0x7F)
     }
 
+    /// Lanes holding ASCII word characters (regex `\w`: letters, digits, `_`).
+    @inline(__always)
+    static func word(_ v: Vector) -> Vector {
+        range(v, 0x30, 0x3A) | range(v, 0x41, 0x5B) | range(v, 0x61, 0x7B) | equals(v, 0x5F)
+    }
+
+    /// The 16 bytes at `offset` when they are all ASCII, or `nil` (fewer than 16 bytes remain or
+    /// one of them is not ASCII): the guard for chunked ASCII fast paths.
+    @inline(__always)
+    static func asciiChunk(_ bytes: UnsafeBufferPointer<UInt8>, at offset: Int) -> Vector? {
+        guard offset + width <= bytes.count else { return nil }
+        let v = load(bytes.baseAddress!, offset)
+        return anyLane(nonASCII(v)) ? nil : v
+    }
+
     // MARK: Horizontal operations
 
     /// `true` if any lane of `mask` is set.
