@@ -56,3 +56,24 @@ final class Locked<Value>: @unchecked Sendable {
         return try body(&value)
     }
 }
+
+/// A value computed on first access, safe to share across threads. The factory may run more
+/// than once under contention; the first result wins.
+final class Lazy<Value: Sendable>: @unchecked Sendable {
+    private let make: @Sendable () -> Value
+    private let storage = Locked<Value?>(nil)
+
+    init(_ make: @escaping @Sendable () -> Value) {
+        self.make = make
+    }
+
+    var value: Value {
+        if let value = storage.withLock({ $0 }) { return value }
+        let value = make()
+        return storage.withLock { stored in
+            if let stored { return stored }
+            stored = value
+            return value
+        }
+    }
+}

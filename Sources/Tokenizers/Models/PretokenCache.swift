@@ -13,12 +13,13 @@ import Foundation
 final class PretokenCache: @unchecked Sendable {
     let lock = UnfairLock()
 
+    /// 16 bytes: the arenas are bounded, so 32-bit offsets and hashes suffice.
     private struct Slot {
-        var hash: UInt64 = 0
+        var hash: UInt32 = 0
         var keyOffset: UInt32 = 0
         var idsOffset: UInt32 = 0
-        var keyLength: UInt16 = 0
-        var idsCount: UInt16 = 0
+        var keyLength: UInt8 = 0
+        var idsCount: UInt8 = 0
         var byteLevel: Bool = false
         var used: Bool = false
     }
@@ -32,7 +33,8 @@ final class PretokenCache: @unchecked Sendable {
 
     private let slots: UnsafeMutablePointer<Slot>
     private let keyArena: UnsafeMutablePointer<UInt8>
-    private let idsArena: UnsafeMutablePointer<Int>
+    /// Token ids are stored as 32-bit values (vocabularies are far below 2³¹ entries).
+    private let idsArena: UnsafeMutablePointer<Int32>
     private var keyCount = 0
     private var idsCount = 0
     private let mask = slotCount - 1
@@ -57,14 +59,16 @@ final class PretokenCache: @unchecked Sendable {
         let n = bytes.count
         guard n <= Self.maxKeyLength, let base = bytes.baseAddress else { return false }
         let hash = ByteHash.hash(bytes)
+        let tag = UInt32(truncatingIfNeeded: hash >> 32)
         var slot = Int(truncatingIfNeeded: hash) & mask
         for _ in 0..<Self.maxProbes {
             let s = slots[slot]
             if !s.used { return false }
-            if s.hash == hash, s.byteLevel == byteLevel, Int(s.keyLength) == n,
+            if s.hash == tag, s.byteLevel == byteLevel, Int(s.keyLength) == n,
                 memcmp(keyArena + Int(s.keyOffset), base, n) == 0
             {
-                ids.append(contentsOf: UnsafeBufferPointer(start: idsArena + Int(s.idsOffset), count: Int(s.idsCount)))
+                let cached = idsArena + Int(s.idsOffset)
+                for i in 0..<Int(s.idsCount) { ids.append(Int(cached[i])) }
                 return true
             }
             slot = (slot + 1) & mask
@@ -82,6 +86,7 @@ final class PretokenCache: @unchecked Sendable {
             reset()
         }
         let hash = ByteHash.hash(bytes)
+        let tag = UInt32(truncatingIfNeeded: hash >> 32)
         var slot = Int(truncatingIfNeeded: hash) & mask
         var target = slot
         for _ in 0..<Self.maxProbes {
@@ -98,17 +103,15 @@ final class PretokenCache: @unchecked Sendable {
         keyCount += n
 
         let idsOffset = idsCount
-        ids.withUnsafeBufferPointer { source in
-            (idsArena + idsOffset).update(from: source.baseAddress!, count: source.count)
-        }
+        for (i, id) in ids.enumerated() { idsArena[idsOffset + i] = Int32(truncatingIfNeeded: id) }
         idsCount += ids.count
 
         slots[target] = Slot(
-            hash: hash,
+            hash: tag,
             keyOffset: UInt32(keyOffset),
             idsOffset: UInt32(idsOffset),
-            keyLength: UInt16(n),
-            idsCount: UInt16(ids.count),
+            keyLength: UInt8(n),
+            idsCount: UInt8(ids.count),
             byteLevel: byteLevel,
             used: true
         )

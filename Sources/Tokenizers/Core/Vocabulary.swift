@@ -87,15 +87,15 @@ final class Vocabulary: Sendable {
             packedHi[id] = packed.offsets[i + 1]
             present[id] = true
         }
-        var extraById: [Int: String] = [:]
-        extraById.reserveCapacity(extra.count)
-        for (token, id) in extra {
-            extraById[id] = token
+        // Index into `extra` per id (`-1`: none); dense so the layout loop performs no hashing.
+        var extraIndexById = [Int32](repeating: -1, count: count)
+        for (index, (_, id)) in extra.enumerated() {
+            extraIndexById[id] = Int32(index)
             present[id] = true
         }
 
         var totalBytes = extraBytes
-        for id in 0..<count where present[id] && extraById[id] == nil {
+        for id in 0..<count where present[id] && extraIndexById[id] < 0 {
             totalBytes += Int(packedHi[id] - packedLo[id])
         }
 
@@ -106,8 +106,10 @@ final class Vocabulary: Sendable {
         packed.utf8.withUnsafeBufferPointer { packedBytes in
             for id in 0..<count {
                 offsets[id] = UInt32(storage.count)
-                if var token = extraById[id] {
+                let extraIndex = extraIndexById[id]
+                if extraIndex >= 0 {
                     populated += 1
+                    var token = extra[Int(extraIndex)].0
                     token.withUTF8 { storage.append(contentsOf: $0) }
                 } else if present[id] {
                     populated += 1

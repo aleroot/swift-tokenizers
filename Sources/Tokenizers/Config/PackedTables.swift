@@ -15,9 +15,9 @@ public struct PackedStringMap: Sendable, Hashable {
     public var count: Int { ids.count }
 
     init(utf8: [UInt8], offsets: [UInt32], ids: [Int32]) {
-        self.utf8 = utf8
-        self.offsets = offsets
-        self.ids = ids
+        self.utf8 = utf8.trimmed()
+        self.offsets = offsets.trimmed()
+        self.ids = ids.trimmed()
     }
 
     @inline(__always)
@@ -69,8 +69,8 @@ public struct PackedStringPairs: Sendable, Hashable {
     public let count: Int
 
     init(utf8: [UInt8], offsets: [UInt32], count: Int) {
-        self.utf8 = utf8
-        self.offsets = offsets
+        self.utf8 = utf8.trimmed()
+        self.offsets = offsets.trimmed()
         self.count = count
     }
 
@@ -114,9 +114,9 @@ public struct PackedScoredTokens: Sendable, Hashable {
     public var count: Int { scores.count }
 
     init(utf8: [UInt8], offsets: [UInt32], scores: [Double]) {
-        self.utf8 = utf8
-        self.offsets = offsets
-        self.scores = scores
+        self.utf8 = utf8.trimmed()
+        self.offsets = offsets.trimmed()
+        self.scores = scores.trimmed()
     }
 
     func token(at index: Int) -> String {
@@ -134,5 +134,14 @@ public struct PackedScoredTokens: Sendable, Hashable {
             result.append(Config([Config(token(at: i)), Config(scores[i])]))
         }
         return result
+    }
+}
+
+extension Array {
+    /// A copy with capacity equal to its count. Tables are built by appending, which leaves up
+    /// to 2× slack; parts of them (Unigram scores) stay alive for the tokenizer's lifetime.
+    func trimmed() -> [Element] {
+        guard capacity > count + count / 8 else { return self }
+        return withUnsafeBufferPointer { Array($0) }
     }
 }

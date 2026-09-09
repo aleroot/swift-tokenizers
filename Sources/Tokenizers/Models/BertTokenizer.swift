@@ -60,7 +60,10 @@ public final class BertTokenizer: Sendable {
             eosToken: tokenizerConfig.eosToken.string(),
             fuseUnknownTokens: tokenizerConfig.fuseUnk.boolean(or: false),
             doLowerCase: tokenizerConfig.doLowerCase.boolean(or: true),
-            serializedWordPiece: tokenizerData.model.type.string() == "WordPiece",
+            // A serialized pipeline (normalizer / pre-tokenizer in `tokenizer.json`) already
+            // basic-tokenizes; pre-2020 exports omit `model.type` but are WordPiece models too.
+            serializedWordPiece: tokenizerData.model.type.string() == "WordPiece"
+                || !tokenizerData.preTokenizer.isNull() || !tokenizerData.normalizer.isNull(),
             unkToken: tokenizerData.model.unkToken.string(or: "[UNK]"),
             prefix: tokenizerData.model.continuingSubwordPrefix.string(or: "##"), maximum: maximum
         )

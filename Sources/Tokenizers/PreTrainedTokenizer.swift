@@ -52,7 +52,8 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     private let scratchPool = EncodeScratchPool()
     private let fastModel: (any FastTokenizingModel)?
     private let fastPostProcessor: (any FastPostProcessor)?
-    private let byteLevelDecodeTable: ByteLevelDecodeTable?
+    /// Built on first decode: embedding and reranking apps never pay for it.
+    private let byteLevelDecodeTable: Lazy<ByteLevelDecodeTable>?
 
     /// Compiled Jinja templates keyed by their source.
     private let compiledChatTemplates = Locked<[String: Template]>([:])
@@ -130,7 +131,8 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         }
 
         if decoder is ByteLevelDecoder, normalizedSpellings.isEmpty, let bpe = model as? BPETokenizer {
-            byteLevelDecodeTable = ByteLevelDecodeTable(vocabulary: bpe.vocab, addedTokens: self.addedTokens)
+            let addedTokens = self.addedTokens
+            byteLevelDecodeTable = Lazy { ByteLevelDecodeTable(vocabulary: bpe.vocab, addedTokens: addedTokens) }
         } else {
             byteLevelDecodeTable = nil
         }
@@ -266,7 +268,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     public func decode(tokens: [Int], skipSpecialTokens: Bool = false) -> String {
         if let byteLevelDecodeTable {
             return cleanUp(
-                text: byteLevelDecodeTable.decode(tokens, skipping: skipSpecialTokens ? specialTokenIds : []))
+                text: byteLevelDecodeTable.value.decode(tokens, skipping: skipSpecialTokens ? specialTokenIds : []))
         }
 
         var tokenStrings: [String] = []
