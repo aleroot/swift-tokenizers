@@ -252,6 +252,24 @@ struct TokenizerRegressionTests {
         #expect(merges == [["a", " b"], ["foo", "bar baz"]])
     }
 
+    @Test("List-format and string-format BPE merges intern identically")
+    func mergeFormatsAgree() throws {
+        let stringData: Config = [
+            "model": [
+                "type": "BPE", "vocab": ["a": 0, "b": 1, "ab": 2], "merges": ["a b"],
+            ]
+        ]
+        let listData: Config = [
+            "model": [
+                "type": "BPE", "vocab": ["a": 0, "b": 1, "ab": 2], "merges": [["a", "b"]],
+            ]
+        ]
+        let fromString = try PreTrainedTokenizer(tokenizerConfig: configuration, tokenizerData: stringData)
+        let fromList = try PreTrainedTokenizer(tokenizerConfig: configuration, tokenizerData: listData)
+        #expect(fromString.encode(text: "ab", addSpecialTokens: false) == [2])
+        #expect(fromList.encode(text: "ab", addSpecialTokens: false) == [2])
+    }
+
     @Test("NLLB unknown Unicode agrees with Hugging Face")
     func nllbUnknownUnicode() async throws {
         let tokenizer = try await HubFixtures.tokenizer(for: "Xenova/nllb-200-distilled-600M", strict: false)

@@ -34,24 +34,33 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
     let byteFallbackIds: [Int]
 
     required init(tokenizerConfig: Config, tokenizerData: Config, addedTokens: [String: Int]) throws {
-        guard let configVocab = tokenizerData.model.vocab.array() else {
+        let vocab: [SentencePieceToken]
+        if let packed = tokenizerData.model.vocab.asPackedScoredTokens() {
+            var pieces: [SentencePieceToken] = []
+            pieces.reserveCapacity(packed.count)
+            for i in 0..<packed.count {
+                pieces.append(SentencePieceToken(token: packed.token(at: i), score: packed.scores[i]))
+            }
+            vocab = pieces
+        } else if let configVocab = tokenizerData.model.vocab.array() {
+            var pieces: [SentencePieceToken] = []
+            pieces.reserveCapacity(configVocab.count)
+            for piece in configVocab {
+                let tuple = piece.array(or: [])
+                guard tuple.count == 2, let token = tuple.first?.string(), let scoreValue = tuple.last else {
+                    throw TokenizerError.malformedVocab
+                }
+                let score: Double
+                if let d = scoreValue.double(), d.isFinite {
+                    score = d
+                } else {
+                    throw TokenizerError.malformedVocab
+                }
+                pieces.append(SentencePieceToken(token: token, score: score))
+            }
+            vocab = pieces
+        } else {
             throw TokenizerError.missingVocab
-        }
-
-        var vocab: [SentencePieceToken] = []
-        vocab.reserveCapacity(configVocab.count)
-        for piece in configVocab {
-            let tuple = piece.array(or: [])
-            guard tuple.count == 2, let token = tuple.first?.string(), let scoreValue = tuple.last else {
-                throw TokenizerError.malformedVocab
-            }
-            let score: Double
-            if let d = scoreValue.double(), d.isFinite {
-                score = d
-            } else {
-                throw TokenizerError.malformedVocab
-            }
-            vocab.append(SentencePieceToken(token: token, score: score))
         }
         self.vocab = vocab
         scores = vocab.map(\.score)

@@ -38,6 +38,129 @@ final class Vocabulary: Sendable {
         try self.init(entries: entries)
     }
 
+    convenience init(vocab: Config, addedTokens: [String: Int]) throws {
+        if let packed = vocab.asPackedStringMap() {
+            try self.init(packed: packed, addedTokens: addedTokens)
+        } else if let dict = vocab.dictionary() {
+            try self.init(vocab: dict, addedTokens: addedTokens)
+        } else {
+            throw TokenizerError.missingVocab
+        }
+    }
+
+    convenience init(packed: PackedStringMap, addedTokens: [String: Int]) throws {
+        var extra: [(String, Int)] = []
+        extra.reserveCapacity(addedTokens.count)
+        for (token, id) in addedTokens { extra.append((token, id)) }
+        try self.init(packed: packed, extra: extra)
+    }
+
+    private init(packed: PackedStringMap, extra: [(String, Int)]) throws {
+        var maxId = -1
+        for id in packed.ids {
+            let i = Int(id)
+            guard i >= 0, i < 64_000_000 else { throw TokenizerError.malformedVocab }
+            if i > maxId { maxId = i }
+        }
+        var extraBytes = 0
+        for (token, id) in extra {
+            guard id >= 0, id < 64_000_000 else { throw TokenizerError.malformedVocab }
+            if id > maxId { maxId = id }
+            extraBytes += token.utf8.count
+        }
+        let count = maxId + 1
+        guard count <= 64_000_000 else { throw TokenizerError.malformedVocab }
+
+        var packedLo = [UInt32](repeating: 0, count: count)
+        var packedHi = [UInt32](repeating: 0, count: count)
+        var present = [Bool](repeating: false, count: count)
+        for i in 0..<packed.count {
+            let id = Int(packed.ids[i])
+            packedLo[id] = packed.offsets[i]
+            packedHi[id] = packed.offsets[i + 1]
+            present[id] = true
+        }
+        var extraById: [Int: String] = [:]
+        extraById.reserveCapacity(extra.count)
+        for (token, id) in extra {
+            extraById[id] = token
+            present[id] = true
+        }
+
+        var totalBytes = extraBytes
+        for id in 0..<count where present[id] && extraById[id] == nil {
+            totalBytes += Int(packedHi[id] - packedLo[id])
+        }
+
+        var storage: [UInt8] = []
+        storage.reserveCapacity(totalBytes)
+        var offsets = [UInt32](repeating: 0, count: count + 1)
+        var populated = 0
+        packed.utf8.withUnsafeBufferPointer { packedBytes in
+            for id in 0..<count {
+                offsets[id] = UInt32(storage.count)
+                if var token = extraById[id] {
+                    populated += 1
+                    token.withUTF8 { storage.append(contentsOf: $0) }
+                } else if present[id] {
+                    populated += 1
+                    let lo = Int(packedLo[id])
+                    let hi = Int(packedHi[id])
+                    storage.append(contentsOf: UnsafeBufferPointer(rebasing: packedBytes[lo..<hi]))
+                }
+            }
+        }
+        offsets[count] = UInt32(storage.count)
+
+        var capacity = 16
+        while capacity < (packed.count + extra.count) * 2 { capacity <<= 1 }
+        var slots = [UInt32](repeating: 0, count: capacity)
+        let mask = capacity - 1
+
+        storage.withUnsafeBufferPointer { storageBuffer in
+            func insert(bytes: UnsafeBufferPointer<UInt8>, id: Int) {
+                var slot = Int(truncatingIfNeeded: ByteHash.hash(bytes)) & mask
+                while true {
+                    let existing = slots[slot]
+                    if existing == 0 {
+                        slots[slot] = UInt32(id + 1)
+                        return
+                    }
+                    let existingId = Int(existing - 1)
+                    let lo = Int(offsets[existingId])
+                    let hi = Int(offsets[existingId + 1])
+                    if hi - lo == bytes.count,
+                        bytes.count == 0
+                            || memcmp(storageBuffer.baseAddress! + lo, bytes.baseAddress!, bytes.count) == 0
+                    {
+                        slots[slot] = UInt32(id + 1)
+                        return
+                    }
+                    slot = (slot + 1) & mask
+                }
+            }
+            packed.utf8.withUnsafeBufferPointer { packedBytes in
+                for i in 0..<packed.count {
+                    let lo = Int(packed.offsets[i])
+                    let hi = Int(packed.offsets[i + 1])
+                    insert(bytes: UnsafeBufferPointer(rebasing: packedBytes[lo..<hi]), id: Int(packed.ids[i]))
+                }
+            }
+            for (token, id) in extra {
+                var copy = token
+                copy.withUTF8 { insert(bytes: $0, id: id) }
+            }
+        }
+
+        self.count = count
+        self.populatedCount = populated
+        self.storage = storage
+        self.offsets = offsets
+        self.present = present
+        self.slots = slots
+        self.mask = mask
+    }
+
     convenience init(vocab: [String: Int]) throws {
         try self.init(entries: vocab.map { ($0.key, $0.value) })
     }

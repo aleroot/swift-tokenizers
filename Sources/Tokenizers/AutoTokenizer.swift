@@ -159,7 +159,7 @@ public struct LocalModelConfiguration: Sendable {
         guard fm.fileExists(atPath: tokenizerDataURL.path) else {
             throw TokenizerError.missingFile(tokenizerDataURL)
         }
-        tokenizerData = try Config(jsonFile: tokenizerDataURL)
+        tokenizerData = try Config(tokenizerJSONFile: tokenizerDataURL)
 
         let modelConfigURL = modelFolder.appendingPathComponent("config.json")
         modelConfig = fm.fileExists(atPath: modelConfigURL.path) ? try Config(jsonFile: modelConfigURL) : nil

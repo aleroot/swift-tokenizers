@@ -104,28 +104,36 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         return result
     }
 
-    required init(tokenizerConfig: Config, tokenizerData: Config, addedTokens: [String: Int]) throws {
-        guard let mergeList = Self.mergesFromConfig(tokenizerData.model.merges) else {
-            throw TokenizerError.invalidConfiguration("BPE model is missing `merges`")
-        }
-        guard let vocabDict = tokenizerData.model.vocab.dictionary() else {
-            throw TokenizerError.missingVocab
-        }
-
-        let vocab = try Vocabulary(vocab: vocabDict, addedTokens: addedTokens)
-        self.vocab = vocab
-        continuingPrefix = tokenizerData.model.continuingSubwordPrefix.string(or: "")
-        endSuffix = tokenizerData.model.endOfWordSuffix.string(or: "")
-        ignoreMerges = tokenizerData.model.ignoreMerges.boolean(or: false)
-
-        // Merge table. Strings that are not vocabulary entries get synthetic ids.
+    /// Interns merge pairs into the integer table. Pieces are looked up by UTF-8 bytes so
+    /// merge products never allocate a concatenated `String`.
+    private struct MergeIntern {
+        let vocab: Vocabulary
+        let prefixBytes: [UInt8]
         var synthetic: [BinaryDistinctString: Int32] = [:]
-        var nextSynthetic = Int32(vocab.count)
-        var table = MergeTable(expectedCount: mergeList.count)
+        var nextSynthetic: Int32
+        var table: MergeTable
+        var concat: [UInt8] = []
+        var chunkingSafe: Bool
+        var guards: [(bytes: [UInt8], offset: Int)] = []
 
-        func intern(_ s: String) -> Int32 {
-            if let id = vocab.id(of: s) { return Int32(id) }
-            let key = BinaryDistinctString(s)
+        init(
+            vocab: Vocabulary, continuingPrefix: String, endSuffix: String, ignoreMerges: Bool,
+            expectedCount: Int
+        ) {
+            self.vocab = vocab
+            prefixBytes = continuingPrefix.isEmpty ? [] : Array(continuingPrefix.utf8)
+            nextSynthetic = Int32(vocab.count)
+            table = MergeTable(expectedCount: expectedCount)
+            concat.reserveCapacity(64)
+            chunkingSafe =
+                vocab.id(of: sentencePieceUnderline) != nil && continuingPrefix.isEmpty && endSuffix.isEmpty
+                && !ignoreMerges
+        }
+
+        mutating func intern(_ bytes: UnsafeBufferPointer<UInt8>) -> Int32 {
+            let existing = vocab.id(of: bytes)
+            if existing >= 0 { return existing }
+            let key = BinaryDistinctString(String(decoding: bytes, as: UTF8.self))
             if let id = synthetic[key] { return id }
             let id = nextSynthetic
             synthetic[key] = id
@@ -133,37 +141,128 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
             return id
         }
 
-        for (rank, merge) in mergeList.enumerated() where merge.count >= 2 {
-            let a = merge[0]
-            let b = merge[1]
-            let left = intern(a)
-            let right = intern(b)
-            let merged = intern(a + String(b.droppingBytePrefix(continuingPrefix)))
-            table.insert(left: left, right: right, rank: UInt32(rank), merged: merged)
-        }
-        merges = table
-        symbolCount = Int(nextSynthetic)
-
-        var chunkingSafe =
-            vocab.id(of: sentencePieceUnderline) != nil && continuingPrefix.isEmpty && endSuffix.isEmpty
-            && !ignoreMerges
-        var guards: [(bytes: [UInt8], offset: Int)] = []
-        if chunkingSafe {
-            var seen: Set<[UInt8]> = []
-            for merge in mergeList where merge.count >= 2 {
-                let product = Array((merge[0] + merge[1]).utf8)
-                guard seen.insert(product).inserted else { continue }
-                for offset in Self.interiorMetaspaceOffsets(product) {
-                    guards.append((product, offset))
-                }
-                if guards.count > Self.maxMetaspaceChunkGuards {
-                    chunkingSafe = false
+        mutating func add(
+            left leftBytes: UnsafeBufferPointer<UInt8>, right rightBytes: UnsafeBufferPointer<UInt8>, rank: Int
+        ) {
+            let left = intern(leftBytes)
+            let right = intern(rightBytes)
+            var skip = 0
+            if !prefixBytes.isEmpty, rightBytes.count >= prefixBytes.count {
+                var matches = true
+                for i in 0..<prefixBytes.count where rightBytes[i] != prefixBytes[i] {
+                    matches = false
                     break
+                }
+                if matches { skip = prefixBytes.count }
+            }
+            concat.removeAll(keepingCapacity: true)
+            concat.append(contentsOf: leftBytes)
+            if skip < rightBytes.count {
+                concat.append(contentsOf: UnsafeBufferPointer(rebasing: rightBytes[skip...]))
+            }
+            let existing = concat.withUnsafeBufferPointer { vocab.id(of: $0) }
+            let merged: Int32
+            if existing >= 0 {
+                merged = existing
+            } else {
+                let key = BinaryDistinctString(String(decoding: concat, as: UTF8.self))
+                if let id = synthetic[key] {
+                    merged = id
+                } else {
+                    merged = nextSynthetic
+                    synthetic[key] = merged
+                    nextSynthetic += 1
+                }
+            }
+            table.insert(left: left, right: right, rank: UInt32(rank), merged: merged)
+            if chunkingSafe {
+                for offset in BPETokenizer.interiorMetaspaceOffsets(concat) {
+                    if !guards.contains(where: { $0.offset == offset && $0.bytes == concat }) {
+                        guards.append((concat, offset))
+                    }
+                }
+                if guards.count > BPETokenizer.maxMetaspaceChunkGuards {
+                    chunkingSafe = false
+                    guards.removeAll(keepingCapacity: false)
                 }
             }
         }
-        metaspaceChunking = chunkingSafe
-        metaspaceChunkGuards = chunkingSafe ? guards : []
+
+        func finish() -> (table: MergeTable, symbolCount: Int, chunking: Bool, guards: [(bytes: [UInt8], offset: Int)])
+        {
+            (table, Int(nextSynthetic), chunkingSafe, chunkingSafe ? guards : [])
+        }
+    }
+
+    private static func buildMergeTable(
+        mergeList: [Config], vocab: Vocabulary, continuingPrefix: String, endSuffix: String,
+        ignoreMerges: Bool
+    ) -> (table: MergeTable, symbolCount: Int, chunking: Bool, guards: [(bytes: [UInt8], offset: Int)]) {
+        var intern = MergeIntern(
+            vocab: vocab, continuingPrefix: continuingPrefix, endSuffix: endSuffix, ignoreMerges: ignoreMerges,
+            expectedCount: mergeList.count)
+        for (rank, element) in mergeList.enumerated() {
+            let a: String
+            let b: String
+            if let pair = element.array() {
+                guard pair.count == 2, let left = pair[0].string(), let right = pair[1].string() else { continue }
+                a = left
+                b = right
+            } else if let s = element.string(), let idx = s.unicodeScalars.firstIndex(of: " ") {
+                a = String(s.unicodeScalars[..<idx])
+                b = String(s.unicodeScalars[s.unicodeScalars.index(after: idx)...])
+            } else {
+                continue
+            }
+            var aCopy = a
+            var bCopy = b
+            aCopy.withUTF8 { leftBytes in
+                bCopy.withUTF8 { rightBytes in
+                    intern.add(left: leftBytes, right: rightBytes, rank: rank)
+                }
+            }
+        }
+        return intern.finish()
+    }
+
+    private static func buildMergeTable(
+        pairs: PackedStringPairs, vocab: Vocabulary, continuingPrefix: String, endSuffix: String,
+        ignoreMerges: Bool
+    ) -> (table: MergeTable, symbolCount: Int, chunking: Bool, guards: [(bytes: [UInt8], offset: Int)]) {
+        var intern = MergeIntern(
+            vocab: vocab, continuingPrefix: continuingPrefix, endSuffix: endSuffix, ignoreMerges: ignoreMerges,
+            expectedCount: pairs.count)
+        for rank in 0..<pairs.count {
+            pairs.withPair(at: rank) { left, right in
+                intern.add(left: left, right: right, rank: rank)
+            }
+        }
+        return intern.finish()
+    }
+
+    required init(tokenizerConfig: Config, tokenizerData: Config, addedTokens: [String: Int]) throws {
+        let vocab = try Vocabulary(vocab: tokenizerData.model.vocab, addedTokens: addedTokens)
+        self.vocab = vocab
+        continuingPrefix = tokenizerData.model.continuingSubwordPrefix.string(or: "")
+        endSuffix = tokenizerData.model.endOfWordSuffix.string(or: "")
+        ignoreMerges = tokenizerData.model.ignoreMerges.boolean(or: false)
+
+        let built: (table: MergeTable, symbolCount: Int, chunking: Bool, guards: [(bytes: [UInt8], offset: Int)])
+        if let packed = tokenizerData.model.merges.asPackedStringPairs() {
+            built = Self.buildMergeTable(
+                pairs: packed, vocab: vocab, continuingPrefix: continuingPrefix, endSuffix: endSuffix,
+                ignoreMerges: ignoreMerges)
+        } else if let mergeList = tokenizerData.model.merges.array() {
+            built = Self.buildMergeTable(
+                mergeList: mergeList, vocab: vocab, continuingPrefix: continuingPrefix,
+                endSuffix: endSuffix, ignoreMerges: ignoreMerges)
+        } else {
+            throw TokenizerError.invalidConfiguration("BPE model is missing `merges`")
+        }
+        merges = built.table
+        symbolCount = built.symbolCount
+        metaspaceChunking = built.chunking
+        metaspaceChunkGuards = built.guards
 
         // Symbol tables.
         var byteIds = [Int32](repeating: -1, count: 256)

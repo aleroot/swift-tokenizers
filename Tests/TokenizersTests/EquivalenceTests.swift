@@ -224,6 +224,50 @@ struct JSONParserEquivalenceTests {
         #expect(vocab[BinaryDistinctString(";")]?.integer() == 3)
     }
 
+    @Test("Large objects keep every entry after the capacity heuristic kicks in")
+    func largeObjectReserveCapacity() throws {
+        var json = "{\"vocab\":{"
+        for i in 0..<200 {
+            if i > 0 { json += "," }
+            json += "\"t\(i)\":\(i)"
+        }
+        json += "}}"
+        let config = try Config(jsonString: json)
+        #expect(config.vocab.dictionary()?.count == 200)
+        #expect(config.vocab["t0"].integer() == 0)
+        #expect(config.vocab["t64"].integer() == 64)
+        #expect(config.vocab["t199"].integer() == 199)
+    }
+
+    @Test("Packed tokenizer.json tables match generic parse encode")
+    func packedTablesMatchGenericEncode() throws {
+        let json = Data(
+            #"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2,"Ġ":3},"merges":[["a","b"],["Ġ","a"]]}}"#
+                .utf8)
+        let generic = try Config(jsonData: json)
+        let packed = try Config(tokenizerJSON: json)
+        #expect(packed.model.vocab.asPackedStringMap()?.count == 4)
+        #expect(packed.model.merges.asPackedStringPairs()?.count == 2)
+        let config: Config = ["tokenizer_class": "GPT2Tokenizer"]
+        let fromGeneric = try PreTrainedTokenizer(tokenizerConfig: config, tokenizerData: generic)
+        let fromPacked = try PreTrainedTokenizer(tokenizerConfig: config, tokenizerData: packed)
+        #expect(fromGeneric.encode(text: "ab", addSpecialTokens: false) == [2])
+        #expect(fromPacked.encode(text: "ab", addSpecialTokens: false) == [2])
+        #expect(
+            fromGeneric.encode(text: "ab", addSpecialTokens: false)
+                == fromPacked.encode(text: "ab", addSpecialTokens: false))
+    }
+
+    @Test("Large arrays keep every entry after the capacity heuristic kicks in")
+    func largeArrayReserveCapacity() throws {
+        let json = "[" + (0..<200).map { "[\"a\($0)\",\"b\"]" }.joined(separator: ",") + "]"
+        let config = try Config(jsonString: json)
+        #expect(config.array()?.count == 200)
+        #expect(config[0][0].string() == "a0")
+        #expect(config[64][0].string() == "a64")
+        #expect(config[199][0].string() == "a199")
+    }
+
     @Test func matchesFoundationOnFixtures() throws {
         for name in ["tokenizer", "tokenizer_config", "gemma_encoded", "tokenizer_tests"] {
             let url = try #require(Bundle.module.url(forResource: name, withExtension: "json"))

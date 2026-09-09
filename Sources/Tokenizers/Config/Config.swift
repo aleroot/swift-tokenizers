@@ -32,6 +32,12 @@ public struct Config: Hashable, Sendable,
         case dictionary([BinaryDistinctString: Config])
         case array([Config])
         case token((UInt, BinaryDistinctString))
+        /// Packed BPE/WordPiece `model.vocab` (`token → id`).
+        case stringMap(PackedStringMap)
+        /// Packed BPE `model.merges` (ranked pairs).
+        case stringPairs(PackedStringPairs)
+        /// Packed Unigram `model.vocab` (`[token, score]` rows).
+        case scoredTokens(PackedScoredTokens)
 
         public func string() -> String? {
             if case let .string(v) = self { return v.string }
@@ -83,6 +89,9 @@ public struct Config: Hashable, Sendable,
             case let .array(a): "[\(a)]"
             case let .dictionary(d): "{\(d)}"
             case let .token(t): "(\(t.0), \(t.1))"
+            case let .stringMap(m): "{<\(m.count) tokens>}"
+            case let .stringPairs(p): "[<\(p.count) pairs>]"
+            case let .scoredTokens(t): "[<\(t.count) pieces>]"
             }
         }
 
@@ -107,6 +116,12 @@ public struct Config: Hashable, Sendable,
             case let (.array(l), .array(r)):
                 return l == r
             case let (.token(l), .token(r)):
+                return l == r
+            case let (.stringMap(l), .stringMap(r)):
+                return l == r
+            case let (.stringPairs(l), .stringPairs(r)):
+                return l == r
+            case let (.scoredTokens(l), .scoredTokens(r)):
                 return l == r
             default:
                 return false
@@ -301,7 +316,25 @@ public struct Config: Hashable, Sendable,
     public func get(or: [BinaryDistinctString: Config]) -> [BinaryDistinctString: Config] { dictionary(or: or) }
 
     public func dictionary() -> [BinaryDistinctString: Config]? {
-        if case let .dictionary(v) = value { return v }
+        switch value {
+        case let .dictionary(v): return v
+        case let .stringMap(packed): return packed.materializeDictionary()
+        default: return nil
+        }
+    }
+
+    func asPackedStringMap() -> PackedStringMap? {
+        if case let .stringMap(v) = value { return v }
+        return nil
+    }
+
+    func asPackedStringPairs() -> PackedStringPairs? {
+        if case let .stringPairs(v) = value { return v }
+        return nil
+    }
+
+    func asPackedScoredTokens() -> PackedScoredTokens? {
+        if case let .scoredTokens(v) = value { return v }
         return nil
     }
 
@@ -345,8 +378,12 @@ public struct Config: Hashable, Sendable,
     public func get(or: [Config]) -> [Config] { array(or: or) }
 
     public func array() -> [Config]? {
-        if case let .array(v) = value { return v }
-        return nil
+        switch value {
+        case let .array(v): return v
+        case let .stringPairs(packed): return packed.materializeArray()
+        case let .scoredTokens(packed): return packed.materializeArray()
+        default: return nil
+        }
     }
 
     public func array(or: [Config]) -> [Config] { array() ?? or }
@@ -372,8 +409,16 @@ public struct Config: Hashable, Sendable,
     // MARK: Subscripts
 
     public subscript(index: BinaryDistinctString) -> Config {
-        guard case let .dictionary(dict) = value else { return Config() }
-        return dict[index] ?? dict[Config.uncamelCase(index)] ?? Config()
+        switch value {
+        case let .dictionary(dict):
+            return dict[index] ?? dict[Config.uncamelCase(index)] ?? Config()
+        case let .stringMap(packed):
+            var copy = index.string
+            let id = copy.withUTF8 { packed.id(of: $0) }
+            return id >= 0 ? Config(Int(id)) : Config()
+        default:
+            return Config()
+        }
     }
 
     public subscript(index: Int) -> Config {
@@ -436,6 +481,12 @@ public struct Config: Hashable, Sendable,
         case let .integer(i): return .int(i)
         case let .string(s): return .string(s.string)
         case let .token(t): return .object([String(t.0): .string(t.1.string)])
+        case let .stringMap(m):
+            return Config(m.materializeDictionary()).jinjaValue()
+        case let .stringPairs(p):
+            return Config(p.materializeArray()).jinjaValue()
+        case let .scoredTokens(t):
+            return Config(t.materializeArray()).jinjaValue()
         case .null: return .null
         }
     }
@@ -474,6 +525,15 @@ extension Config.Data: Hashable {
             hasher.combine(7)
             hasher.combine(t.0)
             hasher.combine(t.1)
+        case let .stringMap(m):
+            hasher.combine(8)
+            m.hash(into: &hasher)
+        case let .stringPairs(p):
+            hasher.combine(9)
+            p.hash(into: &hasher)
+        case let .scoredTokens(t):
+            hasher.combine(10)
+            t.hash(into: &hasher)
         }
     }
 }
@@ -583,6 +643,12 @@ extension Config: Codable {
             var c = encoder.unkeyedContainer()
             try c.encode(v.0)
             try c.encode(v.1.string)
+        case let .stringMap(m):
+            try Config(m.materializeDictionary()).encode(to: encoder)
+        case let .stringPairs(p):
+            try Config(p.materializeArray()).encode(to: encoder)
+        case let .scoredTokens(t):
+            try Config(t.materializeArray()).encode(to: encoder)
         }
     }
 
