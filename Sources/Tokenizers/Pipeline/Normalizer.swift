@@ -239,65 +239,72 @@ final class BertNormalizer: ByteNormalizer {
     }
 
     func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
-        // ASCII has no CJK ideographs or combining marks, so only cleaning and lowercasing apply.
-        if ASCII.isASCII(bytes) {
-            output.reserveCapacity(output.count + bytes.count)
-            for var byte in bytes {
-                if shouldCleanText {
-                    switch byte {
-                    case 0x09, 0x0A, 0x0D: byte = 0x20
-                    case 0x00...0x1F, 0x7F: continue
-                    default: break
-                    }
-                }
-                if shouldLowercase, byte >= 0x41, byte <= 0x5A { byte |= 0x20 }
-                output.append(byte)
+        // Every step (cleaning, CJK padding, NFD + mark removal, lowercasing) is context-free
+        // across an ASCII / non-ASCII boundary, so ASCII runs take the byte loop and only the
+        // non-ASCII runs pay for Foundation. Real text is mostly ASCII with a few dashes,
+        // quotes or accented names, which would otherwise send the whole chunk down the slow path.
+        output.reserveCapacity(output.count + bytes.count)
+        let n = bytes.count
+        var i = 0
+        var run = scratch.take()
+        defer { scratch.recycle(run) }
+        while i < n {
+            var j = i
+            while j < n, bytes[j] < 0x80 { j += 1 }
+            if j > i {
+                normalizeASCII(UnsafeBufferPointer(rebasing: bytes[i..<j]), into: &output)
+                i = j
+                if i >= n { break }
             }
-            return
+            while j < n, bytes[j] >= 0x80 { j += 1 }
+            run.removeAll(keepingCapacity: true)
+            normalizeNonASCII(UnsafeBufferPointer(rebasing: bytes[i..<j]), into: &output, run: &run)
+            i = j
         }
+    }
 
-        var cleaned = scratch.take()
-        defer { scratch.recycle(cleaned) }
+    /// ASCII has no CJK ideographs or combining marks, so only cleaning and lowercasing apply.
+    @inline(__always)
+    private func normalizeASCII(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8]) {
+        for var byte in bytes {
+            if shouldCleanText {
+                switch byte {
+                case 0x09, 0x0A, 0x0D: byte = 0x20
+                case 0x00...0x1F, 0x7F: continue
+                default: break
+                }
+            }
+            if shouldLowercase, byte >= 0x41, byte <= 0x5A { byte |= 0x20 }
+            output.append(byte)
+        }
+    }
+
+    private func normalizeNonASCII(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], run: inout [UInt8]) {
         if shouldCleanText || shouldHandleChineseChars {
-            cleaned.reserveCapacity(bytes.count + 16)
             var i = 0
             while i < bytes.count {
                 let (value, width) = UTF8Cursor.decode(bytes, at: i)
                 defer { i += width }
                 if shouldCleanText {
-                    if value == 0 || value == 0xFFFD || Self.isControl(value) { continue }
+                    if value == 0xFFFD || Self.isControl(value) { continue }
                     if Self.isWhitespace(value) {
-                        cleaned.append(0x20)
+                        run.append(0x20)
                         continue
                     }
                 }
                 let chinese = shouldHandleChineseChars && Self.isCJKUnifiedIdeograph(value)
-                if chinese { cleaned.append(0x20) }
-                cleaned.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<i + width]))
-                if chinese { cleaned.append(0x20) }
+                if chinese { run.append(0x20) }
+                run.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<i + width]))
+                if chinese { run.append(0x20) }
             }
         } else {
-            cleaned.append(contentsOf: bytes)
+            run.append(contentsOf: bytes)
         }
 
-        if shouldStripAccents {
-            var stripped = scratch.take()
-            cleaned.withUnsafeBufferPointer { Self.stripAccents($0, into: &stripped) }
-            swap(&cleaned, &stripped)
-            scratch.recycle(stripped)
-        }
-
-        if shouldLowercase {
-            cleaned.withUnsafeBufferPointer { cleaned in
-                if ASCII.isASCII(cleaned) {
-                    for byte in cleaned { output.append(byte >= 0x41 && byte <= 0x5A ? byte | 0x20 : byte) }
-                } else {
-                    ASCII.append(String(decoding: cleaned, as: UTF8.self).lowercased(), to: &output)
-                }
-            }
-        } else {
-            output.append(contentsOf: cleaned)
-        }
+        var text = String(decoding: run, as: UTF8.self)
+        if shouldStripAccents { text = Self.stripAccents(text) }
+        if shouldLowercase { text = text.lowercased() }
+        ASCII.append(text, to: &output)
     }
 
     /// `\t` `\n` `\r` or `Zs`.

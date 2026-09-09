@@ -1,5 +1,11 @@
-// BERT-style WordPiece tokenization: basic (whitespace + punctuation) splitting followed by
-// greedy longest-match-first subword segmentation.
+// BERT-style WordPiece tokenization: greedy longest-match-first subword segmentation of each
+// pre-tokenized word. With a serialized `tokenizer.json` (`model.type == "WordPiece"`) the
+// normalizer and pre-tokenizer pipeline does the basic tokenization; the legacy
+// `vocab.txt` path keeps a built-in basic tokenizer for compatibility.
+//
+// The hot path (`Encoder.encode(bytes:)`) works on the UTF-8 bytes of a word: one hash probe
+// for the whole word, then longest-first candidates bounded by the longest vocabulary entry,
+// with the `##` continuation prefix assembled in a reusable scratch buffer.
 
 import Foundation
 
@@ -9,9 +15,8 @@ public final class BertTokenizer: Sendable {
     private let tokenizeChineseChars: Bool
     private let serializedWordPiece: Bool
 
-    /// Vocabulary keyed by exact scalar sequence (no Unicode canonical folding).
-    private let vocab: [BinaryDistinctString: Int]
-    private let ids_to_tokens: [Int: String]
+    /// Vocabulary keyed by exact byte sequence (no Unicode canonical folding).
+    private let vocabulary: Vocabulary
 
     public let bosToken: String?
     public let bosTokenId: Int?
@@ -19,7 +24,7 @@ public final class BertTokenizer: Sendable {
     public let eosTokenId: Int?
     public let fuseUnknownTokens: Bool
 
-    public init(
+    public convenience init(
         vocab: [String: Int],
         merges: [String]?,
         tokenizeChineseChars: Bool = true,
@@ -28,55 +33,33 @@ public final class BertTokenizer: Sendable {
         fuseUnknownTokens: Bool = false,
         doLowerCase: Bool = true
     ) {
-        var distinct = [BinaryDistinctString: Int](minimumCapacity: vocab.count)
-        var reverse = [Int: String](minimumCapacity: vocab.count)
-        for (token, id) in vocab {
-            distinct[BinaryDistinctString(token)] = id
-            reverse[id] = token
-        }
-        serializedWordPiece = false
-        self.vocab = distinct
-        ids_to_tokens = reverse
-        basicTokenizer = BasicTokenizer(doLowerCase: doLowerCase)
-        wordpieceTokenizer = WordpieceTokenizer(vocab: distinct)
-        self.tokenizeChineseChars = tokenizeChineseChars
-        self.bosToken = bosToken
-        bosTokenId = bosToken.flatMap { distinct[BinaryDistinctString($0)] }
-        self.eosToken = eosToken
-        eosTokenId = eosToken.flatMap { distinct[BinaryDistinctString($0)] }
-        self.fuseUnknownTokens = fuseUnknownTokens
+        // A `[String: Int]` vocabulary is well-formed by construction.
+        let vocabulary = try! Vocabulary(vocab: vocab)
+        self.init(
+            vocabulary: vocabulary, tokenizeChineseChars: tokenizeChineseChars, bosToken: bosToken,
+            eosToken: eosToken, fuseUnknownTokens: fuseUnknownTokens, doLowerCase: doLowerCase)
     }
 
     public required convenience init(tokenizerConfig: Config, tokenizerData: Config, addedTokens: [String: Int]) throws
     {
-        guard let vocab = tokenizerData.model.vocab.dictionary() else {
-            throw TokenizerError.missingVocab
-        }
-
-        let tokenizeChineseChars = tokenizerConfig.handleChineseChars.boolean(or: true)
-        let eosToken = tokenizerConfig.eosToken.string()
-        let bosToken = tokenizerConfig.bosToken.string()
-        let fuseUnknown = tokenizerConfig.fuseUnk.boolean(or: false)
-        let doLowerCase = tokenizerConfig.doLowerCase.boolean(or: true)
-
-        var vocabulary = [BinaryDistinctString: Int](minimumCapacity: vocab.count)
-        for (key, value) in vocab {
-            if let id = value.integer() { vocabulary[key] = id }
-        }
+        var extra = addedTokens
         if let pairs = tokenizerData.addedTokens.array() {
             for element in pairs {
                 guard let id = element["id"].integer(), let key = element["content"].string() else { continue }
-                vocabulary[BinaryDistinctString(key)] = id
+                if extra[key] == nil { extra[key] = id }
             }
         }
-        for (token, id) in addedTokens { vocabulary[BinaryDistinctString(token)] = id }
+        let vocabulary = try Vocabulary(vocab: tokenizerData.model.vocab, addedTokens: extra)
 
         let maximum = tokenizerData.model.maxInputCharsPerWord.integer(or: 100)
         guard maximum >= 0 else { throw TokenizerError.invalidConfiguration("Negative WordPiece word limit") }
         self.init(
-            distinctVocab: vocabulary, tokenizeChineseChars: tokenizeChineseChars, bosToken: bosToken,
-            eosToken: eosToken,
-            fuseUnknownTokens: fuseUnknown, doLowerCase: doLowerCase,
+            vocabulary: vocabulary,
+            tokenizeChineseChars: tokenizerConfig.handleChineseChars.boolean(or: true),
+            bosToken: tokenizerConfig.bosToken.string(),
+            eosToken: tokenizerConfig.eosToken.string(),
+            fuseUnknownTokens: tokenizerConfig.fuseUnk.boolean(or: false),
+            doLowerCase: tokenizerConfig.doLowerCase.boolean(or: true),
             serializedWordPiece: tokenizerData.model.type.string() == "WordPiece",
             unkToken: tokenizerData.model.unkToken.string(or: "[UNK]"),
             prefix: tokenizerData.model.continuingSubwordPrefix.string(or: "##"), maximum: maximum
@@ -84,7 +67,7 @@ public final class BertTokenizer: Sendable {
     }
 
     init(
-        distinctVocab vocab: [BinaryDistinctString: Int],
+        vocabulary: Vocabulary,
         tokenizeChineseChars: Bool,
         bosToken: String?,
         eosToken: String?,
@@ -93,17 +76,15 @@ public final class BertTokenizer: Sendable {
         serializedWordPiece: Bool = false, unkToken: String = "[UNK]", prefix: String = "##", maximum: Int = 100
     ) {
         self.serializedWordPiece = serializedWordPiece
-        self.vocab = vocab
-        var reverse = [Int: String](minimumCapacity: vocab.count)
-        for (token, id) in vocab { reverse[id] = token.string }
-        ids_to_tokens = reverse
+        self.vocabulary = vocabulary
         basicTokenizer = BasicTokenizer(doLowerCase: doLowerCase)
-        wordpieceTokenizer = WordpieceTokenizer(vocab: vocab, unkToken: unkToken, prefix: prefix, maximum: maximum)
+        wordpieceTokenizer = WordpieceTokenizer(
+            vocabulary: vocabulary, unkToken: unkToken, prefix: prefix, maximum: maximum)
         self.tokenizeChineseChars = tokenizeChineseChars
         self.bosToken = bosToken
-        bosTokenId = bosToken.flatMap { vocab[BinaryDistinctString($0)] }
+        bosTokenId = bosToken.flatMap { vocabulary.id(of: $0) }
         self.eosToken = eosToken
-        eosTokenId = eosToken.flatMap { vocab[BinaryDistinctString($0)] }
+        eosTokenId = eosToken.flatMap { vocabulary.id(of: $0) }
         self.fuseUnknownTokens = fuseUnknownTokens
     }
 
@@ -120,11 +101,11 @@ public final class BertTokenizer: Sendable {
     /// Tokenizes and maps to ids in one step (tokens absent from the vocabulary are dropped,
     /// as in the original BERT implementation).
     func tokenizeToIds(text: String) -> [Int] {
-        tokenize(text: text).compactMap { vocab[BinaryDistinctString($0)] }
+        tokenize(text: text).compactMap { vocabulary.id(of: $0) }
     }
 
     func unTokenize(tokens: [Int]) -> [String] {
-        tokens.compactMap { ids_to_tokens[$0] }
+        tokens.compactMap { vocabulary.token($0) }
     }
 
     func convertWordpieceToBasicTokenList(_ wordpieceTokenList: [String]) -> String {
@@ -168,7 +149,7 @@ public final class BertTokenizer: Sendable {
 
 extension BertTokenizer: PreTrainedTokenizerModel {
     public var unknownToken: String? { wordpieceTokenizer.unkToken }
-    public var unknownTokenId: Int? { vocab[BinaryDistinctString(unknownToken!)] }
+    public var unknownTokenId: Int? { wordpieceTokenizer.unkId }
 
     func encode(text: String) -> [Int] { tokenizeToIds(text: text) }
 
@@ -177,11 +158,11 @@ extension BertTokenizer: PreTrainedTokenizerModel {
     }
 
     public func convertTokenToId(_ token: String) -> Int? {
-        vocab[BinaryDistinctString(token)] ?? unknownTokenId
+        vocabulary.id(of: token) ?? unknownTokenId
     }
 
     public func convertIdToToken(_ id: Int) -> String? {
-        ids_to_tokens[id]
+        vocabulary.token(id)
     }
 }
 
@@ -190,19 +171,32 @@ extension BertTokenizer: FastTokenizingModel {
 
     final class Encoder: PieceEncoder {
         let model: BertTokenizer
+        private var scratch = WordpieceTokenizer.Scratch()
+        private var alphabetScratch: [UInt8] = []
+
         init(model: BertTokenizer) { self.model = model }
 
         override func encode(piece: Substring, byteLevel: Bool, into ids: inout [Int]) {
-            let text = byteLevel ? ByteLevelAlphabet.encode(piece.utf8) : String(piece)
+            var copy = piece
+            copy.withUTF8 { encode(bytes: $0, byteLevel: byteLevel, into: &ids) }
+        }
+
+        override func encode(bytes: UnsafeBufferPointer<UInt8>, byteLevel: Bool, into ids: inout [Int]) {
+            guard !bytes.isEmpty else { return }
+            if byteLevel {
+                alphabetScratch.removeAll(keepingCapacity: true)
+                ByteLevelAlphabet.appendEncoded(bytes, to: &alphabetScratch)
+                alphabetScratch.withUnsafeBufferPointer { encode(bytes: $0, byteLevel: false, into: &ids) }
+                return
+            }
             if model.serializedWordPiece {
-                if let pieces = model.wordpieceTokenizer.tokenizeToIds(word: text) {
-                    ids.append(contentsOf: pieces)
-                } else if let unknown = model.unknownTokenId {
+                if !model.wordpieceTokenizer.encode(bytes, into: &ids, scratch: &scratch), let unknown = model.unknownTokenId {
                     ids.append(unknown)
                 }
                 return
             }
-            for token in model.tokenize(text: text) {
+            // Legacy configuration: run the built-in basic tokenizer on the piece.
+            for token in model.tokenize(text: String(decoding: bytes, as: UTF8.self)) {
                 if let id = model.convertTokenToId(token) {
                     ids.append(id)
                 }
@@ -227,7 +221,7 @@ final class BasicTokenizer: Sendable {
     /// is space/tab (`NSCharacterSet.whitespaces`), and punctuation is the ASCII range set.
     /// Returns `nil` when the input is not ASCII.
     private static func tokenizeASCII(_ bytes: UnsafeBufferPointer<UInt8>, lowercase: Bool) -> [String]? {
-        for b in bytes where b >= 0x80 { return nil }
+        guard ASCII.isASCII(bytes) else { return nil }
         var tokens: [String] = []
         var i = 0
         let n = bytes.count
@@ -331,94 +325,150 @@ private extension Character {
 
 final class WordpieceTokenizer: Sendable {
     let unkToken: String
+    let unkId: Int?
     let prefix: String
     private let maxInputCharsPerWord: Int
-    private let vocab: [BinaryDistinctString: Int]
-    /// Packed copy of the vocabulary so candidate substrings are looked up as byte slices
-    /// without materializing a `String` per attempt.
-    private let packed: Vocabulary?
+    private let vocabulary: Vocabulary
     private let continuationPrefix: [UInt8]
+    /// Byte length of the longest vocabulary entry: no candidate longer than this can match.
+    private let maxTokenBytes: Int
+    /// BMP scalars that begin some word-initial token / some `##` continuation token. A word
+    /// whose current position starts with any other scalar cannot be segmented, so scripts
+    /// absent from the vocabulary are rejected without probing.
+    private let initialStarts: ScalarBitmap
+    private let continuationStarts: ScalarBitmap
 
-    init(vocab: [BinaryDistinctString: Int], unkToken: String = "[UNK]", prefix: String = "##", maximum: Int = 100) {
+    /// Per-encoder reusable buffers.
+    struct Scratch {
+        /// `##` + candidate bytes.
+        var continuation: [UInt8] = []
+        /// Ids of the word being segmented (committed only when the whole word succeeds).
+        var pieces: [Int] = []
+    }
+
+    init(vocabulary: Vocabulary, unkToken: String = "[UNK]", prefix: String = "##", maximum: Int = 100) {
         self.unkToken = unkToken
         self.prefix = prefix
         maxInputCharsPerWord = maximum
         continuationPrefix = Array(prefix.utf8)
-        self.vocab = vocab
-        packed = try? Vocabulary(entries: vocab.map { ($0.key.string, $0.value) })
+        self.vocabulary = vocabulary
+        unkId = vocabulary.id(of: unkToken)
+        var longest = 0
+        var initialStarts = ScalarBitmap()
+        var continuationStarts = ScalarBitmap()
+        let prefixBytes = continuationPrefix
+        for id in 0..<vocabulary.count where vocabulary.contains(id: id) {
+            longest = max(longest, vocabulary.byteCount(of: id))
+            vocabulary.withBytes(of: id) { token in
+                guard !token.isEmpty else { return }
+                if !prefixBytes.isEmpty, token.count > prefixBytes.count, token.starts(with: prefixBytes) {
+                    continuationStarts.insert(UTF8Cursor.decode(token, at: prefixBytes.count).value)
+                } else {
+                    initialStarts.insert(UTF8Cursor.decode(token, at: 0).value)
+                }
+            }
+        }
+        maxTokenBytes = longest
+        self.initialStarts = initialStarts
+        self.continuationStarts = continuationStarts
     }
 
     /// Greedy longest-match-first segmentation of a single word into WordPiece subwords.
     func tokenize(word: String) -> [String] {
-        guard let packed else { return tokenizeSlow(Array(word.unicodeScalars)) }
-        guard let ids = tokenizeToIds(word: word) else { return [unkToken] }
-        return ids.compactMap { packed.token($0) }
+        var copy = word
+        var scratch = Scratch()
+        var ids: [Int] = []
+        let encoded = copy.withUTF8 { encode($0, into: &ids, scratch: &scratch) }
+        guard encoded else { return [unkToken] }
+        return ids.compactMap { vocabulary.token($0) }
     }
 
     /// The encode pipeline needs IDs directly; don't allocate token strings and hash them again.
     func tokenizeToIds(word: String) -> [Int]? {
-        guard let packed else {
-            return tokenizeSlow(Array(word.unicodeScalars)).compactMap { vocab[BinaryDistinctString($0)] }
-        }
-        let count = word.unicodeScalars.count
-        guard count <= maxInputCharsPerWord else { return nil }
-        if word.isEmpty { return [] }
         var copy = word
-        return copy.withUTF8 { bytes -> [Int]? in
-            let whole = packed.id(of: bytes)
-            if whole >= 0 { return [Int(whole)] }
-            var boundaries: [Int] = [0]
-            boundaries.reserveCapacity(count + 1)
-            var offset = 0
-            while offset < bytes.count {
-                offset += UTF8Cursor.decode(bytes, at: offset).1
-                boundaries.append(offset)
-            }
-            var ids: [Int] = []
-            var scratch = continuationPrefix
-            var start = 0
-            while start < count {
-                var end = count
-                var found: Int32 = -1
-                while start < end {
-                    let slice = UnsafeBufferPointer(rebasing: bytes[boundaries[start]..<boundaries[end]])
-                    if start == 0 {
-                        found = packed.id(of: slice)
-                    } else {
-                        scratch.removeSubrange(continuationPrefix.count...)
-                        scratch.append(contentsOf: slice)
-                        found = scratch.withUnsafeBufferPointer { packed.id(of: $0) }
-                    }
-                    if found >= 0 { break }
-                    end -= 1
-                }
-                guard found >= 0 else { return nil }
-                ids.append(Int(found))
-                start = end
-            }
-            return ids
-        }
+        var scratch = Scratch()
+        var ids: [Int] = []
+        return copy.withUTF8 { encode($0, into: &ids, scratch: &scratch) } ? ids : nil
     }
 
-    private func tokenizeSlow(_ scalars: [Unicode.Scalar]) -> [String] {
-        var subTokens: [String] = []
+    /// The scalar boundary preceding `end` (at least `floor`).
+    @inline(__always)
+    private static func previousScalarBoundary(_ word: UnsafeBufferPointer<UInt8>, before end: Int, floor: Int) -> Int {
+        var end = end - 1
+        while end > floor, word[end] & 0xC0 == 0x80 { end -= 1 }
+        return end
+    }
+
+    /// Appends the subword ids of `word` (well-formed UTF-8) to `ids`. Returns `false`, leaving
+    /// `ids` untouched, when the word is too long or a suffix has no match (the caller emits
+    /// the unknown token).
+    func encode(_ word: UnsafeBufferPointer<UInt8>, into ids: inout [Int], scratch: inout Scratch) -> Bool {
+        let n = word.count
+        guard n > 0 else { return true }
+        var scalarCount = 0
+        for byte in word where byte & 0xC0 != 0x80 { scalarCount += 1 }
+        guard scalarCount <= maxInputCharsPerWord else { return false }
+
+        let whole = vocabulary.id(of: word)
+        if whole >= 0 {
+            ids.append(Int(whole))
+            return true
+        }
+
+        scratch.pieces.removeAll(keepingCapacity: true)
+        let prefixCount = continuationPrefix.count
         var start = 0
-        while start < scalars.count {
-            var end = scalars.count
-            var current: String?
-            while start < end {
-                var substr = String(String.UnicodeScalarView(scalars[start..<end]))
-                if start > 0 { substr = prefix + substr }
-                if vocab[BinaryDistinctString(substr)] != nil {
-                    current = substr
-                    break
+        while start < n {
+            // No token starts with this scalar: the word cannot be segmented.
+            let starts = start == 0 ? initialStarts : continuationStarts
+            guard starts.mayContain(UTF8Cursor.decode(word, at: start).value) else { return false }
+            // Longest candidate first, never longer than the longest vocabulary entry.
+            let limit = start == 0 ? maxTokenBytes : maxTokenBytes - prefixCount
+            var end = min(n, start + max(limit, 1))
+            while end > start, end < n, word[end] & 0xC0 == 0x80 { end -= 1 }  // scalar boundary
+            var found: Int32 = -1
+            if start == 0 {
+                while end > start {
+                    found = vocabulary.id(of: UnsafeBufferPointer(rebasing: word[start..<end]))
+                    if found >= 0 { break }
+                    end = Self.previousScalarBoundary(word, before: end, floor: start)
                 }
-                end -= 1
+            } else {
+                // `##` + the longest candidate, assembled once; shorter candidates are prefixes of it.
+                scratch.continuation.removeAll(keepingCapacity: true)
+                scratch.continuation.append(contentsOf: continuationPrefix)
+                scratch.continuation.append(contentsOf: UnsafeBufferPointer(rebasing: word[start..<end]))
+                scratch.continuation.withUnsafeBufferPointer { candidate in
+                    while end > start {
+                        let length = prefixCount + (end - start)
+                        found = vocabulary.id(of: UnsafeBufferPointer(rebasing: candidate[0..<length]))
+                        if found >= 0 { break }
+                        end = Self.previousScalarBoundary(word, before: end, floor: start)
+                    }
+                }
             }
-            guard let current else { return [unkToken] }
-            subTokens.append(current)
+            guard found >= 0 else { return false }
+            scratch.pieces.append(Int(found))
             start = end
         }
-        return subTokens
+        ids.append(contentsOf: scratch.pieces)
+        return true
+    }
+}
+
+/// A set of Basic Multilingual Plane scalars (8 KiB bitmap). Scalars outside the BMP are
+/// reported as possibly present.
+struct ScalarBitmap: Sendable {
+    private var words = [UInt64](repeating: 0, count: 0x10000 / 64)
+
+    mutating func insert(_ value: UInt32) {
+        guard value < 0x10000 else { return }
+        words[Int(value >> 6)] |= 1 << UInt64(value & 63)
+    }
+
+    @inline(__always)
+    func mayContain(_ value: UInt32) -> Bool {
+        guard value < 0x10000 else { return true }
+        return words[Int(value >> 6)] & (1 << UInt64(value & 63)) != 0
     }
 }
