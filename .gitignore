@@ -11,3 +11,4 @@ DerivedData/
 /.fixtures-cache
 /.e2e/
 /.e2e-ref/
+/.bench/

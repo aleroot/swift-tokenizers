@@ -55,6 +55,13 @@ final class Vocabulary: Sendable {
         try self.init(packed: packed, extra: extra)
     }
 
+    /// Builds from a packed Unigram vocabulary (`id == index`) plus added tokens.
+    convenience init(scored: PackedScoredTokens, addedTokens: [String: Int]) throws {
+        var ids = [Int32](repeating: 0, count: scored.count)
+        for i in 0..<scored.count { ids[i] = Int32(i) }
+        try self.init(packed: PackedStringMap(utf8: scored.utf8, offsets: scored.offsets, ids: ids), addedTokens: addedTokens)
+    }
+
     private init(packed: PackedStringMap, extra: [(String, Int)]) throws {
         var maxId = -1
         for id in packed.ids {
@@ -243,6 +250,15 @@ final class Vocabulary: Sendable {
     }
 
     // MARK: - Lookup
+
+    /// Runs `body` with the packed token storage and its `count + 1` offsets table.
+    func withStorage<R>(_ body: (UnsafeBufferPointer<UInt8>, UnsafeBufferPointer<UInt32>) throws -> R) rethrows -> R {
+        try storage.withUnsafeBufferPointer { storage in
+            try offsets.withUnsafeBufferPointer { offsets in
+                try body(storage, offsets)
+            }
+        }
+    }
 
     @inline(__always)
     func contains(id: Int) -> Bool {
