@@ -288,7 +288,12 @@ final class MetaspacePreTokenizer: ByteRewriter {
         let startsWithReplacement =
             bytes.starts(with: replacementBytes)
             || (bytes[0] == 0x20 && stringReplacementBytes.starts(with: replacementBytes))
-        if needsPrefix, !startsWithReplacement {
+        let prefix = needsPrefix && !startsWithReplacement
+        if stringReplacementBytes == replacementBytes, replacementBytes.count > 1 {
+            rewriteFused(bytes, prefix: prefix, into: &output, pieces: &pieces)
+            return
+        }
+        if prefix {
             output.append(contentsOf: stringReplacementBytes)
         }
         if stringReplacementBytes == [0x20] {
@@ -318,6 +323,61 @@ final class MetaspacePreTokenizer: ByteRewriter {
                 }
             }
             if start < length { pieces.append(start..<length) }
+        }
+    }
+
+    /// Substitution and split in one pass for the usual configuration (`str_rep` equal to the
+    /// multi-byte `replacement`, e.g. `▁`): a SIMD scan finds the next space or marker lead
+    /// byte, the gap is copied, and every emitted marker starts a piece. Output goes straight
+    /// into reserved storage instead of through one `append` per fragment.
+    private func rewriteFused(
+        _ bytes: UnsafeBufferPointer<UInt8>, prefix: Bool, into output: inout [UInt8], pieces: inout [Range<Int>]
+    ) {
+        let n = bytes.count
+        let m = replacementBytes.count
+        replacementBytes.withUnsafeBufferPointer { marker in
+            let lead = marker[0]
+            let split = self.split
+            output.appendUninitialized(maximum: (prefix ? m : 0) + n * m) { out in
+                var written = 0
+                var pieceStart = 0
+                @inline(__always) func emitMarker() {
+                    if split, written > pieceStart {
+                        pieces.append(pieceStart..<written)
+                    }
+                    if split { pieceStart = written }
+                    (out + written).update(from: marker.baseAddress!, count: m)
+                    written += m
+                }
+                if prefix { emitMarker() }
+                var i = 0
+                while i < n {
+                    let j = ByteKernels.firstIndex(of: 0x20, or: lead, in: bytes, from: i)
+                    if j > i {
+                        (out + written).update(from: bytes.baseAddress! + i, count: j - i)
+                        written += j - i
+                        i = j
+                    }
+                    if i >= n { break }
+                    if bytes[i] == 0x20 {
+                        emitMarker()
+                        i += 1
+                    } else if i + m <= n, memcmp(bytes.baseAddress! + i, marker.baseAddress!, m) == 0 {
+                        emitMarker()
+                        i += m
+                    } else {
+                        out[written] = bytes[i]
+                        written += 1
+                        i += 1
+                    }
+                }
+                if split {
+                    if written > pieceStart { pieces.append(pieceStart..<written) }
+                } else {
+                    pieces.append(0..<written)
+                }
+                return written
+            }
         }
     }
 }

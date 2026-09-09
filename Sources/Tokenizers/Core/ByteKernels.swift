@@ -44,7 +44,7 @@ enum ByteKernels {
         ((v &+ (0x80 &- lower)) ^ (v &+ (0x80 &- upper))) & ~v & 0x80
     }
 
-    /// `0x80` in lanes equal to `byte` (`byte` < 0x80), `0` elsewhere.
+    /// `0x80` in lanes equal to `byte` (any value), `0` elsewhere.
     @inline(__always)
     static func equals(_ v: Vector, _ byte: UInt8) -> Vector {
         let difference = v ^ byte
@@ -150,6 +150,46 @@ enum ByteKernels {
         return UnsafePointer<UInt8>(hit.assumingMemoryBound(to: UInt8.self)) - base
     }
 
+    /// Index of the first byte equal to `first` or `second` at or after `start`, or `bytes.count`.
+    @inline(__always)
+    static func firstIndex(
+        of first: UInt8, or second: UInt8, in bytes: UnsafeBufferPointer<UInt8>, from start: Int
+    )
+        -> Int
+    {
+        let n = bytes.count
+        guard let base = bytes.baseAddress else { return n }
+        var i = start
+        while i + width <= n {
+            let v = load(base, i)
+            let lanes = equals(v, first) | equals(v, second)
+            if anyLane(lanes) { return i + bits(lanes).trailingZeroBitCount }
+            i += width
+        }
+        while i < n, base[i] != first, base[i] != second { i += 1 }
+        return i
+    }
+
+    /// `true` if `bytes` contain two adjacent occurrences of `byte`.
+    @inline(__always)
+    static func containsRepeat(of byte: UInt8, in bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        let n = bytes.count
+        guard let base = bytes.baseAddress else { return false }
+        var i = 0
+        var previous: UInt16 = 0  // bit 0: the byte before lane 0 is `byte`
+        while i + width <= n {
+            let lanes = bits(equals(load(base, i), byte))
+            if lanes & (lanes << 1 | previous) != 0 { return true }
+            previous = lanes >> 15
+            i += width
+        }
+        while i < n {
+            if base[i] == byte, i > 0, base[i - 1] == byte { return true }
+            i += 1
+        }
+        return false
+    }
+
     /// `true` if any byte of `bytes` is a C0 control or DEL.
     @inline(__always)
     static func containsControl(_ bytes: UnsafeBufferPointer<UInt8>) -> Bool {
@@ -213,5 +253,18 @@ enum ByteKernels {
     @inline(__always)
     static func lowercased(_ v: Vector) -> Vector {
         v | (uppercase(v) &>> 2)
+    }
+}
+
+extension Array where Element == UInt8 {
+    /// Appends the bytes that `body` writes to the pointer it receives (at most `maximum` of
+    /// them); `body` returns how many it wrote. Lets a kernel emit output with plain stores
+    /// instead of one `append` per fragment.
+    @inline(__always)
+    mutating func appendUninitialized(maximum: Int, _ body: (UnsafeMutablePointer<UInt8>) -> Int) {
+        let start = count
+        append(contentsOf: repeatElement(0, count: maximum))
+        let written = withUnsafeMutableBufferPointer { body($0.baseAddress! + start) }
+        removeLast(maximum - written)
     }
 }

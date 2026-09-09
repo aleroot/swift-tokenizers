@@ -47,8 +47,15 @@ struct ByteKernelsTests {
                     #expect(ByteKernels.firstASCII(bytes, from: start) == expectedASCII)
                     let expectedSpace = bytes[start...].firstIndex(of: 0x20) ?? bytes.count
                     #expect(ByteKernels.firstIndex(of: 0x20, in: bytes, from: start) == expectedSpace)
+                    let expectedEither = bytes[start...].firstIndex { $0 == 0x20 || $0 == 0xE2 } ?? bytes.count
+                    #expect(ByteKernels.firstIndex(of: 0x20, or: 0xE2, in: bytes, from: start) == expectedEither)
                 }
                 #expect(ByteKernels.isASCII(bytes) == bytes.allSatisfy { $0 < 0x80 })
+                var expectedRepeat = false
+                for i in 1..<max(1, bytes.count) where bytes[i] == 0x61 && bytes[i - 1] == 0x61 {
+                    expectedRepeat = true
+                }
+                #expect(ByteKernels.containsRepeat(of: 0x61, in: bytes) == expectedRepeat)
             }
         }
     }

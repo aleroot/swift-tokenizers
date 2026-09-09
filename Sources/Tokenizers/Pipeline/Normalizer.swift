@@ -497,6 +497,9 @@ final class PrecompiledNormalizer: ByteNormalizer {
     private let crlfReplacementOffset: Int32
     /// `true` when no ASCII byte (or CRLF) maps to anything: ASCII chunks are then copied verbatim.
     private let asciiIsIdentity: Bool
+    /// `true` when only C0 controls / DEL map to something (SentencePiece's `nmt_nfkc` maps):
+    /// an ASCII run without control bytes is then copied verbatim after one SIMD scan.
+    private let asciiReplacesOnlyControls: Bool
 
     required init(config: Config) throws {
         guard let encoded = config.precompiledCharsmap.string(), let data = Data(base64Encoded: encoded),
@@ -528,11 +531,21 @@ final class PrecompiledNormalizer: ByteNormalizer {
         crlfReplacementOffset =
             Self.replacementOffset(for: [UInt8(13), 10], trie: trie, replacements: replacements) ?? -1
         asciiIsIdentity = asciiReplacementOffsets.allSatisfy { $0 < 0 } && crlfReplacementOffset < 0
+        asciiReplacesOnlyControls = asciiReplacementOffsets.enumerated().allSatisfy { byte, offset in
+            offset < 0 || byte < 0x20 || byte == 0x7F
+        }
     }
 
     func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
-        guard ASCII.isASCII(bytes) else { return false }
+        guard ByteKernels.isASCII(bytes) else { return false }
+        return asciiIsIdentity(on: bytes)
+    }
+
+    /// Whether the ASCII-only `bytes` map to themselves.
+    @inline(__always)
+    private func asciiIsIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
         if asciiIsIdentity { return true }
+        if asciiReplacesOnlyControls { return !ByteKernels.containsControl(bytes) }
         for byte in bytes where asciiReplacementOffsets[Int(byte)] >= 0 { return false }
         if crlfReplacementOffset >= 0, bytes.count > 1 {
             for i in 0..<(bytes.count - 1) where bytes[i] == 13 && bytes[i + 1] == 10 { return false }
@@ -588,23 +601,24 @@ final class PrecompiledNormalizer: ByteNormalizer {
         while i < n {
             // ASCII runs go through the per-byte table without constructing graphemes.
             if bytes[i] < 0x80 {
-                var j = i
-                while j < n, bytes[j] < 0x80 {
-                    // Keep a trailing ASCII scalar for the non-ASCII run if it may start a
-                    // grapheme that a following mark extends (e.g. `e` + U+0301 maps as one unit).
-                    if j + 1 < n, bytes[j + 1] >= 0x80, Self.extendsGrapheme(bytes, at: j + 1) { break }
-                    j += 1
-                }
+                var j = ByteKernels.firstNonASCII(bytes, from: i + 1)
+                // Keep a trailing ASCII scalar for the non-ASCII run if it may start a grapheme
+                // that a following mark extends (e.g. `e` + U+0301 maps as one unit).
+                if j < n, j > i, Self.extendsGrapheme(bytes, at: j) { j -= 1 }
                 appendASCII(UnsafeBufferPointer(rebasing: bytes[i..<j]), to: &output)
                 i = j
                 if i >= n { break }
             }
             // A non-ASCII run (plus at most one leading ASCII scalar): the reference maps whole
             // graphemes first (when shorter than 6 bytes), then scalars.
-            var j = i + 1
-            while j < n, bytes[j] >= 0x80 { j += 1 }
-            for grapheme in String(decoding: UnsafeBufferPointer(rebasing: bytes[i..<j]), as: UTF8.self) {
-                appendGrapheme(grapheme, to: &output)
+            let j = ByteKernels.firstASCII(bytes, from: i + 1)
+            let run = UnsafeBufferPointer(rebasing: bytes[i..<j])
+            let mark = output.count
+            if !appendClusters(run, to: &output) {
+                output.removeSubrange(mark...)
+                for grapheme in String(decoding: run, as: UTF8.self) {
+                    appendGrapheme(grapheme, to: &output)
+                }
             }
             i = j
         }
@@ -617,9 +631,52 @@ final class PrecompiledNormalizer: ByteNormalizer {
         return ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.graphemeExtend != 0
     }
 
+    /// Maps a run of scalars cluster by cluster without materialising a `String`.
+    ///
+    /// Only clusters shorter than 6 bytes are looked up whole (a prefix match then replaces
+    /// the entire cluster, as in the reference), so cluster boundaries need to be exact only
+    /// for short clusters: a base scalar plus the grapheme-extending scalars (`Extend`,
+    /// `SpacingMark`, ZWJ) that follow it. Every other UAX #29 rule joins scalars into
+    /// clusters of 6 bytes or more (Hangul jamo, regional indicators, emoji sequences, Indic
+    /// conjuncts) — except `Control` (a boundary on both sides) and `Prepend`, which make the
+    /// function return `false` (with `output` in an unspecified state past its previous
+    /// count) so the caller can use the reference grapheme iterator.
+    private func appendClusters(_ bytes: UnsafeBufferPointer<UInt8>, to output: inout [UInt8]) -> Bool {
+        let n = bytes.count
+        var i = 0
+        while i < n {
+            let (value, width) = UTF8Cursor.decode(bytes, at: i)
+            if ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.graphemeControl != 0 { return false }
+            var end = i + width
+            while end < n, Self.extendsGrapheme(bytes, at: end) { end += UTF8Cursor.width(bytes[end]) }
+            if end - i < 6 {
+                if let offset = replacementOffset(for: bytes[i..<end]) {
+                    appendReplacement(at: offset, to: &output)
+                    i = end
+                    continue
+                }
+                if end == i + width {
+                    output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<end]))
+                    i = end
+                    continue
+                }
+            }
+            while i < end {
+                let scalarEnd = i + UTF8Cursor.width(bytes[i])
+                if let offset = replacementOffset(for: bytes[i..<scalarEnd]) {
+                    appendReplacement(at: offset, to: &output)
+                } else {
+                    output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<scalarEnd]))
+                }
+                i = scalarEnd
+            }
+        }
+        return true
+    }
+
     @inline(__always)
     private func appendASCII(_ bytes: UnsafeBufferPointer<UInt8>, to output: inout [UInt8]) {
-        if asciiIsIdentity {
+        if asciiIsIdentity(on: bytes) {
             output.append(contentsOf: bytes)
             return
         }
@@ -792,8 +849,12 @@ enum StringReplacePattern: Sendable {
             }
             return false
         case let .run(byte, minimum, _):
-            var i = 0
             let n = bytes.count
+            if minimum <= 1 { return ByteKernels.firstIndex(of: byte, in: bytes, from: 0) < n }
+            // A run of `minimum` needs two adjacent occurrences; that check is one SIMD pass.
+            guard ByteKernels.containsRepeat(of: byte, in: bytes) else { return false }
+            if minimum == 2 { return true }
+            var i = 0
             while i < n {
                 guard bytes[i] == byte else {
                     i += 1

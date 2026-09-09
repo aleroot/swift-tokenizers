@@ -60,7 +60,11 @@ final class TemplateProcessing: PostProcessor, FastPostProcessor {
         pair = try require(config.pair.array(), "TemplateProcessing", field: "pair")
         singleItems = single.map(Self.item)
         pairItems = pair.map(Self.item)
-        guard !singleItems.contains(where: { if case .sequenceB = $0 { return true }; return false }) else {
+        guard
+            !singleItems.contains(where: {
+                if case .sequenceB = $0 { return true }; return false
+            })
+        else {
             throw TokenizerError.invalidConfiguration("TemplateProcessing single template references sequence B")
         }
     }

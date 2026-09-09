@@ -256,6 +256,13 @@ enum ScalarClassifier {
         {
             flags |= ScalarExtraFlags.graphemeExtend
         }
+        // UAX #29 GB4/GB5 `Control` and GB9b `Prepend` (the latter are Cf, except U+0D4E).
+        switch category {
+        case .control, .format, .lineSeparator, .paragraphSeparator, .unassigned, .surrogate:
+            if value != 0x200C && value != 0x200D { flags |= ScalarExtraFlags.graphemeControl }
+        default:
+            if value == 0x0D4E { flags |= ScalarExtraFlags.graphemeControl }
+        }
         return flags
     }
 }
@@ -275,6 +282,10 @@ enum ScalarExtraFlags {
     @usableFromInline static let word: UInt8 = 16
     /// Continues the preceding grapheme cluster: `Grapheme_Extend`, `Mc`, ZWJ.
     @usableFromInline static let graphemeExtend: UInt8 = 32
+    /// UAX #29 `Control` (a cluster boundary on both sides) or `Prepend`: Cc, Cf, Zl, Zp, Cn,
+    /// Cs plus the prepended concatenation marks. Such scalars never form a cluster with the
+    /// scalars around them the way a base letter does.
+    @usableFromInline static let graphemeControl: UInt8 = 64
 }
 
 /// Byte-level helpers shared by the encode pipeline.
