@@ -136,11 +136,6 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         } else {
             byteLevelDecodeTable = nil
         }
-
-        // Prepare shared Unicode classification data so a loaded tokenizer is ready
-        // for its first request. Subsequent tokenizers reuse the tables.
-        _ = ScalarClassifier.bmp
-        _ = ScalarClassifier.bmpExtra
     }
 
     // MARK: - Pipeline stages (string API)

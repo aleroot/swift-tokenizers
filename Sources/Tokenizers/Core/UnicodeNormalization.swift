@@ -22,29 +22,38 @@ enum UnicodeNormalization {
         static let lowercaseComplex: UInt16 = 1 << 12
         /// General category `Mn`.
         static let nonspacingMark: UInt16 = 1 << 13
-        /// A supplementary-plane scalar with a non-zero combining class, a decomposition, a case
-        /// mapping or a mark category: not covered by the BMP tables.
-        static let supplementary: UInt16 = 1 << 14
+        /// A scalar outside the stable BMP data: supplementary or changed between supported
+        /// Unicode releases. Normalization and case mapping must use the running OS/stdlib.
+        static let requiresRuntime: UInt16 = 1 << 14
 
         /// Flags that make a scalar's NFC status depend on context or differ from identity.
-        static let notNFC: UInt16 = nfcUnstable | supplementary
-        static let notNFD: UInt16 = canonicalDecomposition | supplementary
-        static let notNFKC: UInt16 = nfcUnstable | compatibilityDecomposition | supplementary
-        static let notNFKD: UInt16 = canonicalDecomposition | compatibilityDecomposition | supplementary
+        static let notNFC: UInt16 = nfcUnstable | requiresRuntime
+        static let notNFD: UInt16 = canonicalDecomposition | requiresRuntime
+        static let notNFKC: UInt16 = nfcUnstable | compatibilityDecomposition | requiresRuntime
+        static let notNFKD: UInt16 = canonicalDecomposition | compatibilityDecomposition | requiresRuntime
     }
 
     /// The expanded BMP table (128 KiB), built from the run-length data at first use.
-    static let bmp: [UInt16] = expand(runs)
+    static let bmp: [UInt16] = {
+        var table = expand(runs)
+        for index in stride(from: 0, to: UnicodeCompatibility.bmpRanges.count, by: 2) {
+            let start = UnicodeCompatibility.bmpRanges[index]
+            let end = UnicodeCompatibility.bmpRanges[index + 1]
+            for value in start..<end { table[Int(value)] = Property.requiresRuntime }
+        }
+        return table
+    }()
 
     /// Properties of `value` (any scalar).
     @inline(__always)
     static func properties(of value: UInt32) -> UInt16 {
         if value < 0x10000 { return bmp[Int(value)] }
-        return isSupplementaryNontrivial(value) ? Property.supplementary : 0
+        return isSupplementaryNontrivial(value) ? Property.requiresRuntime : 0
     }
 
     /// Whether the supplementary-plane scalar `value` lies in one of the non-trivial ranges.
     static func isSupplementaryNontrivial(_ value: UInt32) -> Bool {
+        let supplementaryRanges = UnicodeCompatibility.supplementaryRanges
         // `supplementaryRanges` holds sorted, disjoint `[start, end)` pairs.
         var lo = 0
         var hi = supplementaryRanges.count / 2
@@ -87,19 +96,33 @@ enum UnicodeNormalization {
         for i in start..<end { body(decompositions[i]) }
     }
 
-    /// The simple lowercase mapping of the BMP scalar `value` (which must have
-    /// ``Property/lowercaseMapped``).
+    /// Sparse, constant-time lowercase mapping. The zero page means identity; nonempty
+    /// pages store `scalar XOR lowercase`, so lookup needs two loads and one XOR.
+    private struct LowercaseTable {
+        var pages = [UInt16](repeating: 0, count: 1024)
+        var deltas = [UInt16](repeating: 0, count: 64)
+
+        init() {
+            for entry in lowercaseIndex {
+                let value = Int(entry >> 16)
+                let page = value >> 6
+                if pages[page] == 0 {
+                    pages[page] = UInt16(deltas.count)
+                    deltas.append(contentsOf: repeatElement(0, count: 64))
+                }
+                deltas[Int(pages[page]) + (value & 63)] = UInt16(value) ^ UInt16(truncatingIfNeeded: entry)
+            }
+        }
+    }
+
+    private static let lowercaseTable = LowercaseTable()
+
+    /// The simple lowercase mapping of a BMP scalar. Version-dependent mappings are
+    /// excluded by ``Property/requiresRuntime`` before normalizers call this helper.
     @inline(__always)
     static func lowercase(_ value: UInt32) -> UInt32 {
-        // `lowercaseIndex` holds `scalar << 16 | lowercase` sorted by scalar.
-        var lo = 0
-        var hi = lowercaseIndex.count - 1
-        let key = value << 16
-        while lo < hi {
-            let mid = (lo + hi) >> 1
-            if lowercaseIndex[mid] & 0xFFFF_0000 < key { lo = mid + 1 } else { hi = mid }
-        }
-        return lowercaseIndex[lo] & 0xFFFF
+        let offset = Int(lowercaseTable.pages[Int(value >> 6)]) + Int(value & 63)
+        return value ^ UInt32(lowercaseTable.deltas[offset])
     }
 
     static let hangulBase: UInt32 = 0xAC00
@@ -119,15 +142,6 @@ enum UnicodeNormalization {
         return table
     }
 
-    /// Run-length encodes a 65 536-entry property table.
-    static func encode(_ table: [UInt16]) -> [UInt32] {
-        var runs: [UInt32] = []
-        for v in 0..<0x10000 {
-            if let last = runs.last, UInt16(truncatingIfNeeded: last) == table[v] { continue }
-            runs.append(UInt32(v) << 16 | UInt32(table[v]))
-        }
-        return runs
-    }
 }
 
 // MARK: - Quick checks

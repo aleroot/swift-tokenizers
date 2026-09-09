@@ -5,6 +5,41 @@ import Testing
 
 @Suite("Normalizer Tests")
 struct NormalizerTests {
+    @Test("Hangul composition respects modern jamo bounds and restarts at each starter")
+    func hangulComposition() {
+        for normalizer: any Normalizer in [NFCNormalizer(config: [:]), NFKCNormalizer(config: [:])] {
+            for leading in UInt32(0x1100)...0x1113 {
+                for vowel in UInt32(0x1160)...0x1176 {
+                    let input = String(Unicode.Scalar(leading)!) + String(Unicode.Scalar(vowel)!)
+                    let expected: String
+                    if leading < 0x1113, vowel >= 0x1161, vowel < 0x1176 {
+                        expected = String(Unicode.Scalar(0xAC00 + (leading - 0x1100) * 588 + (vowel - 0x1161) * 28)!)
+                    } else {
+                        expected = input
+                    }
+                    #expect(normalizer.normalize(text: input).utf8.elementsEqual(expected.utf8))
+                    // The accent forces the fallback even when the jamo are already NFC.
+                    #expect(normalizer.normalize(text: input + "e\u{301}").utf8.elementsEqual((expected + "é").utf8))
+                }
+            }
+            for (input, expected) in [
+                ("\u{1100}\u{AC00}\u{11A8}", "\u{1100}\u{AC01}"),
+                ("\u{1100}\u{AC00}\u{11A8}\u{11A8}", "\u{1100}\u{AC01}\u{11A8}"),
+            ] {
+                #expect(normalizer.normalize(text: input).utf8.elementsEqual(expected.utf8))
+            }
+        }
+    }
+
+    @Test("Compatibility decomposition is recursively ordered before composition")
+    func compatibilityComposition() {
+        // Unicode 17 NormalizationTest.txt: U+01C4 -> D + Z + caron, then dot below
+        // sorts before caron and composes with Z. Canonical String equality hides this bug.
+        let input = "\u{01C4}\u{0323}"
+        #expect(NFKCNormalizer(config: [:]).normalize(text: input).utf8.elementsEqual("D\u{1E92}\u{030C}".utf8))
+        #expect(NFKDNormalizer(config: [:]).normalize(text: input).utf8.elementsEqual("DZ\u{0323}\u{030C}".utf8))
+    }
+
     @Test("Strip preserves combining marks attached to boundary whitespace")
     func stripCombiningMarks() {
         // tokenizers 0.23.2 normalizers.Strip: whitespace is scalar-based, not grapheme-based.
@@ -40,7 +75,7 @@ struct NormalizerTests {
         for (arg, expect) in testCases {
             let config = Config([String: Config]())
             let normalizer = LowercaseNormalizer(config: config)
-            #expect(normalizer.normalize(text: arg) == expect)
+            #expect(normalizer.normalize(text: arg).utf8.elementsEqual(expect.utf8))
         }
 
         let config = Config(["type": NormalizerType.Lowercase.rawValue])
@@ -64,7 +99,7 @@ struct NormalizerTests {
         for (arg, expect) in testCases {
             let config = Config([String: Config]())
             let normalizer = NFDNormalizer(config: config)
-            #expect(normalizer.normalize(text: arg) == expect)
+            #expect(normalizer.normalize(text: arg).utf8.elementsEqual(expect.utf8))
         }
 
         let config = Config(["type": NormalizerType.NFD.rawValue])
@@ -88,7 +123,7 @@ struct NormalizerTests {
         for (arg, expect) in testCases {
             let config = Config([String: Config]())
             let normalizer = NFCNormalizer(config: config)
-            #expect(normalizer.normalize(text: arg) == expect)
+            #expect(normalizer.normalize(text: arg).utf8.elementsEqual(expect.utf8))
         }
 
         let config = Config(["type": NormalizerType.NFC.rawValue])
@@ -112,7 +147,7 @@ struct NormalizerTests {
         for (arg, expect) in testCases {
             let config = Config([String: Config]())
             let normalizer = NFKDNormalizer(config: config)
-            #expect(normalizer.normalize(text: arg) == expect)
+            #expect(normalizer.normalize(text: arg).utf8.elementsEqual(expect.utf8))
         }
 
         let config = Config(["type": NormalizerType.NFKD.rawValue])
@@ -136,7 +171,7 @@ struct NormalizerTests {
         for (arg, expect) in testCases {
             let config = Config([String: Config]())
             let normalizer = NFKCNormalizer(config: config)
-            #expect(normalizer.normalize(text: arg) == expect)
+            #expect(normalizer.normalize(text: arg).utf8.elementsEqual(expect.utf8))
         }
 
         let config = Config(["type": NormalizerType.NFKC.rawValue])
@@ -152,7 +187,7 @@ struct NormalizerTests {
         let config = Config(["stripAccents": true])
         let normalizer = BertNormalizer(config: config)
         for (arg, expect) in testCases {
-            #expect(normalizer.normalize(text: arg) == expect)
+            #expect(normalizer.normalize(text: arg).utf8.elementsEqual(expect.utf8))
         }
     }
 
@@ -173,7 +208,7 @@ struct NormalizerTests {
         for (arg, expect) in testCases {
             let config = Config(["stripAccents": false])
             let normalizer = BertNormalizer(config: config)
-            #expect(normalizer.normalize(text: arg) == expect)
+            #expect(normalizer.normalize(text: arg).utf8.elementsEqual(expect.utf8))
         }
 
         let config = Config(["type": NormalizerType.Bert.rawValue])
@@ -198,7 +233,7 @@ struct NormalizerTests {
         for (arg, expect) in testCases {
             let config = Config([String: Config]())
             let normalizer = BertNormalizer(config: config)
-            #expect(normalizer.normalize(text: arg) == expect)
+            #expect(normalizer.normalize(text: arg).utf8.elementsEqual(expect.utf8))
         }
 
         let config = Config(["type": NormalizerType.Bert.rawValue])
@@ -256,7 +291,7 @@ struct NormalizerTests {
                 "stripRight": rightStrip,
             ])
             let normalizer = StripNormalizer(config: config)
-            #expect(normalizer.normalize(text: input) == expected)
+            #expect(normalizer.normalize(text: input).utf8.elementsEqual(expected.utf8))
         }
 
         let config = Config(["type": NormalizerType.Strip.rawValue])

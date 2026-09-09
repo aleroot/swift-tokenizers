@@ -129,19 +129,15 @@ enum ScalarFlags {
 
 @usableFromInline
 enum ScalarClassifier {
-    /// Precomputed flags for the Basic Multilingual Plane (64 KiB), built on first use.
+    /// Runtime-derived flags for the Basic Multilingual Plane (64 KiB), built on first use.
     @usableFromInline
-    static let bmp: [UInt8] = UnicodeTables.expand(\.flags)
+    static let bmp: [UInt8] = makeBMPFlags()
 
-    /// Computes the BMP table from scalar properties (the source of truth for
-    /// ``UnicodeTables``; see `UnicodeTablesTests`).
-    static func computeBMP() -> [UInt8] {
-        var table = [UInt8](repeating: ScalarFlags.other, count: 0x10000)
-        for v in 0..<0x10000 {
-            guard let scalar = Unicode.Scalar(UInt32(v)) else { continue }
-            table[v] = flagsSlow(scalar)
+    static func makeBMPFlags() -> [UInt8] {
+        (UInt32(0)..<0x10000).map {
+            guard let scalar = Unicode.Scalar($0) else { return ScalarFlags.other }
+            return flagsSlow(scalar)
         }
-        return table
     }
 
     @inlinable
@@ -206,21 +202,15 @@ enum ScalarClassifier {
 
     // MARK: Extended properties (normalizers)
 
-    /// Precomputed ``ScalarExtraFlags`` for the Basic Multilingual Plane, built on first use.
+    /// Runtime-derived ``ScalarExtraFlags`` for the Basic Multilingual Plane, built on first use.
     @usableFromInline
-    static let bmpExtra: [UInt8] = UnicodeTables.expand(\.extraFlags)
+    static let bmpExtra: [UInt8] = makeBMPExtraFlags()
 
-    /// Computes the extra BMP table from scalar properties (source of truth for ``UnicodeTables``).
-    static func computeBMPExtra() -> [UInt8] {
-        var table = [UInt8](repeating: 0, count: 0x10000)
-        for v in 0..<0x10000 {
-            guard let scalar = Unicode.Scalar(UInt32(v)) else {
-                table[v] = ScalarExtraFlags.control  // surrogates (Cs)
-                continue
-            }
-            table[v] = extraFlagsSlow(scalar)
+    static func makeBMPExtraFlags() -> [UInt8] {
+        (UInt32(0)..<0x10000).map {
+            guard let scalar = Unicode.Scalar($0) else { return ScalarExtraFlags.control }
+            return extraFlagsSlow(scalar)
         }
-        return table
     }
 
     @inlinable
@@ -244,7 +234,10 @@ enum ScalarClassifier {
         }
         let value = scalar.value
         switch category {
-        case .nonspacingMark, .spacingMark, .enclosingMark, .decimalNumber, .connectorPunctuation:
+        case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter, .letterNumber,
+            .nonspacingMark, .spacingMark, .enclosingMark, .decimalNumber, .connectorPunctuation:
+            // Every letter and Nl is Alphabetic. Reuse the category already fetched,
+            // avoiding another Unicode-property lookup for the majority of the BMP.
             flags |= ScalarExtraFlags.word
         default:
             if properties.isAlphabetic || value == 0x200C || value == 0x200D { flags |= ScalarExtraFlags.word }

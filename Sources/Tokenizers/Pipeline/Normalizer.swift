@@ -173,7 +173,7 @@ final class LowercaseNormalizer: ByteNormalizer {
 
     /// Appends the lowercase form of `bytes` using the SIMD ASCII kernel and the BMP case
     /// table. Returns `false` (with `output` in an unspecified state past its previous count)
-    /// when a scalar's mapping is not a single BMP scalar.
+    /// when a scalar's mapping is not a stable single BMP scalar.
     static func appendLowercased(_ bytes: UnsafeBufferPointer<UInt8>, to output: inout [UInt8]) -> Bool {
         typealias Property = UnicodeNormalization.Property
         let n = bytes.count
@@ -192,7 +192,7 @@ final class LowercaseNormalizer: ByteNormalizer {
             }
             let (value, width) = UTF8Cursor.decode(bytes, at: i)
             let properties = UnicodeNormalization.properties(of: value)
-            if properties & (Property.lowercaseComplex | Property.supplementary) != 0 { return false }
+            if properties & (Property.lowercaseComplex | Property.requiresRuntime) != 0 { return false }
             if properties & Property.lowercaseMapped != 0 {
                 UTF8Cursor.encode(UnicodeNormalization.lowercase(value), into: &output)
             } else {
@@ -207,12 +207,19 @@ final class LowercaseNormalizer: ByteNormalizer {
 /// A Unicode normalization form. Text that the quick check proves to be in the form already
 /// (all everyday text) is copied; Foundation normalizes the rest.
 protocol UnicodeFormNormalizer: ByteNormalizer {
-    static func apply(_ text: String) -> String
+    static var transform: StringTransform { get }
     /// ``UnicodeNormalization/Property`` flags of scalars that are not (certainly) in the form.
     static var unstable: UInt16 { get }
 }
 
 extension UnicodeFormNormalizer {
+    static func apply(_ text: String) -> String {
+        // NSString's precomposed/decomposed properties use a different implementation
+        // with known conformance failures (including Hangul composition). These standard
+        // ICU transforms are available through Foundation's public API on every target.
+        text.applyingTransform(transform, reverse: false)!
+    }
+
     func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
         UnicodeNormalization.isNormalized(bytes, mask: Self.unstable)
     }
@@ -229,25 +236,25 @@ extension UnicodeFormNormalizer {
 final class NFDNormalizer: UnicodeFormNormalizer {
     required init(config: Config) {}
     static let unstable = UnicodeNormalization.Property.notNFD
-    static func apply(_ text: String) -> String { text.decomposedStringWithCanonicalMapping }
+    static let transform = StringTransform("NFD")
 }
 
 final class NFCNormalizer: UnicodeFormNormalizer {
     required init(config: Config) {}
     static let unstable = UnicodeNormalization.Property.notNFC
-    static func apply(_ text: String) -> String { text.precomposedStringWithCanonicalMapping }
+    static let transform = StringTransform("NFC")
 }
 
 final class NFKDNormalizer: UnicodeFormNormalizer {
     required init(config: Config) {}
     static let unstable = UnicodeNormalization.Property.notNFKD
-    static func apply(_ text: String) -> String { text.decomposedStringWithCompatibilityMapping }
+    static let transform = StringTransform("NFKD")
 }
 
 final class NFKCNormalizer: UnicodeFormNormalizer {
     required init(config: Config) {}
     static let unstable = UnicodeNormalization.Property.notNFKC
-    static func apply(_ text: String) -> String { text.precomposedStringWithCompatibilityMapping }
+    static let transform = StringTransform("NFKC")
 }
 
 final class BertNormalizer: ByteNormalizer {
@@ -323,7 +330,7 @@ final class BertNormalizer: ByteNormalizer {
     /// Table-driven form of ``normalizeWithFoundation(_:into:scratch:)`` for a non-ASCII run:
     /// canonical decomposition, `Mn` removal and simple lowercase mapping per scalar. Returns
     /// `false` (with `output` in an unspecified state past its previous count) when a scalar
-    /// is outside the tables: a non-trivial supplementary-plane scalar, a non-`Mn` scalar
+    /// is outside the stable tables: a version-dependent or supplementary scalar, a non-`Mn` scalar
     /// with a combining class (canonical reordering could interleave it with marks) or a
     /// multi-scalar lowercase mapping.
     private func appendNormalizedBMP(_ bytes: UnsafeBufferPointer<UInt8>, to output: inout [UInt8]) -> Bool {
@@ -333,7 +340,7 @@ final class BertNormalizer: ByteNormalizer {
             let (value, width) = UTF8Cursor.decode(bytes, at: i)
             i += width
             let properties = UnicodeNormalization.properties(of: value)
-            if properties & Property.supplementary != 0 { return false }
+            if properties & Property.requiresRuntime != 0 { return false }
             if shouldCleanText {
                 if value == 0xFFFD || Self.isControl(value) { continue }
                 if Self.isWhitespace(value) {
@@ -365,6 +372,7 @@ final class BertNormalizer: ByteNormalizer {
     @inline(__always)
     private func appendStrippedLowercased(_ value: UInt32, _ properties: UInt16, to output: inout [UInt8]) -> Bool {
         typealias Property = UnicodeNormalization.Property
+        if properties & Property.requiresRuntime != 0 { return false }
         if shouldStripAccents {
             if properties & Property.nonspacingMark != 0 { return true }
             if properties & Property.combiningClassMask != 0 { return false }
@@ -380,7 +388,7 @@ final class BertNormalizer: ByteNormalizer {
 
     /// Reference implementation for runs the tables do not cover: Foundation NFD, mark
     /// removal and `String.lowercased()`.
-    private func normalizeWithFoundation(
+    func normalizeWithFoundation(
         _ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers
     ) {
         var run = scratch.take()
@@ -446,7 +454,7 @@ final class BertNormalizer: ByteNormalizer {
             output.append(contentsOf: bytes)
             return
         }
-        var decomposed = String(decoding: bytes, as: UTF8.self).decomposedStringWithCanonicalMapping
+        var decomposed = NFDNormalizer.apply(String(decoding: bytes, as: UTF8.self))
         decomposed.withUTF8 { decomposed in
             output.reserveCapacity(output.count + decomposed.count)
             var i = 0

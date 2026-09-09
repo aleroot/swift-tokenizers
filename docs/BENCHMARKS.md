@@ -149,7 +149,7 @@ Stage breakdown for the two interesting cases:
 | Build packed vocabulary | (in parse) | 6.5 ms |
 | Build double-array trie | — | 20.0 ms (785,408 units, 9.2 MB) |
 | Build `Precompiled` charsmap normalizer | — | 0.3 ms |
-| Expand generated Unicode tables (first access) | 0.05 ms | 0.05 ms |
+| Expand generated Unicode tables (historical implementation) | 0.05 ms | 0.05 ms |
 | **Total `AutoTokenizer.load`** | **25.9 ms** | **49.9 ms** |
 
 ## Memory footprint
@@ -262,7 +262,7 @@ hand-written over UTF-8 with NEON lane masks instead of being expressed as regul
   bytes to symbol ids through a 256-entry table — no `String` is ever built.
 * **Regex-free pre-tokenization.** The GPT-2, Llama-3/cl100k, Qwen-2, Qwen-3.5, o200k
   (GPT-4o / gpt-oss / Muse) and Falcon-H1 split patterns are implemented as hand-written
-  linear scanners over UTF-8 with a precomputed Unicode classification table (including the
+  linear scanners over UTF-8 with an immutable runtime-derived classification cache (including the
   o200k case-aware `[Lu Lt Lm Lo M]*[Ll Lm Lo M]+` alternation). `Punctuation`, literal
   `Split` and `[0-9]` stages are byte scanners too. All are fuzz-tested against
   `NSRegularExpression` for exact equivalence; unknown patterns fall back to
@@ -275,16 +275,20 @@ hand-written over UTF-8 with NEON lane masks instead of being expressed as regul
   Pre-tokenizers classify a whole chunk at once and then visit only the lanes where the class
   changes; the added-token splitter jumps to token first bytes with `memchr` and backs up over
   the preceding whitespace run.
-* **Exact normalization without Foundation.** Generated BMP tables hold the canonical combining
+* **Normalization fast paths.** Generated BMP tables hold the canonical combining
   class, NFC / NFD / NFKC / NFKD quick-check status, canonical decompositions (Hangul computed
   algorithmically) and simple lowercase mappings, plus the sparse ranges of non-trivial
   supplementary scalars. The Unicode-form normalizers therefore *prove* text is already
   normalized (all everyday input) and copy it, `BertNormalizer` strips accents and lowercases
   BMP runs scalar by scalar, and SentencePiece `Precompiled` charsmaps copy control-free ASCII
   runs verbatim and map non-ASCII runs cluster by cluster. Only scalars outside the tables —
-  supplementary-plane marks, one multi-scalar lowercase mapping — fall back to Foundation.
-  A test derives every table from the running toolchain, brute-force checks the NFC `Maybe`
-  set by composition, and fails if Unicode data ever drifts.
+  supplementary-plane marks, version-dependent characters, multi-scalar lowercase mappings —
+  fall back to Foundation's public ICU transforms and the Swift standard library. A small
+  compatibility table derived from Unicode 14–17 makes normalization conservative for scalars
+  whose properties changed. Classification uses the runtime directly when building its caches.
+  Tests check every BMP scalar and every
+  non-trivial supplementary scalar against the runtime without assuming that all OS versions
+  ship identical Unicode data. See [Unicode compatibility](UNICODE.md) for regeneration.
 * **Zero-allocation hot path.** Added tokens are found with a double-array trie (and `memchr`
   when they share a first byte), sections and pieces are byte ranges, model encoders and their
   working state (Viterbi lattice, merge buffers, WordPiece scratch) are pooled with the

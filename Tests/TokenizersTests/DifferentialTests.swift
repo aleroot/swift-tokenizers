@@ -61,10 +61,8 @@ struct DifferentialTests {
         model.replacingOccurrences(of: "/", with: "__")
     }
 
-    static func loadHF(_ model: String) throws -> [HFRecord]? {
-        guard let url = Bundle.module.url(forResource: "hf__" + resourceName(model), withExtension: "json") else {
-            return nil
-        }
+    static func loadHF(_ model: String) throws -> [HFRecord] {
+        let url = try #require(Bundle.module.url(forResource: "hf__" + resourceName(model), withExtension: "json"))
         return try JSONDecoder().decode([HFRecord].self, from: Data(contentsOf: url))
     }
 
@@ -79,10 +77,7 @@ struct DifferentialTests {
 
     @Test(arguments: models)
     func matchesHuggingFace(model: String) async throws {
-        guard let records = try Self.loadHF(model) else {
-            // No HF golden for this model (transformers cannot load it); covered by the upstream test.
-            return
-        }
+        let records = try Self.loadHF(model)
         // These Python 4.57 goldens include class reconstruction (notably Llama's BOS
         // override). Exercise the equivalent configuration factory here; folder-loading
         // policy is covered separately by TokenizerRegressionTests and TokenizerTests.
@@ -139,7 +134,7 @@ struct DifferentialTests {
         let surfacesByText = Dictionary(
             uniqueKeysWithValues: surfaceRecords.map { (BinaryDistinctString($0.text), $0.tokens) })
         var hfByText: [BinaryDistinctString: HFRecord] = [:]
-        for record in hf ?? [] { hfByText[BinaryDistinctString(record.text)] = record }
+        for record in hf { hfByText[BinaryDistinctString(record.text)] = record }
         #expect(upstream.count > 250)
 
         var regressions: [String] = []

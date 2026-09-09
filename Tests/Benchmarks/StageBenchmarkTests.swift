@@ -39,10 +39,11 @@ struct StageBenchmarkTests {
             "bpe (cache)",
             benchmarkMeasure(label: "bpe over pieces (cached)", iterations: 20) {
                 let encoder = model.makeEncoder()
+                encoder.begin()
+                defer { encoder.finish() }
                 var ids: [Int] = []
                 ids.reserveCapacity(text.utf8.count / 3)
                 for piece in pieces { encoder.encode(piece: piece, byteLevel: true, into: &ids) }
-                encoder.finish()
             })
 
         report(
@@ -50,12 +51,13 @@ struct StageBenchmarkTests {
             benchmarkMeasure(label: "bpe over pieces (no cache)", iterations: 20) {
                 // Hold the cache lock so the encoder cannot acquire it.
                 model.cache.lock.lock()
+                defer { model.cache.lock.unlock() }
                 let encoder = model.makeEncoder()
+                encoder.begin()
+                defer { encoder.finish() }
                 var ids: [Int] = []
                 ids.reserveCapacity(text.utf8.count / 3)
                 for piece in pieces { encoder.encode(piece: piece, byteLevel: true, into: &ids) }
-                encoder.finish()
-                model.cache.lock.unlock()
             })
 
         if let splitter = Mirror(reflecting: tokenizer).descendant("splitter") as? AddedTokenSplitter {

@@ -379,10 +379,10 @@ final class WordpieceTokenizer: Sendable {
             longest = max(longest, vocabulary.byteCount(of: id))
             vocabulary.withBytes(of: id) { token in
                 guard !token.isEmpty else { return }
+                // Continuation tokens can also match literally at the start of a word.
+                initialStarts.insert(UTF8Cursor.decode(token, at: 0).value)
                 if !prefixBytes.isEmpty, token.count > prefixBytes.count, token.starts(with: prefixBytes) {
                     continuationStarts.insert(UTF8Cursor.decode(token, at: prefixBytes.count).value)
-                } else {
-                    initialStarts.insert(UTF8Cursor.decode(token, at: 0).value)
                 }
             }
         }

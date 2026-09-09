@@ -100,10 +100,10 @@ struct UnicodeNormalizationTests {
         return derived
     }
 
-    @Test("Generated tables match the normalization data of this toolchain")
+    @Test("Stable tables and conservative fallbacks cover this runtime's Unicode data")
     func tablesMatchToolchain() throws {
         let derived = Self.derive()
-        let runs = UnicodeNormalization.encode(derived.bmp)
+        let runs = Self.encodeBMPRuns(derived.bmp)
 
         if ProcessInfo.processInfo.environment["REGENERATE_UNICODE_TABLES"] == "1" {
             try Self.verifyMaybeSetByComposition(derived.bmp)
@@ -119,26 +119,23 @@ struct UnicodeNormalizationTests {
             source += Self.array(
                 "lowercaseIndex", derived.lowercaseIndex,
                 comment: "\(derived.lowercaseIndex.count) simple lowercase mappings: scalar << 16 | lowercase")
-            source += Self.array(
-                "supplementaryRanges", derived.supplementaryRanges,
-                comment: "\(derived.supplementaryRanges.count / 2) non-trivial supplementary-plane ranges: [start, end)"
-            )
             source += "}\n"
             try source.write(to: Self.generatedFile, atomically: true, encoding: .utf8)
         }
 
-        let hint = "run `REGENERATE_UNICODE_TABLES=1 swift test --filter UnicodeNormalizationTests`"
-        #expect(UnicodeNormalization.runs == runs, "BMP property runs differ: \(hint)")
-        #expect(
-            UnicodeNormalization.decompositionIndex == derived.decompositionIndex,
-            "decomposition index differs: \(hint)")
-        #expect(UnicodeNormalization.decompositions == derived.decompositions, "decompositions differ: \(hint)")
-        #expect(UnicodeNormalization.lowercaseIndex == derived.lowercaseIndex, "lowercase mappings differ: \(hint)")
-        #expect(
-            UnicodeNormalization.supplementaryRanges == derived.supplementaryRanges,
-            "supplementary ranges differ: \(hint)"
-        )
-        #expect(UnicodeNormalization.bmp.elementsEqual(derived.bmp))
+        let mismatch = derived.bmp.indices.first {
+            let actual = UnicodeNormalization.bmp[$0]
+            return actual != UnicodeNormalization.Property.requiresRuntime && actual != derived.bmp[$0]
+        }
+        #expect(mismatch == nil, "stable BMP properties differ at U+\(mismatch.map { String($0, radix: 16) } ?? "-")")
+        var missing: UInt32?
+        for index in stride(from: 0, to: derived.supplementaryRanges.count, by: 2) {
+            for value in derived.supplementaryRanges[index]..<derived.supplementaryRanges[index + 1] {
+                if !UnicodeNormalization.isSupplementaryNontrivial(value) { missing = value; break }
+            }
+            if missing != nil { break }
+        }
+        #expect(missing == nil, "supplementary fallback missing U+\(missing.map { String($0, radix: 16) } ?? "-")")
     }
 
     /// Brute-force check of the derived `Maybe` set: no scalar outside `nfcUnstable` composes
@@ -171,6 +168,13 @@ struct UnicodeNormalizationTests {
         }
     }
 
+    private static func encodeBMPRuns(_ table: [UInt16]) -> [UInt32] {
+        table.indices.compactMap { index in
+            guard index == 0 || table[index] != table[index - 1] else { return nil }
+            return UInt32(index) << 16 | UInt32(table[index])
+        }
+    }
+
     static func array(_ name: String, _ values: [UInt32], comment: String) -> String {
         var source = "    /// \(comment).\n    static let \(name): [UInt32] = [\n"
         for chunk in stride(from: 0, to: values.count, by: 8) {
@@ -181,6 +185,31 @@ struct UnicodeNormalizationTests {
     }
 
     // MARK: - Behaviour against Foundation
+
+    @Test("Paged lowercase mapping covers every BMP value, including identity pages")
+    func pagedLowercase() {
+        var expected = Array(UInt32(0)..<0x10000)
+        for entry in UnicodeNormalization.lowercaseIndex {
+            expected[Int(entry >> 16)] = entry & 0xFFFF
+        }
+        let mismatch = expected.indices.first { UnicodeNormalization.lowercase(UInt32($0)) != expected[$0] }
+        #expect(mismatch == nil, "lowercase differs at U+\(mismatch.map { String($0, radix: 16) } ?? "-")")
+    }
+
+    @Test("Supplementary composition letters cannot bypass normalization")
+    func supplementaryComposition() {
+        // Kirat Rai vowel signs are letters (Lm), with combining class zero.
+        // A marks-only fallback set incorrectly certifies their pairs as NFC.
+        for value: UInt32 in [0x16D63, 0x16D67] {
+            #expect(UnicodeNormalization.properties(of: value) & UnicodeNormalization.Property.requiresRuntime != 0)
+        }
+        for var text in ["\u{16D67}\u{16D67}", "\u{16D63}\u{16D67}"] {
+            #expect(
+                !text.withUTF8 { UnicodeNormalization.isNormalized($0, mask: UnicodeNormalization.Property.notNFC) })
+            let expected = text.applyingTransform(StringTransform("NFC"), reverse: false)!
+            #expect(NFCNormalizer(config: [:]).normalize(text: text).utf8.elementsEqual(expected.utf8))
+        }
+    }
 
     static let sampleTexts = [
         "plain ascii", "café résumé naïve", "e\u{301}le\u{300}ve", "Ǖ ǖ ḉ ự", "İstanbul ǅ ﬁ Straße",
@@ -202,7 +231,10 @@ struct UnicodeNormalizationTests {
                 var copy = text
                 let claimed = copy.withUTF8 { UnicodeNormalization.isNormalized($0, mask: mask) }
                 // A `true` must be exact; a `false` may be a `Maybe`.
-                if claimed { #expect(normalize(text) == text, "\(text.debugDescription) claimed normalized") }
+                if claimed {
+                    #expect(
+                        normalize(text).utf8.elementsEqual(text.utf8), "\(text.debugDescription) claimed normalized")
+                }
             }
         }
         // Everyday NFC text (precomposed Latin, Thai, Devanagari, Hangul syllables, emoji) is
@@ -233,6 +265,33 @@ struct UnicodeNormalizationTests {
             }
         }
         #expect(UnicodeNormalization.properties(of: 0x1F600) == 0)
-        #expect(UnicodeNormalization.properties(of: 0x1D165) & P.supplementary != 0)
+        #expect(UnicodeNormalization.properties(of: 0x1D165) & P.requiresRuntime != 0)
+    }
+
+    @Test("Version-dependent scalars take exact runtime normalization and case paths")
+    func runtimeDependentScalars() throws {
+        let lowercase = LowercaseNormalizer(config: [:])
+        let bert = BertNormalizer(config: ["lowercase": true, "strip_accents": true])
+        let forms: [(any Normalizer, (String) -> String)] = [
+            (NFCNormalizer(config: [:]), { $0.precomposedStringWithCanonicalMapping }),
+            (NFDNormalizer(config: [:]), { $0.decomposedStringWithCanonicalMapping }),
+            (NFKCNormalizer(config: [:]), { $0.precomposedStringWithCompatibilityMapping }),
+            (NFKDNormalizer(config: [:]), { $0.decomposedStringWithCompatibilityMapping }),
+        ]
+        for index in stride(from: 0, to: UnicodeCompatibility.bmpRanges.count, by: 2) {
+            for value in UnicodeCompatibility.bmpRanges[index]..<UnicodeCompatibility.bmpRanges[index + 1] {
+                #expect(UnicodeNormalization.properties(of: value) == UnicodeNormalization.Property.requiresRuntime)
+                // U+0130 forces the complex case path; the result of the preceding scalar
+                // must be the same whether the fast path succeeds or rolls back.
+                for text in [Self.string(value), "A" + Self.string(value) + "\u{301}", Self.string(value) + "İ"] {
+                    #expect(lowercase.normalize(text: text).utf8.elementsEqual(text.lowercased().utf8))
+                    let expected = BertNormalizer.stripAccents(text).lowercased()
+                    #expect(bert.normalize(text: text).utf8.elementsEqual(expected.utf8))
+                    for (normalizer, reference) in forms {
+                        #expect(normalizer.normalize(text: text).utf8.elementsEqual(reference(text).utf8))
+                    }
+                }
+            }
+        }
     }
 }
