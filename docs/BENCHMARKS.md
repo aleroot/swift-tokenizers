@@ -9,8 +9,8 @@ also use an M2. All figures are measurements, not projections.
 |---|---|
 | Machine | Apple M4 Pro, 24 GB, macOS 26.6.2 |
 | Toolchain | Apple Swift 6.3.3, `-c release`, Swift 6 language mode |
-| Concurrency | single-threaded everywhere except the "Concurrent encoding" section; `RAYON_NUM_THREADS=1` for the Rust cores |
-| Reference builds | Hugging Face `tokenizers` 0.22.2, `transformers` 4.57.6 (CPython), `tiktoken` 0.14.0, swift-transformers @ `c21fdcd` |
+| Concurrency | single-threaded everywhere except the "SentencePiece" and "Concurrent encoding" sections; `RAYON_NUM_THREADS=1` for the Rust cores |
+| Reference builds | Hugging Face `tokenizers` 0.22.2, `transformers` 4.57.6 (CPython), `tiktoken` 0.14.0, `google/sentencepiece` @ master (C++, CMake Release), swift-transformers @ `c21fdcd` |
 | Correctness first | every swift-tokenizers result below was compared token-for-token with Hugging Face *before* it was timed — 0 mismatches (see [Correctness](#correctness-of-the-measured-outputs)) |
 | Units | `MB/s` is MiB/s (1,048,576 bytes) except in the end-to-end table, which is the harness's decimal MB/s |
 
@@ -29,6 +29,8 @@ tables quote a single representative run.
 - [Memory footprint](#memory-footprint)
 - [Embedding models and rerankers](#embedding-models-and-rerankers)
 - [End to end through mlx-swift-lm](#end-to-end-through-mlx-swift-lm)
+- [SentencePiece](#sentencepiece)
+- [Concurrent encoding](#concurrent-encoding)
 - [Where the time goes](#where-the-time-goes)
 - [Why it is fast](#why-it-is-fast)
 - [Reproducing these numbers](#reproducing-these-numbers)
@@ -352,6 +354,86 @@ mixed prose corpus, M4 Pro):
 | 4 | n/a | 339 MB/s |
 | 8 | 26.5 MB/s | 382 MB/s |
 
+## SentencePiece
+
+`google/sentencepiece` publishes [its own benchmark](https://github.com/google/sentencepiece/blob/master/doc/performance_benchmark.md):
+FLORES-200 parallel sentences in English, Chinese, Japanese and Thai, 1,012 per language,
+replicated 15 times to 11.29 MB / 60,720 lines, fed as one batch. This section reproduces that
+corpus byte for byte (11,772,975 bytes of text) and runs it against the C++ engine itself rather
+than its Python wrapper, so both sides measure tokenization instead of object conversion.
+
+* **SentencePiece**: `libsentencepiece.a` built from master, `RunBatch` over its own `ThreadPool`,
+  ids materialised into `std::vector<std::vector<int>>`, loading `t5-base/spiece.model` and
+  `gemma-3-4b/tokenizer.model`.
+* **swift-tokenizers**: the same corpus, one `[Int]` per line, the same dynamic load balancing
+  across a fixed worker count, loading the Hugging Face `tokenizer.json` of the same two models.
+
+Both take the best of five runs after a warm-up.
+
+### Correctness
+
+Checked before timing, on every one of the 4,048 distinct sentences, against both references:
+
+| Model | vs SentencePiece C++ | vs Hugging Face `tokenizers` |
+|---|---:|---:|
+| T5 (Unigram, 32k) | **4048 / 4048 exact** | 4048 / 4048 exact |
+| Gemma 3 (BPE, 262k) | **4048 / 4048 exact** | 4048 / 4048 exact |
+
+Identical ids from a `tokenizer.json` and from the original `.model` protobuf, including Thai and
+Japanese without spaces, byte fallback and the SentencePiece charsmap normalizer.
+
+### Throughput
+
+Encoding throughput in MB/s, higher is better:
+
+| Threads | 1 | 2 | 4 | 8 | 14 |
+|---|---:|---:|---:|---:|---:|
+| **T5 Unigram** SentencePiece C++ | 68.5 | 129.2 | 243.7 | **396.1** | **588.2** |
+| **T5 Unigram** swift-tokenizers | **108.1** | **170.6** | **290.6** | 300.6 | 156.7 |
+| **Gemma 3 BPE** SentencePiece C++ | 24.1 | 47.2 | 89.3 | 162.7 | **228.7** |
+| **Gemma 3 BPE** swift-tokenizers | **39.3** | **65.8** | **112.0** | **168.6** | 175.2 |
+
+Single-threaded, swift-tokenizers is **1.58× SentencePiece on T5 and 1.63× on Gemma 3**, and it
+keeps the lead through four threads. Beyond that a shared tokenizer stops scaling while
+SentencePiece keeps going: the machine has 10 performance and 4 efficiency cores.
+
+For scale, `sentencepiece`'s published table for the same corpus reports 27.41 MB/s (T5) and
+7.44 MB/s (Gemma 3) single-threaded for itself, and 3.78 / 3.66 MB/s for Hugging Face Fast, on a
+24-core machine through the Python wrapper.
+
+### What limits the shared instance
+
+Giving each worker its own tokenizer instance, same corpus, same harness (`--isolate`):
+
+| Threads | 1 | 2 | 4 | 8 | 14 |
+|---|---:|---:|---:|---:|---:|
+| T5, one instance per worker | 107.3 | 202.5 | 385.2 | **531.8** | **723.0** |
+| T5, one shared instance | 108.1 | 170.6 | 290.6 | 300.6 | 156.7 |
+| T5, SentencePiece C++ | 68.5 | 129.2 | 243.7 | 396.1 | 588.2 |
+
+The algorithms scale: with nothing shared they stay ahead of the C++ implementation at every
+thread count. What does not scale is the reference counting on the objects a shared tokenizer
+hands its threads. `sample` at 14 threads puts `swift_retain` / `swift_release` at the top of
+every stack, and the pattern is specific: loading a class or existential out of an `Array` on a
+hot path is what collapses (measured in isolation, a three-element stage array falls from ~50 to
+~1 million calls per second between 1 and 14 threads), while calling through a stored property,
+or through `Unmanaged` with `_withUnsafeGuaranteedRef`, keeps scaling. Removing those array loads
+from the pipeline is the next step; it needs the pre-tokenizers themselves to become the compiled
+steps, because an adapter object in between costs more per call than the retain it saves.
+
+### Load time
+
+| Model | swift-tokenizers (`tokenizer.json`) | SentencePiece (`.model`) |
+|---|---:|---:|
+| T5 (32k) | **7.6 ms** (1.4 MB JSON) | 15.5 ms (0.8 MB protobuf) |
+| Gemma 3 (262k) | 90 ms (33 MB JSON) | **27 ms** (4.7 MB protobuf) |
+
+Warm file cache, median of three loads after discarding the first.
+
+Gemma 3 is where the file format shows: 33 MB of JSON against 4.7 MB of protobuf. Reading the
+`.model` protobuf directly would close that gap and is the one input format the library does not
+yet accept.
+
 ## Concurrent encoding
 
 Aggregate `encode(text:)` throughput of one shared tokenizer called from N threads
@@ -360,17 +442,25 @@ embedding benchmark, native Swift strings, M4 Pro:
 
 | Threads | Qwen3 (BPE) | Llama-2 (SentencePiece BPE) | XLM-R (Unigram) | BERT (WordPiece) |
 |---:|---:|---:|---:|---:|
-| 1 | 145 MB/s | 131 MB/s | 134 MB/s | 186 MB/s |
-| 2 | 268 MB/s | 242 MB/s | 243 MB/s | 320 MB/s |
-| 4 | 429 MB/s | 389 MB/s | 407 MB/s | 503 MB/s |
-| 8 | 446 MB/s | 381 MB/s | 360 MB/s | 390 MB/s |
+| 1 | 143 MB/s | 129 MB/s | 129 MB/s | 176 MB/s |
+| 2 | 259 MB/s | 234 MB/s | 233 MB/s | 311 MB/s |
+| 4 | 427 MB/s | 382 MB/s | 392 MB/s | 472 MB/s |
+| 8 | 529 MB/s | 372 MB/s | 410 MB/s | 427 MB/s |
 
 Before the shared reference counts were removed from the per-word paths, eight threads reached
 143 MB/s on Qwen3 and 25 MB/s on XLM-R: each contended atomic on a shared object costs more than
-encoding a short query. The remaining gap to linear scaling is per-call ARC traffic on the
-tokenizer and model objects; eight independent processes reach 1040 MB/s aggregate on Qwen3.
-Every thread memoises: the first caller to reach the shared pretoken cache uses it, the others
-use a 0.4 MB table of their own that lives with their pooled scratch.
+encoding a short query.
+
+Scratch buffers, and with them each model's encoder and its pretoken cache, are owned per thread
+through a thread-specific key. An earlier version filed them in a free list striped by a hash of
+the thread handle; Darwin hands out thread handles as evenly spaced stack addresses, so hashing
+them collapsed 14 threads onto 4 stripes and a starved stripe rebuilt the encoder and its cache
+on nearly every call. Moving to real thread-local ownership is worth 8-18% at eight threads and
+nothing at all at one, which is the point: it removes contention rather than work.
+
+The remaining gap to linear scaling is per-call ARC traffic on the tokenizer, pipeline and model
+objects: see [SentencePiece](#sentencepiece), where private instances scale to 723 MB/s on the
+same workload that caps at 300 MB/s when one instance is shared.
 
 ## Where the time goes
 
@@ -562,3 +652,4 @@ compiled once against swift-tokenizers and once against swift-transformers and d
 | Embedding harness | 12 embedding/reranker models × 68 texts (queries, passages, long passages, multilingual, code, rerank pairs, edge cases) | 816/816 exact |
 | End-to-end harness | 6 mlx-community folders × 301 texts, `encode`/`decode` × special-token modes, chat templates with and without tools | exact |
 | Cold-corpus cross-check | 4.0 MB of unseen synthetic prose, token counts vs Hugging Face, 3 families | identical counts |
+| SentencePiece cross-check | T5 and Gemma 3, 4,048 FLORES-200 sentences in English, Chinese, Japanese and Thai, ids vs the C++ `.model` engine and vs Hugging Face | 4048/4048 exact, both models |

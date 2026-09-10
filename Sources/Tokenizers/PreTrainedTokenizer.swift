@@ -51,6 +51,8 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     private let pipeline: EncodePipeline
     private let scratchPool = EncodeScratchPool()
     private let fastModel: (any FastTokenizingModel)?
+    /// ``fastModel``'s identity, resolved once so the pooled-encoder check stays trivial.
+    private let fastModelIdentity: ObjectIdentifier?
     private let fastPostProcessor: (any FastPostProcessor)?
     /// Built on first decode: embedding and reranking apps never pay for it.
     private let byteLevelDecodeTable: Lazy<ByteLevelDecodeTable>?
@@ -117,7 +119,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         let model = try TokenizerModel.from(
             tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData, addedTokens: addedTokens, strict: strict)
         self.model = model
-        fastModel = model as? any FastTokenizingModel
+        let fastModel = model as? any FastTokenizingModel
+        self.fastModel = fastModel
+        fastModelIdentity = fastModel.map { ObjectIdentifier($0 as AnyObject) }
 
         // `fuse_unk` is a property of the WordPiece-style models; BPE and Unigram fuse
         // (or byte-fall-back) unknowns themselves.
@@ -248,7 +252,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             return tokenize(text: text).compactMap { model.convertTokenToId($0) }
         }
         return withScratch { scratch in
-            let encoder = scratch.encoder(for: fastModel)
+            let encoder = scratch.encoder(for: fastModel, identity: fastModelIdentity)
             encoder.begin()
             defer { encoder.finish() }
             return pipeline.encode(text, encoder: encoder, scratch: scratch)

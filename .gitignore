@@ -13,3 +13,4 @@ DerivedData/
 /.e2e-ref/
 /.bench/
 /Tools/
+/.spm-bench/
