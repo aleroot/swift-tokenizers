@@ -46,7 +46,18 @@ jobs:
       - name: Test optimized code
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          TOKENIZERS_PARITY_REPORT_DIR: ${{ runner.temp }}/tokenizers-parity
         run: swift test -c release --parallel -Xswiftc -warnings-as-errors
+
+      - name: Summarize reference parity
+        run: python3 scripts/parity_report.py "$RUNNER_TEMP/tokenizers-parity" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload reference parity report
+        uses: actions/upload-artifact@v4
+        with:
+          name: reference-parity-${{ matrix.os }}
+          path: ${{ runner.temp }}/tokenizers-parity/summary.json
+          if-no-files-found: error
 
       - name: Official Unicode normalization conformance
         env:
@@ -60,10 +71,10 @@ jobs:
           swift test -c release --skip-build --filter UnicodeConformanceTests
 
       - name: Thread sanitizer (concurrency suites)
-        run: swift test --sanitize=thread --filter "Concurrency|Differential|OptimizationRegression|UnicodeTablesTests|SendableTests"
+        run: swift test --sanitize=thread --filter "Concurrency|Differential|OptimizationRegression|UnicodeTablesTests|SendableTests|BPEMerge"
 
       - name: Address sanitizer (byte kernels and raw storage)
-        run: swift test --sanitize=address --filter "ByteKernels|OptimizationRegression|ConfigTests|TrieTests|UnicodeTablesTests|UnicodeNormalizationTests|CorrectnessAuditTests"
+        run: swift test --sanitize=address --filter "ByteKernels|OptimizationRegression|ConfigTests|TrieTests|UnicodeTablesTests|UnicodeNormalizationTests|CorrectnessAuditTests|JSONFuzz|BPEMerge"
 
   ios:
     name: Build (iOS)

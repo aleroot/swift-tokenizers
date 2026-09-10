@@ -507,7 +507,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
         }
     }
 
-    private struct Candidate: Comparable {
+    fileprivate struct Candidate: Comparable {
         let rank: UInt32
         let left: Int32
 
@@ -520,15 +520,45 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
     /// Priority-queue variant for long words (linked list + min-heap with lazy deletion).
     func mergeHeap(_ symbols: inout [Symbol], scratch: inout MergeScratch) {
         let n = symbols.count
-        var next = [Int32](repeating: -1, count: n)
-        var prev = [Int32](repeating: -1, count: n)
-        var alive = [Bool](repeating: true, count: n)
-        for i in 0..<n {
-            prev[i] = Int32(i - 1)
-            next[i] = i == n - 1 ? -1 : Int32(i + 1)
+        guard n >= 2 else { return }
+
+        // Move the buffers out while merging: copying them out would leave a second array
+        // owner in scratch and trigger copy-on-write allocations on every long word.
+        var next: [Int32] = []
+        var prev: [Int32] = []
+        var alive: [Bool] = []
+        var heap = MinHeap<Candidate>()
+        swap(&next, &scratch.next)
+        swap(&prev, &scratch.prev)
+        swap(&alive, &scratch.alive)
+        swap(&heap, &scratch.heap)
+        defer {
+            swap(&next, &scratch.next)
+            swap(&prev, &scratch.prev)
+            swap(&alive, &scratch.alive)
+            swap(&heap, &scratch.heap)
+        }
+        if next.count < n {
+            let additional = n - next.count
+            next.append(contentsOf: repeatElement(-1, count: additional))
+            prev.append(contentsOf: repeatElement(-1, count: additional))
+            alive.append(contentsOf: repeatElement(true, count: additional))
+        }
+        // Keep the initialized storage at its high-water mark and reset only the active
+        // prefix. Every link stays inside that prefix or terminates at -1.
+        next.withUnsafeMutableBufferPointer { next in
+            prev.withUnsafeMutableBufferPointer { prev in
+                alive.withUnsafeMutableBufferPointer { alive in
+                    for i in 0..<n {
+                        prev[i] = Int32(i - 1)
+                        next[i] = i == n - 1 ? -1 : Int32(i + 1)
+                        alive[i] = true
+                    }
+                }
+            }
         }
 
-        var heap = MinHeap<Candidate>()
+        // The previous merge drained the heap, including stale candidates.
         heap.reserveCapacity(n)
 
         func enqueue(_ left: Int) {
@@ -580,6 +610,11 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
     /// Reusable per-call working state.
     struct MergeScratch {
         var ranks: [UInt32] = []
+        // Allocated only by the long-word path and exclusively owned by this encoder.
+        fileprivate var next: [Int32] = []
+        fileprivate var prev: [Int32] = []
+        fileprivate var alive: [Bool] = []
+        fileprivate var heap = MinHeap<Candidate>()
     }
 
     /// Stateful encoder holding scratch buffers, pooled across `encode` calls. Each call tries

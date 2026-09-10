@@ -583,6 +583,9 @@ struct JSONConfigParser {
                 pos += 1
                 skipWhitespace()
             }
+            // Unlike parseValue(), this fast path calls parseNumber() directly.
+            // A truncated row can end after the token, comma, or whitespace.
+            guard pos < bytes.count else { throw JSONConfigError.unexpectedEnd }
             let scoreConfig = try parseNumber()
             guard let score = scoreConfig.double(), score.isFinite else { throw PackedShapeError.mismatch }
             scores.append(score)

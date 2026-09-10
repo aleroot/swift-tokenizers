@@ -86,31 +86,44 @@ struct DifferentialTests {
             tokenizerConfig: #require(configuration.tokenizerConfig), tokenizerData: configuration.tokenizerData)
         #expect(records.count > 250)
 
+        var differences = ["ids": 0, "idsNoSpecial": 0, "decoded": 0, "decodedSkipSpecial": 0]
         var mismatches: [String] = []
         for record in records {
             let ids = tokenizer.encode(text: record.text)
             if ids != record.ids {
                 mismatches.append("encode(\(record.text.debugDescription)): got \(ids) expected \(record.ids)")
-                continue
+                differences["ids", default: 0] += 1
             }
             let noSpecial = tokenizer.encode(text: record.text, addSpecialTokens: false)
             if noSpecial != record.idsNoSpecial {
+                differences["idsNoSpecial", default: 0] += 1
                 mismatches.append(
                     "encode(noSpecial)(\(record.text.debugDescription)): got \(noSpecial) expected \(record.idsNoSpecial)"
                 )
             }
             let decoded = tokenizer.decode(tokens: ids)
             if !decoded.utf8.elementsEqual(record.decoded.utf8) {
+                differences["decoded", default: 0] += 1
                 mismatches.append(
                     "decode(\(record.text.debugDescription)): got \(decoded.debugDescription) expected \(record.decoded.debugDescription)"
                 )
             }
             let decodedSkip = tokenizer.decode(tokens: ids, skipSpecialTokens: true)
             if !decodedSkip.utf8.elementsEqual(record.decodedSkipSpecial.utf8) {
+                differences["decodedSkipSpecial", default: 0] += 1
                 mismatches.append(
                     "decode(skip)(\(record.text.debugDescription)): got \(decodedSkip.debugDescription) expected \(record.decodedSkipSpecial.debugDescription)"
                 )
             }
+        }
+        // One atomic file per parameterized test: parallel test processes never share a
+        // mutable report. CI aggregates only after the optimized test run succeeds.
+        if let directory = ProcessInfo.processInfo.environment["TOKENIZERS_PARITY_REPORT_DIR"] {
+            let folder = URL(fileURLWithPath: directory, isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let report: [String: Any] = ["model": model, "cases": records.count, "differences": differences]
+            try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
+                .write(to: folder.appendingPathComponent(Self.resourceName(model) + ".json"), options: .atomic)
         }
         if !mismatches.isEmpty {
             let summary = Array(mismatches.prefix(10)).joined(separator: "\n")
