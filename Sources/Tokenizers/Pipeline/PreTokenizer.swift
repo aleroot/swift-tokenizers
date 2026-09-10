@@ -113,6 +113,8 @@ extension ByteRewriter {
 ///
 /// A subclass names its ``Shape`` in its own initializer and overrides the one operation that
 /// shape runs; the runner never calls the other.
+/// `@unchecked Sendable` is required by the non-final class hierarchy. Subclasses must keep
+/// their stored state immutable and sendable, and write only to caller-owned output buffers.
 class PreTokenizationStage: @unchecked Sendable {
     /// The operation the runner performs, fixed by the subclass that sets it.
     enum Shape: UInt8 {
@@ -145,6 +147,7 @@ class PreTokenizationStage: @unchecked Sendable {
 }
 
 /// Compiles a ``ByteSplitter`` into a stage.
+/// Restates the unchecked superclass conformance; `Splitter` is sendable and held by `let`.
 final class SplitStage<Splitter: ByteSplitter>: PreTokenizationStage, @unchecked Sendable {
     private let splitter: Splitter
 
@@ -163,6 +166,7 @@ final class SplitStage<Splitter: ByteSplitter>: PreTokenizationStage, @unchecked
 }
 
 /// Compiles a ``ByteRewriter`` into a stage.
+/// Restates the unchecked superclass conformance; `Rewriter` is sendable and held by `let`.
 final class RewriteStage<Rewriter: ByteRewriter>: PreTokenizationStage, @unchecked Sendable {
     private let rewriter: Rewriter
 
@@ -183,6 +187,7 @@ final class RewriteStage<Rewriter: ByteRewriter>: PreTokenizationStage, @uncheck
 
 /// The terminal `ByteLevel` marker: the pieces that follow it are encoded through the byte-level
 /// alphabet.
+/// Restates the unchecked superclass conformance and adds no stored state.
 final class ByteLevelStage: PreTokenizationStage, @unchecked Sendable {
     init() { super.init(shape: .byteLevel) }
 }

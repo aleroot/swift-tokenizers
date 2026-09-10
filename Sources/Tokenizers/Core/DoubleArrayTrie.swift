@@ -11,6 +11,8 @@
 
 import Foundation
 
+/// `@unchecked Sendable`: the builder transfers exclusive ownership of the units at init.
+/// No mutable view escapes, and the allocation remains read-only until deinit.
 final class DoubleArrayTrie: @unchecked Sendable {
     struct Unit {
         var base: Int32
@@ -22,7 +24,7 @@ final class DoubleArrayTrie: @unchecked Sendable {
 
     /// Immutable after `init`; manually managed so hot loops perform no retain/release or
     /// copy-on-write checks.
-    let units: UnsafeMutablePointer<Unit>
+    private let units: UnsafePointer<Unit>
     /// Number of allocated units, always a multiple of 256 so `base ^ c` stays in range.
     let count: Int
     /// Number of distinct keys that carry a value.
@@ -44,7 +46,7 @@ final class DoubleArrayTrie: @unchecked Sendable {
     init(utf8: UnsafeBufferPointer<UInt8>, offsets: UnsafeBufferPointer<UInt32>, count keyTotal: Int) {
         var builder = Builder(utf8: utf8, offsets: offsets, keyTotal: keyTotal)
         builder.build()
-        units = builder.finish()
+        units = UnsafePointer(builder.finish())
         count = builder.capacity
         keyCount = builder.keyCount
     }

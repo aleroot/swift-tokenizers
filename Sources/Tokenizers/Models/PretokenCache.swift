@@ -5,6 +5,9 @@
 
 import Foundation
 
+/// `@unchecked Sendable`: shared access requires holding `lock` for the entire encode call.
+/// `PretokenCacheLease` supplies that ownership or an encoder-private fallback. Lookup and
+/// insert deliberately do not lock per word; callers must never use a shared table unleased.
 final class PretokenCache: @unchecked Sendable {
     let lock = UnfairLock()
 
@@ -68,6 +71,7 @@ final class PretokenCache: @unchecked Sendable {
     }
 
     /// Looks up `bytes`; on a hit appends the cached ids to `ids` and returns `true`.
+    /// - Precondition: the caller holds `lock` or exclusively owns this cache.
     @inline(__always)
     func lookup(_ bytes: UnsafeBufferPointer<UInt8>, byteLevel: Bool, into ids: inout [Int]) -> Bool {
         let n = bytes.count
@@ -91,6 +95,7 @@ final class PretokenCache: @unchecked Sendable {
     }
 
     /// Records the ids for `bytes`.
+    /// - Precondition: the caller holds `lock` or exclusively owns this cache.
     func insert(_ bytes: UnsafeBufferPointer<UInt8>, byteLevel: Bool, ids: ArraySlice<Int>) {
         let n = bytes.count
         guard n <= Self.maxKeyLength, ids.count <= Self.maxIdsCount, !ids.isEmpty, let base = bytes.baseAddress else {
@@ -143,7 +148,8 @@ final class PretokenCache: @unchecked Sendable {
 /// memoise without ever blocking on each other. After a failed attempt the shared cache is left
 /// alone for a number of calls: a contended `tryLock` still bounces its cache line between cores.
 struct PretokenCacheLease {
-    /// The table to use for the current call.
+    /// The table to use between `begin` and `finish` on the same thread; never let it escape
+    /// the call or copy an active lease. Encoders confine their leases to the calling thread.
     private(set) var cache: PretokenCache?
     private var holdsShared = false
     private var backoff = 0

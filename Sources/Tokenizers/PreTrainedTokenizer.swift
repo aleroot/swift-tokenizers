@@ -17,9 +17,10 @@ let specialTokenAttributes: [String] = [
 
 /// A tokenizer assembled from Hugging Face `tokenizer.json` / `tokenizer_config.json` files.
 ///
-/// All state is immutable after initialization except the compiled chat-template cache,
-/// which is guarded by a lock; instances are therefore safe to share across threads and
-/// tasks (`@unchecked` only because a non-final class cannot be checked by the compiler).
+/// Stored properties are immutable and sendable. Shared caches synchronize internally;
+/// encode scratch is lent exclusively to synchronous calls by thread-local storage.
+/// `@unchecked` is required by the non-final class hierarchy. Subclasses must preserve these
+/// invariants; inherited sendability does not check any state they add.
 public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     class var decodesNormalizedAddedTokens: Bool { true }
 

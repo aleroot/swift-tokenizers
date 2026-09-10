@@ -112,6 +112,7 @@ func llamaPostProcessorConfig(tokenizerConfig: Config) throws -> Config {
 /// affects conversion from a slow SentencePiece model — so no Metaspace pre-tokenizer is
 /// injected. Both configuration construction and folder loading rebuild the post-processor as in
 /// `LlamaTokenizerFast.__init__` / `GemmaTokenizerFast.__init__`.
+/// Restates the unchecked superclass conformance; this final subclass adds no stored state.
 final class LlamaPreTrainedTokenizer: PreTrainedTokenizer, @unchecked Sendable {
     // Python Llama construction removes the serialized SentencePiece normalizer.
     // Preserve declared added-token spellings here; feeding the exported dummy prefix

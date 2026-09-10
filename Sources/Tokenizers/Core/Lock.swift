@@ -7,6 +7,8 @@ import Foundation
 /// Minimal unfair mutex. On Darwin this wraps `os_unfair_lock`; elsewhere it falls back
 /// to `NSLock`. Provides `tryLock` so hot paths can opportunistically use shared caches
 /// without ever blocking a concurrent caller.
+/// `@unchecked Sendable`: the allocated lock has a stable address until deinit; only the
+/// platform's synchronization primitives access it. Lock and unlock must run on one thread.
 final class UnfairLock: @unchecked Sendable {
     #if canImport(os)
         private let pointer: os_unfair_lock_t
@@ -41,7 +43,10 @@ final class UnfairLock: @unchecked Sendable {
 
 /// A value guarded by an ``UnfairLock``. Access is only possible through ``withLock(_:)``,
 /// which is what makes the wrapper safe to share across isolation domains.
-final class Locked<Value>: @unchecked Sendable {
+/// `Value` must itself be sendable: callers can retain the initializer argument or return
+/// a copy from `withLock`, and the lock cannot protect aliases used outside its scope.
+/// `@unchecked Sendable` is needed only for the mutable slot guarded by `lock`.
+final class Locked<Value: Sendable>: @unchecked Sendable {
     private var value: Value
     private let lock = UnfairLock()
 
@@ -59,7 +64,7 @@ final class Locked<Value>: @unchecked Sendable {
 
 /// A value computed on first access, safe to share across threads. The factory may run more
 /// than once under contention; the first result wins.
-final class Lazy<Value: Sendable>: @unchecked Sendable {
+final class Lazy<Value: Sendable>: Sendable {
     private let make: @Sendable () -> Value
     private let storage = Locked<Value?>(nil)
 

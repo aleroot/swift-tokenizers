@@ -60,7 +60,7 @@ jobs:
           swift test -c release --skip-build --filter UnicodeConformanceTests
 
       - name: Thread sanitizer (concurrency suites)
-        run: swift test --sanitize=thread --filter "Concurrency|Differential|OptimizationRegression|UnicodeTablesTests"
+        run: swift test --sanitize=thread --filter "Concurrency|Differential|OptimizationRegression|UnicodeTablesTests|SendableTests"
 
       - name: Address sanitizer (byte kernels and raw storage)
         run: swift test --sanitize=address --filter "ByteKernels|OptimizationRegression|ConfigTests|TrieTests|UnicodeTablesTests|UnicodeNormalizationTests|CorrectnessAuditTests"

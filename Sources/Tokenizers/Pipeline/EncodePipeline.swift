@@ -12,6 +12,8 @@ import Foundation
 /// single virtual call and no reference counting. A tokenizer is shared by every thread that
 /// encodes with it, and so are its stages: reading them out of an array per piece costs a
 /// contended atomic pair per stage, which is what stops the pipeline scaling past a few threads.
+/// `@unchecked Sendable`: the private borrowed table is initialized once and never mutated;
+/// `stages` strongly owns every entry through the runner's lifetime. Stages share no scratch.
 final class PreTokenizationRunner: @unchecked Sendable {
     /// The stages, with a non-final `byteLevel` marker compiled into a rewrite that
     /// materialises the alphabet form (the following stages then see plain text, as in
@@ -411,7 +413,7 @@ final class EncodeScratch {
 /// evenly spaced stack addresses: hashing them collapses many threads onto a few stripes, and
 /// a starved stripe reallocates the scratch (and with it the model's ``PieceEncoder``, its
 /// lattice or merge buffers and its pretoken cache) on nearly every call.
-final class EncodeScratchPool: @unchecked Sendable {
+final class EncodeScratchPool: Sendable {
     /// Per-thread storage for every pool in the process, so the library holds one
     /// thread-specific key however many tokenizers are alive.
     private static let store = ThreadScratchStore()
@@ -433,7 +435,9 @@ final class EncodeScratchPool: @unchecked Sendable {
 /// scratch caches a ``PieceEncoder`` built for one model and a thread may encode with several
 /// tokenizers. A cache is released when its thread exits, so buffers never outlive their user
 /// and the number of live scratch objects stays bounded by the number of encoding threads.
-private final class ThreadScratchStore: @unchecked Sendable {
+/// The only stored property is the immutable, sendable pthread key. The non-sendable cache
+/// lives in pthread TLS, is accessed synchronously, and is never shared between threads.
+private final class ThreadScratchStore: Sendable {
     /// How many tokenizers one thread can alternate between before evicting a scratch. Kept
     /// small because an entry holds a model's encoder, so a stale entry keeps that model alive
     /// until the thread encodes with enough other tokenizers to evict it, or exits.
@@ -455,13 +459,15 @@ private final class ThreadScratchStore: @unchecked Sendable {
         var key = pthread_key_t()
         // Darwin declares the destructor's argument non-optional, other platforms optional.
         #if canImport(Darwin)
-            pthread_key_create(&key) { Unmanaged<Cache>.fromOpaque($0).release() }
+            let result = pthread_key_create(&key) { Unmanaged<Cache>.fromOpaque($0).release() }
         #else
-            pthread_key_create(&key) { pointer in
+            let result = pthread_key_create(&key) { pointer in
                 guard let pointer else { return }
                 Unmanaged<Cache>.fromOpaque(pointer).release()
             }
         #endif
+        // Never interpret another TLS slot as a Cache if the process has exhausted its keys.
+        precondition(result == 0, "Unable to allocate tokenizer scratch TLS key")
         self.key = key
     }
 
@@ -504,8 +510,18 @@ private final class ThreadScratchStore: @unchecked Sendable {
             return Unmanaged<Cache>.fromOpaque(pointer).takeUnretainedValue()
         }
         guard creating else { return nil }
+        return makeCache()
+    }
+
+    /// Keep allocation and failure handling out of the inlined, warm scratch-recycling path.
+    @inline(never)
+    private func makeCache() -> Cache? {
         let cache = Cache()
-        pthread_setspecific(key, Unmanaged.passRetained(cache).toOpaque())
+        let retained = Unmanaged.passRetained(cache)
+        guard pthread_setspecific(key, retained.toOpaque()) == 0 else {
+            retained.release()
+            return nil
+        }
         return cache
     }
 }
