@@ -40,6 +40,24 @@ extension ByteNormalizer {
     }
 }
 
+/// Leaves text unchanged, for a tokenizer that declares no normalizer.
+///
+/// The pipeline holds its normalizer non-optionally so that the per-section check reads no
+/// optional existential, which on a shared tokenizer is a pair of reference-count updates every
+/// encoding thread contends on. A stateless struct costs nothing to carry.
+struct IdentityNormalizer: ByteNormalizer {
+    init() {}
+    init(config: Config) throws {}
+
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool { true }
+
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        output.append(contentsOf: bytes)
+    }
+
+    func normalize(text: String) -> String { text }
+}
+
 enum NormalizerType: String {
     case Sequence
     case Prepend

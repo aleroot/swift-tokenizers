@@ -240,7 +240,10 @@ final class ScratchBuffers {
 struct EncodePipeline: Sendable {
     /// Splits around added tokens matched on the raw text.
     let splitter: AddedTokenSplitter?
-    let normalizer: (any ByteNormalizer)?
+    /// Never `nil`: a tokenizer that declares none gets ``IdentityNormalizer``, which answers
+    /// `isIdentity` at once. Reading an optional existential per section costs a pair of
+    /// contended reference-count updates on a shared tokenizer.
+    let normalizer: any ByteNormalizer
     /// Splits around added tokens declared `normalized: true`, matched after normalization.
     let normalizedSplitter: AddedTokenSplitter?
     /// Never `nil`: a tokenizer with no pre-tokenizer gets a runner with no stages, which hands
@@ -256,7 +259,7 @@ struct EncodePipeline: Sendable {
         _ bytes: UnsafeBufferPointer<UInt8>, scratch: EncodeScratch,
         onToken: (Int) -> Void, onPiece: (UnsafeBufferPointer<UInt8>, Bool) -> Void
     ) {
-        if preTokenizer.needsOriginalStart, let normalizer, !normalizer.isIdentity(on: bytes) {
+        if preTokenizer.needsOriginalStart, !normalizer.isIdentity(on: bytes) {
             // Only `first` needs provenance in the IDs-only path. Prepare before
             // calling consumers so a failed optional trace cannot emit partial IDs.
             var sections: [(Int?, AlignedText, Bool)] = []
@@ -288,7 +291,7 @@ struct EncodePipeline: Sendable {
                 // `firstSection`: the text starts the input (`tokenizers` checks original offset 0).
                 let flags: PreTokenizerFlags = range.lowerBound == 0 ? .firstSection : []
                 let raw = UnsafeBufferPointer(rebasing: bytes[range])
-                if let normalizer, !normalizer.isIdentity(on: raw) {
+                if !normalizer.isIdentity(on: raw) {
                     scratch.normalized.removeAll(keepingCapacity: true)
                     normalizer.normalize(raw, into: &scratch.normalized, scratch: scratch.buffers)
                     scratch.normalized.withUnsafeBufferPointer { normalized in

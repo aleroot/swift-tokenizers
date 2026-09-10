@@ -140,7 +140,7 @@ extension EncodePipeline {
         for (range, token) in sections(source, splitter) {
             if let token { onToken(token, source.slice(range)); continue }
             var part = source.slice(range)
-            if let normalizer { part = try part.normalized(by: normalizer) }
+            part = try part.normalized(by: normalizer)
             for (subrange, token) in sections(part, normalizedSplitter) {
                 if let token { onToken(token, part.slice(subrange)); continue }
                 let flags: PreTokenizerFlags = part.sourceRange(subrange).lowerBound == 0 ? .firstSection : []

@@ -130,7 +130,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         let fusesUnknown = model.fuseUnknownTokens && !(model is BPETokenizer) && !(model is UnigramTokenizer)
         pipeline = EncodePipeline(
             splitter: AddedTokenSplitter(tokens: splitterTokens),
-            normalizer: normalizer,
+            normalizer: normalizer ?? IdentityNormalizer(),
             normalizedSplitter: AddedTokenSplitter(tokens: normalizedTokens),
             preTokenizer: PreTokenizationRunner(stages: preTokenizer?.stages ?? []),
             fuseUnknownId: fusesUnknown ? model.unknownTokenId : nil
