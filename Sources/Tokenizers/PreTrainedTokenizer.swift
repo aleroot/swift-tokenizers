@@ -544,19 +544,39 @@ final class ByteLevelDecodeTable: Sendable {
     }
 
     func decode(_ ids: [Int], skipping skipped: Set<Int>) -> String {
-        var bytes: [UInt8] = []
-        bytes.reserveCapacity(ids.count * 4)
-
         storage.withUnsafeBufferPointer { buffer in
+            // Token inspection needs no concatenation buffer, including for partial UTF-8.
+            if ids.count == 1 {
+                let id = ids[0]
+                guard id >= 0, id < count, !skipped.contains(id) else { return "" }
+                return String(decoding: buffer[Int(offsets[id])..<Int(offsets[id + 1])], as: UTF8.self)
+            }
+
+            // Size the final string exactly instead of growing a temporary byte array and
+            // copying it again. Validation still happens after concatenation: adjacent
+            // tokens may supply separate bytes of the same Unicode scalar.
+            var capacity = 0
             for id in ids {
                 guard id >= 0, id < count else { continue }
                 if !skipped.isEmpty, skipped.contains(id) { continue }
-                let lo = Int(offsets[id])
-                let hi = Int(offsets[id + 1])
-                bytes.append(contentsOf: UnsafeBufferPointer(rebasing: buffer[lo..<hi]))
+                capacity += Int(offsets[id + 1] - offsets[id])
+            }
+            guard capacity > 0 else { return "" }
+            return String(unsafeUninitializedCapacity: capacity) { output in
+                var written = 0
+                for id in ids {
+                    guard id >= 0, id < count else { continue }
+                    if !skipped.isEmpty, skipped.contains(id) { continue }
+                    let lo = Int(offsets[id])
+                    let length = Int(offsets[id + 1]) - lo
+                    if length > 0 {
+                        (output.baseAddress! + written).initialize(from: buffer.baseAddress! + lo, count: length)
+                        written += length
+                    }
+                }
+                return written
             }
         }
-        return String(decoding: bytes, as: UTF8.self)
     }
 }
 

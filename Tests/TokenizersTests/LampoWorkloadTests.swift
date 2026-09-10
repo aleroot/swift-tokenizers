@@ -5,6 +5,43 @@ import Testing
 
 @Suite("Lampo tokenizer workloads")
 struct LampoWorkloadTests {
+    @Test("Direct byte-level decoding repairs UTF-8 only after joining tokens")
+    func directByteLevelDecoding() throws {
+        let raw: [[UInt8]] = [
+            [], [0], [0x41], [0xF0], [0x9F], [0x98], [0x80], [0xC0, 0xAF],
+            Array(String(repeating: "long token ", count: 128).utf8),
+        ]
+        let vocabulary = try Vocabulary(entries: raw.enumerated().map { index, bytes in
+            (bytes.withUnsafeBufferPointer { ByteLevelAlphabet.encode($0) }, index * 2)
+        } + [("literal😀", 20)])
+        let table = ByteLevelDecodeTable(vocabulary: vocabulary)
+        let decoder = ByteLevelDecoder(config: [:])
+        let cases = [
+            [], [0], [1], [-1], [Int.max], [20], [2], [6], [16],
+            [6, 8, 10, 12], [6, 8, 10], [14, 2, 4], [0, 1, -1, Int.max],
+            [16, 20, 16], [6, 20, 8, 10, 12],
+        ]
+        for ids in cases {
+            for skipped: Set<Int> in [[], [6, 20], Set(ids)] {
+                let strings = ids.filter { !skipped.contains($0) }.compactMap { vocabulary.token($0) }
+                let expected = decoder.decode(tokens: strings).joined()
+                #expect(table.decode(ids, skipping: skipped).utf8.elementsEqual(expected.utf8))
+            }
+        }
+        // Exercise every one- and two-byte sequence, including invalid UTF-8 and split scalars.
+        let bytesVocabulary = try Vocabulary(entries: (0..<256).map { byte in
+            ([UInt8(byte)].withUnsafeBufferPointer { ByteLevelAlphabet.encode($0) }, byte)
+        })
+        let bytesTable = ByteLevelDecodeTable(vocabulary: bytesVocabulary)
+        for first in 0..<256 {
+            #expect(bytesTable.decode([first], skipping: []) == String(decoding: [UInt8(first)], as: UTF8.self))
+            for second in 0..<256 {
+                let expected = String(decoding: [UInt8(first), UInt8(second)], as: UTF8.self)
+                #expect(bytesTable.decode([first, second], skipping: []) == expected)
+            }
+        }
+    }
+
     @Test("Byte-level decoding distinguishes added token IDs from equivalent Unicode spellings")
     func addedTokenIdentity() throws {
         let json = Data(
