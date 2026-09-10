@@ -36,6 +36,10 @@ enum Fuzz {
         "'sure",
         "\u{0301}", "\u{0308}", "\u{200D}", "😀", "🚀", "👨‍👩‍👧", "🇮🇹", "1️⃣",
         "<|endoftext|>", "<s>", "</s>", "[MASK]",
+        // DeepSeek classes: Han / kana runs, `\p{S}` versus `\p{P}`, punctuation glued to a word.
+        "漢字", "ひらがな", "カタカナ", "ー", "、", "。", "日本語です", "中文abc", "abc中文",
+        "+", "=", "±", "€", "©", "°", "˘", "←", "∑", "_name", ".py", "-flag", "/usr", "#tag", "$var",
+        "<｜begin▁of▁sentence｜>", "▁", "｜",
     ]
 
     static func text(_ rng: inout SeededGenerator, maxAtoms: Int = 24) -> String {
@@ -57,6 +61,13 @@ struct ScannerEquivalenceTests {
         (.qwen3, KnownSplitPattern.qwen3Source),
         (.o200k, KnownSplitPattern.o200kSource),
         (.falcon, KnownSplitPattern.falconSource),
+    ]
+
+    /// The DeepSeek patterns do not match every scalar, so the scanners emit the gaps too.
+    static let isolatingPatterns: [(KnownSplitPattern, String)] = [
+        (.deepseekNumbers, KnownSplitPattern.deepseekNumbersSource),
+        (.deepseekCJK, KnownSplitPattern.deepseekCJKSource),
+        (.deepseek, KnownSplitPattern.deepseekSource),
     ]
 
     /// Every match of `regex` in `text` (the reference the scanners are checked against).
@@ -90,6 +101,45 @@ struct ScannerEquivalenceTests {
         #expect(failures.isEmpty, Comment(rawValue: failures.joined(separator: "\n")))
     }
 
+    /// The pieces `Isolated` behaviour produces: every match, plus the text between matches.
+    private func isolatedPieces(in text: String, with regex: NSRegularExpression) -> [String] {
+        let ns = text as NSString
+        var result: [String] = []
+        var cursor = 0
+        regex.enumerateMatches(in: text, range: NSRange(location: 0, length: ns.length)) { match, _, _ in
+            guard let match else { return }
+            if match.range.location > cursor {
+                result.append(ns.substring(with: NSRange(location: cursor, length: match.range.location - cursor)))
+            }
+            result.append(ns.substring(with: match.range))
+            cursor = match.range.location + match.range.length
+        }
+        if cursor < ns.length {
+            result.append(ns.substring(from: cursor))
+        }
+        return result
+    }
+
+    @Test(arguments: [0, 1, 2])
+    func randomTextsIsolating(patternIndex: Int) throws {
+        let (pattern, source) = Self.isolatingPatterns[patternIndex]
+        let regex = try NSRegularExpression(pattern: source)
+        var rng = SeededGenerator(seed: UInt64(2000 + patternIndex))
+        var failures: [String] = []
+        for _ in 0..<6000 {
+            let text = Fuzz.text(&rng)
+            var pieces: [Substring] = []
+            pattern.split(Substring(text), into: &pieces)
+            let ours = pieces.map(String.init)
+            let reference = isolatedPieces(in: text, with: regex)
+            if ours != reference {
+                failures.append("\(text.debugDescription): scanner \(ours) regex \(reference)")
+                if failures.count > 5 { break }
+            }
+        }
+        #expect(failures.isEmpty, Comment(rawValue: failures.joined(separator: "\n")))
+    }
+
     @Test("Hand-picked edge cases")
     func edgeCases() throws {
         let cases = [
@@ -114,6 +164,24 @@ struct ScannerEquivalenceTests {
                 pattern.split(Substring(text), into: &pieces)
                 #expect(
                     pieces.map(String.init) == splitMatches(in: text, with: regex),
+                    "\(pattern) \(text.debugDescription)")
+            }
+        }
+        let deepseekCases =
+            cases + [
+                "1", "12", "123", "1234", "1234567", "a1b", "1a", "a1", "١٢٣٤٥", "½½½½", "3.14159",
+                "漢字", "漢字abc", "abc漢字", "漢 字", "ひらがなカタカナ漢字", "日本語1234テスト", "中文，标点",
+                "_x", "__x", " _x", ".py", "..py", "-\u{0301}a", "+abc", "=x", "$100", "€100", "100€",
+                "😀a", "a😀", "😀😀a", " 😀", "→x", "x→", "±3", "©2026",
+                "<｜User｜>hi", "</｜DSML｜ parameter>", "\u{200B}abc", "\u{200B}123",
+            ]
+        for (pattern, source) in Self.isolatingPatterns {
+            let regex = try NSRegularExpression(pattern: source)
+            for text in deepseekCases {
+                var pieces: [Substring] = []
+                pattern.split(Substring(text), into: &pieces)
+                #expect(
+                    pieces.map(String.init) == isolatedPieces(in: text, with: regex),
                     "\(pattern) \(text.debugDescription)")
             }
         }

@@ -1,8 +1,8 @@
 // Regex-free implementations of the byte-level BPE pre-tokenization patterns used by the
-// GPT-2, Llama-3 / cl100k, Qwen-2 / Qwen-3.5, o200k (GPT-4o, gpt-oss, Muse) and Falcon-H1
-// model families. Each scanner reproduces the leftmost-first alternation semantics of the
-// original regular expression exactly, but runs as a single linear pass over raw UTF-8 with
-// table-driven classification.
+// GPT-2, Llama-3 / cl100k, Qwen-2 / Qwen-3.5, o200k (GPT-4o, gpt-oss, Muse), Falcon-H1 and
+// DeepSeek model families. Each scanner reproduces the leftmost-first alternation semantics
+// of the original regular expression exactly, but runs as a single linear pass over raw UTF-8
+// with table-driven classification.
 //
 // Patterns that are not recognised fall back to `NSRegularExpression` (see `SplitPreTokenizer`).
 
@@ -24,6 +24,14 @@ enum KnownSplitPattern: Sendable {
     case o200k
     /// Falcon-H1: `o200k` without contraction suffixes and with single-digit numbers.
     case falcon
+    /// DeepSeek (V2 / V3 / R1 / V4), first of three sequenced splits: `\p{N}{1,3}`.
+    case deepseekNumbers
+    /// DeepSeek, second split: `[一-龥぀-ゟ゠-ヿ]+` (Han, hiragana, katakana).
+    case deepseekCJK
+    /// DeepSeek, third split: `[!"#$…~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+|`
+    /// ` ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+`. Unlike the patterns above it does
+    /// not match every scalar: digits outside a match stay in the gaps between them.
+    case deepseek
 
     static let gpt2Source = #"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"#
     static let llama3Source =
@@ -37,6 +45,11 @@ enum KnownSplitPattern: Sendable {
     static let falconSource =
         #"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"#
 
+    static let deepseekNumbersSource = ##"\p{N}{1,3}"##
+    static let deepseekCJKSource = ##"[\##u{4E00}-\##u{9FA5}\##u{3040}-\##u{309F}\##u{30A0}-\##u{30FF}]+"##
+    static let deepseekSource =
+        ##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\##u{0D}\##u{0A}\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+[\##u{0D}\##u{0A}]*|\s*[\##u{0D}\##u{0A}]+|\s+(?!\S)|\s+"##
+
     init?(regexSource: String) {
         switch regexSource {
         case Self.gpt2Source: self = .gpt2
@@ -45,6 +58,9 @@ enum KnownSplitPattern: Sendable {
         case Self.qwen3Source: self = .qwen3
         case Self.o200kSource: self = .o200k
         case Self.falconSource: self = .falcon
+        case Self.deepseekNumbersSource: self = .deepseekNumbers
+        case Self.deepseekCJKSource: self = .deepseekCJK
+        case Self.deepseekSource: self = .deepseek
         default: return nil
         }
     }
@@ -57,28 +73,20 @@ enum KnownSplitPattern: Sendable {
         case .qwen3: Self.qwen3Source
         case .o200k: Self.o200kSource
         case .falcon: Self.falconSource
+        case .deepseekNumbers: Self.deepseekNumbersSource
+        case .deepseekCJK: Self.deepseekCJKSource
+        case .deepseek: Self.deepseekSource
         }
     }
 
-    var rules: ByteLevelScanner.Rules {
-        switch self {
-        case .gpt2: .gpt2
-        case .llama3: .llama3
-        case .qwen2: .qwen2
-        case .qwen3: .qwen3
-        case .o200k: .o200k
-        case .falcon: .falcon
-        }
-    }
-
-    /// Splits `text` into the sequence of regex matches. Every scalar of the input belongs to
-    /// exactly one piece for these patterns.
+    /// Splits `text` into the pieces `Isolated` behaviour produces: the regex matches, plus
+    /// the gaps between them for the patterns that do not match every scalar.
     func split(_ text: Substring, into pieces: inout [Substring]) {
         var copy = text
         var ranges: [Range<Int>] = []
         copy.withUTF8 { bytes in
             ranges.reserveCapacity(bytes.count / 4 + 1)
-            ByteLevelScanner.scan(bytes, rules: rules, into: &ranges)
+            split(bytes, into: &ranges)
         }
         let utf8 = text.utf8
         let base = utf8.startIndex
@@ -93,7 +101,17 @@ enum KnownSplitPattern: Sendable {
     /// Byte-range variant used by the fast encode path.
     @inline(__always)
     func split(_ bytes: UnsafeBufferPointer<UInt8>, into ranges: inout [Range<Int>]) {
-        ByteLevelScanner.scan(bytes, rules: rules, into: &ranges)
+        switch self {
+        case .gpt2: ByteLevelScanner.scan(bytes, rules: .gpt2, into: &ranges)
+        case .llama3: ByteLevelScanner.scan(bytes, rules: .llama3, into: &ranges)
+        case .qwen2: ByteLevelScanner.scan(bytes, rules: .qwen2, into: &ranges)
+        case .qwen3: ByteLevelScanner.scan(bytes, rules: .qwen3, into: &ranges)
+        case .o200k: ByteLevelScanner.scan(bytes, rules: .o200k, into: &ranges)
+        case .falcon: ByteLevelScanner.scan(bytes, rules: .falcon, into: &ranges)
+        case .deepseekNumbers: DeepSeekScanner.scanNumbers(bytes, into: &ranges)
+        case .deepseekCJK: DeepSeekScanner.scanCJK(bytes, into: &ranges)
+        case .deepseek: DeepSeekScanner.scan(bytes, into: &ranges)
+        }
     }
 
 }
@@ -159,6 +177,45 @@ enum ScalarClassifier {
         if v < 0x10000 { return bmp[Int(v)] }
         guard let scalar = Unicode.Scalar(v) else { return ScalarFlags.other }
         return flagsSlow(scalar)
+    }
+
+    /// ``bmp`` with ``ScalarFlags/punctuation`` widened from `\p{P}` to `\p{P}` ∪ `\p{S}`, the
+    /// class the DeepSeek split pattern uses. ASCII is unaffected: its symbols already carry
+    /// the flag, because `tokenizers` counts every ASCII punctuation byte as punctuation.
+    @usableFromInline
+    static let bmpWithSymbols: [UInt8] = makeBMPSymbolFlags()
+
+    static func makeBMPSymbolFlags() -> [UInt8] {
+        // Symbols are the only scalars classified as plain `other`, so the general category is
+        // needed for those alone.
+        bmp.enumerated().map { value, flags in
+            guard flags == ScalarFlags.other, let scalar = Unicode.Scalar(UInt32(value)), isSymbol(scalar) else {
+                return flags
+            }
+            return flags | ScalarFlags.punctuation
+        }
+    }
+
+    /// ``flags(value:)`` with `\p{S}` folded into ``ScalarFlags/punctuation``.
+    @inlinable
+    static func symbolFlags(value v: UInt32) -> UInt8 {
+        if v < 0x10000 { return bmpWithSymbols[Int(v)] }
+        guard let scalar = Unicode.Scalar(v) else { return ScalarFlags.other }
+        let flags = flagsSlow(scalar)
+        return isSymbol(scalar) ? flags | ScalarFlags.punctuation : flags
+    }
+
+    /// `\p{S}`: `Sm` / `Sc` / `Sk` / `So` in the regex engine's Unicode version. Private-use
+    /// scalars are not symbols; ICU disagrees, which is what ``OnigurumaDialect`` patches for
+    /// the patterns that do fall back to `NSRegularExpression`.
+    @usableFromInline
+    static func isSymbol(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.properties.generalCategory {
+        case .mathSymbol, .currencySymbol, .modifierSymbol, .otherSymbol:
+            TokenizerUnicode.assigned(scalar, through: 16)
+        default:
+            false
+        }
     }
 
     @usableFromInline

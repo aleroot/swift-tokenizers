@@ -338,6 +338,20 @@ swift-transformers matched only after alphabetically sorting the tool keys (3 of
 Falcon-H1R is the slowest family we ship: its split pattern has the most alternations of the
 hand-written scanners.
 
+### DeepSeek V3 / V4 split sequence
+
+The DeepSeek families pre-tokenize with a `Sequence` of three `Split` regexes instead of one.
+Before those three patterns had scanners they ran through `NSRegularExpression`, which also
+serialised on ICU state across threads (`deepseek-ai/DeepSeek-V4.1-Flash`, 129,280-token vocab,
+mixed prose corpus, M4 Pro):
+
+| Threads | `NSRegularExpression` | Byte scanners |
+|---:|---:|---:|
+| 1 | 13.8 MB/s | 99.5 MB/s |
+| 2 | n/a | 189 MB/s |
+| 4 | n/a | 339 MB/s |
+| 8 | 26.5 MB/s | 382 MB/s |
+
 ## Concurrent encoding
 
 Aggregate `encode(text:)` throughput of one shared tokenizer called from N threads
@@ -390,12 +404,16 @@ hand-written over UTF-8 with NEON lane masks instead of being expressed as regul
   open-addressing table keyed by `(leftId, rightId)`. A byte-level pretoken goes from raw UTF-8
   bytes to symbol ids through a 256-entry table — no `String` is ever built.
 * **Regex-free pre-tokenization.** The GPT-2, Llama-3/cl100k, Qwen-2, Qwen-3.5, o200k
-  (GPT-4o / gpt-oss / Muse) and Falcon-H1 split patterns are implemented as hand-written
+  (GPT-4o / gpt-oss / Muse), Falcon-H1 and DeepSeek (V2 / V3 / R1 / V4) split patterns are
+  implemented as hand-written
   linear scanners over UTF-8 with an immutable runtime-derived classification cache (including the
   o200k case-aware `[Lu Lt Lm Lo M]*[Ll Lm Lo M]+` alternation). `Punctuation`, literal
   `Split` and `[0-9]` stages are byte scanners too. All are fuzz-tested against
   `NSRegularExpression` for exact equivalence; unknown patterns fall back to
   `NSRegularExpression`.
+  DeepSeek is a three-stage `Sequence` (`\p{N}{1,3}`, a Han / kana class, then the main
+  alternation) whose stages do not match every scalar, so those scanners emit the gaps between
+  matches as well.
 * **SIMD byte kernels.** ASCII classification runs 16 bytes per NEON register:
   `SIMD16<UInt8>` lane masks for controls, case, whitespace, punctuation, digits and `\w`,
   first-non-ASCII / first-of-two-bytes scans, adjacent-repeat detection and in-place
