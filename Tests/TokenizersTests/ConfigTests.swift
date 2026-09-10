@@ -20,6 +20,43 @@ private func createFile(with content: String, encoding: String.Encoding, fileNam
 
 @Suite("Config Tests")
 struct ConfigTests {
+    @Test("Equal values hash equally, as Hashable requires")
+    func hashableContract() {
+        // `1` and `1.0` are the same JSON number and must share a bucket.
+        let equal: [(Config.Data, Config.Data)] = [
+            (.integer(1), .floating(1.0)),
+            (.integer(0), .floating(0.0)),
+            (.integer(-7), .floating(-7.0)),
+            (.integer(1 << 53), .floating(Double(1 << 53))),
+            (.floating(2.0), .integer(2)),
+        ]
+        for (lhs, rhs) in equal {
+            #expect(lhs == rhs)
+            #expect(Config(data: lhs) == Config(data: rhs))
+            var left = Hasher()
+            var right = Hasher()
+            lhs.hash(into: &left)
+            rhs.hash(into: &right)
+            #expect(left.finalize() == right.finalize())
+            #expect(Set([Config(data: lhs), Config(data: rhs)]).count == 1)
+        }
+    }
+
+    @Test("Equality is transitive and does not coerce across kinds")
+    func equalityIsTransitive() {
+        // `true` used to equal both `1` and `"1"`, while `1` and `"1"` were unequal.
+        #expect(Config(true) != Config(1))
+        #expect(Config("1") != Config(1))
+        #expect(Config("true") != Config(true))
+        #expect(Config(5) != Config(false))
+        // `Int` → `Double` is lossy above 2⁵³, so distinct integers must stay distinct.
+        #expect(Config.Data.integer(Int.max) != .integer(Int.max - 1))
+        #expect(Config.Data.integer(Int.max) != .floating(Double(Int.max)))
+        #expect(Config.Data.integer((1 << 53) + 1) != .floating(Double(1 << 53)))
+        // A fractional value is no integer.
+        #expect(Config.Data.integer(1) != .floating(1.5))
+    }
+
     @Test("Data hashing produces different hashes for unequal values")
     func hashable() throws {
         let testCases: [(Config.Data, Config.Data)] = [
@@ -242,7 +279,9 @@ struct ConfigTests {
                 (Config(1), 1.0),
             ]
             for (cfg, exp) in testCases {
-                #expect(cfg == .init(exp))
+                // `floating()` narrows to `Float`; equality does not, so a `Float` literal
+                // widened to `Double` is only equal when the widening is exact.
+                #expect((cfg == .init(exp)) == (cfg.double() == Double(exp)))
                 #expect(cfg.get() == exp)
                 #expect(cfg.get(or: 2.2) == exp)
                 #expect(cfg.floating() == exp)

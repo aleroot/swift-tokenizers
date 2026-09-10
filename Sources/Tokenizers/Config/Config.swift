@@ -94,49 +94,44 @@ public struct Config: Hashable, Sendable,
             }
         }
 
-        // Loose equality: numeric / string kinds compare by converted value, so that
-        // `Config(1) == Config(true)` and `Config("1") == Config(1)` hold.
+        /// A JSON number in canonical form. `Int` → `Double` is lossy above 2⁵³, so comparing
+        /// every number as a `Double` would make distinct integers equal; keeping exact integers
+        /// apart from the reals is what makes the relation transitive.
+        enum Number: Hashable {
+            case integer(Int)
+            case real(Double)
+        }
+
+        /// The canonical number, when this is one. `.boolean` is deliberately not a number:
+        /// treating it as one made equality intransitive, because `true` also coerced to the
+        /// strings `"true"` and `"1"` while `1` did not.
+        var numberValue: Number? {
+            switch self {
+            case let .integer(v): return .integer(v)
+            case let .floating(v): return Int(exactly: v).map(Number.integer) ?? .real(v)
+            default: return nil
+            }
+        }
+
+        /// Equality is per kind, with the single coercion JSON itself implies: `1` and `1.0`
+        /// are the same number. Strings compare byte-exactly, so canonically equivalent
+        /// spellings stay distinct. Keeping the relation reflexive, symmetric and transitive is
+        /// what lets ``hash(into:)`` agree with it, as `Hashable` requires.
         public static func == (lhs: Data, rhs: Data) -> Bool {
             switch (lhs, rhs) {
-            case (.null, .null):
-                return true
-            case let (.string(l), _):
-                if let r = rhs.string() { return l == BinaryDistinctString(r) }
-            case let (.integer(l), _):
-                if let r = rhs.integer() { return l == r }
-            case let (.boolean(l), _):
-                if let r = rhs.boolean() { return l == r }
-            case let (.floating(l), _):
-                // Floating values compare at Float precision.
-                if let r = rhs.double() { return Float(l) == Float(r) }
-            case let (.dictionary(l), .dictionary(r)):
-                return l == r
-            case let (.array(l), .array(r)):
-                return l == r
-            case let (.token(l), .token(r)):
-                return l == r
-            case let (.stringMap(l), .stringMap(r)):
-                return l == r
-            case let (.stringPairs(l), .stringPairs(r)):
-                return l == r
-            case let (.scoredTokens(l), .scoredTokens(r)):
-                return l == r
+            case (.null, .null): return true
+            case let (.string(l), .string(r)): return l == r
+            case let (.boolean(l), .boolean(r)): return l == r
+            case let (.dictionary(l), .dictionary(r)): return l == r
+            case let (.array(l), .array(r)): return l == r
+            case let (.token(l), .token(r)): return l == r
+            case let (.stringMap(l), .stringMap(r)): return l == r
+            case let (.stringPairs(l), .stringPairs(r)): return l == r
+            case let (.scoredTokens(l), .scoredTokens(r)): return l == r
             default:
-                return false
+                guard let l = lhs.numberValue, let r = rhs.numberValue else { return false }
+                return l == r
             }
-            switch rhs {
-            case let .string(r):
-                if let l = lhs.string() { return BinaryDistinctString(l) == r }
-            case let .integer(r):
-                if let l = lhs.integer() { return l == r }
-            case let .boolean(r):
-                if let l = lhs.boolean() { return l == r }
-            case let .floating(r):
-                if let l = lhs.double() { return Float(l) == Float(r) }
-            default:
-                return false
-            }
-            return false
         }
     }
 
@@ -498,21 +493,24 @@ extension Config: Equatable {
 
 extension Config.Data: Hashable {
     public func hash(into hasher: inout Hasher) {
+        // Numbers hash through their canonical form, so `1` and `1.0` — which compare equal —
+        // cannot land in different buckets.
+        if let number = numberValue {
+            hasher.combine(2)
+            hasher.combine(number)
+            return
+        }
         switch self {
         case .null:
             hasher.combine(0)
         case let .string(s):
             hasher.combine(1)
             hasher.combine(s)
-        case let .integer(i):
-            hasher.combine(2)
-            hasher.combine(i)
+        case .integer, .floating:
+            preconditionFailure("numbers hash through numberValue")
         case let .boolean(b):
             hasher.combine(3)
             hasher.combine(b)
-        case let .floating(f):
-            hasher.combine(4)
-            hasher.combine(Float(f))
         case let .dictionary(d):
             hasher.combine(5)
             d.hash(into: &hasher)

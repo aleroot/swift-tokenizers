@@ -57,11 +57,13 @@ struct CorrectnessAuditTests {
     func metaspaceOriginalStart() throws {
         let first: Config = ["type": "Metaspace", "replacement": "▁", "prepend_scheme": "first", "split": false]
         let never: Config = ["type": "Metaspace", "replacement": "▁", "prepend_scheme": "never", "split": false]
-        let rewritten = try #require(try PreTokenizerFactory.fromConfig(config: [
-            "type": "Sequence", "pretokenizers": [
-                ["type": "ByteLevel", "add_prefix_space": false], ["type": "Punctuation"], first,
-            ],
-        ]))
+        let rewritten = try #require(
+            try PreTokenizerFactory.fromConfig(config: [
+                "type": "Sequence",
+                "pretokenizers": [
+                    ["type": "ByteLevel", "add_prefix_space": false], ["type": "Punctuation"], first,
+                ],
+            ]))
         #expect(rewritten.preTokenize(text: "\u{327}") == ["▁Ì", "▁§"])
         let cases: [(Config, Config, String, [Int])] = [
             (["type": "StripAccents"], first, "\u{1734}e", [2]),
@@ -334,5 +336,101 @@ struct CorrectnessAuditTests {
                 }
             }
         }
+    }
+}
+
+/// Untrusted `tokenizer.json` files must not be able to trade a few bytes of input for
+/// unbounded work or memory, and no public entry point may terminate the process.
+@Suite("Resource limits")
+struct ResourceLimitTests {
+    static func tokenizer(_ json: String) throws -> PreTrainedTokenizer {
+        try PreTrainedTokenizer(
+            tokenizerConfig: ["tokenizer_class": "PreTrainedTokenizerFast"],
+            tokenizerData: try Config(tokenizerJSON: Data(json.utf8)))
+    }
+
+    @Test("A vocabulary that declares one token at a huge id is refused")
+    func sparseIdSpaceIsRejected() throws {
+        // `id → token` is a direct index, so this used to allocate about a gigabyte.
+        for id in [Vocabulary.maximumIdSpace, 63_999_999, Int.max / 2] {
+            #expect(throws: TokenizerError.self) {
+                try Self.tokenizer(#"{"model":{"type":"BPE","vocab":{"a":\#(id)},"merges":[]}}"#)
+            }
+        }
+        #expect(throws: TokenizerError.self) {
+            try Self.tokenizer(#"{"model":{"type":"BPE","vocab":{"a":-1},"merges":[]}}"#)
+        }
+    }
+
+    @Test("A small vocabulary may still place special tokens at a base model's high ids")
+    func sparseIdSpaceWithinTheFloorIsAccepted() throws {
+        let entries = (0..<8).map { #""t\#($0)": \#($0)"# } + [#""<|endoftext|>": 128255"#]
+        let tokenizer = try Self.tokenizer(
+            """
+            {"model":{"type":"WordLevel","unk_token":"t0","vocab":{\(entries.joined(separator: ","))}},
+             "pre_tokenizer":{"type":"WhitespaceSplit"}}
+            """)
+        #expect(tokenizer.encode(text: "t3 <|endoftext|>", addSpecialTokens: false) == [3, 128255])
+    }
+
+    @Test("The id space scales with the number of entries, between a floor and a ceiling")
+    func idSpaceBounds() {
+        #expect(Vocabulary.idSpace(entryCount: 0) == 1 << 18)
+        #expect(Vocabulary.idSpace(entryCount: 1) == 1 << 18)
+        #expect(Vocabulary.idSpace(entryCount: 200_000) == Vocabulary.maximumIdSpace)
+        #expect(Vocabulary.idSpace(entryCount: Int.max) == Vocabulary.maximumIdSpace)
+        // Monotonic, so growing a vocabulary never narrows the space it may span.
+        var previous = 0
+        for count in [0, 1, 100, 4096, 1 << 16, 1 << 20, 1 << 24] {
+            let space = Vocabulary.idSpace(entryCount: count)
+            #expect(space >= previous)
+            previous = space
+        }
+    }
+
+    @Test("A caller-supplied vocabulary never traps, whatever the ids")
+    func callerSuppliedVocabularyIsSanitised() {
+        // This initializer is not throwing, so unrepresentable ids are dropped instead.
+        let tokenizer = BertTokenizer(
+            vocab: ["ok": 1, "negative": -5, "huge": Int.max, "past-the-limit": Vocabulary.maximumIdSpace],
+            merges: nil)
+        #expect(tokenizer.convertTokenToId("ok") == 1)
+        #expect(tokenizer.convertIdToToken(1) == "ok")
+        for dropped in ["negative", "huge", "past-the-limit"] {
+            #expect(tokenizer.convertTokenToId(dropped) == nil)
+        }
+        #expect(BertTokenizer(vocab: [:], merges: nil).convertIdToToken(0) == nil)
+    }
+
+    @Test("An implausible regular expression is refused instead of compiled")
+    func regexLengthIsBounded() {
+        let long = String(repeating: "a", count: maximumRegexLength + 1)
+        #expect(throws: TokenizerError.self) { try compileRegex(long, component: "test") }
+        #expect(throws: Never.self) {
+            try compileRegex(String(repeating: "a", count: maximumRegexLength), component: "test")
+        }
+        #expect(throws: TokenizerError.self) {
+            try Self.tokenizer(
+                #"{"model":{"type":"BPE","vocab":{"a":0},"merges":[]},"#
+                    + #""pre_tokenizer":{"type":"Split","pattern":{"Regex":"\#(long)"},"behavior":"Isolated"}}"#)
+        }
+    }
+
+    @Test("The compiled chat-template cache is bounded")
+    func chatTemplateCacheIsBounded() throws {
+        let tokenizer = try Self.tokenizer(#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[]}}"#)
+        // A caller that builds a fresh template per request must not retain all of them.
+        for i in 0...(PreTrainedTokenizer.chatTemplateCacheLimit * 2) {
+            _ = try tokenizer.renderChatTemplate(
+                messages: [["role": "user", "content": "hi"]], chatTemplate: .literal("{{ \(i) }}"))
+        }
+        #expect(tokenizer.compiledChatTemplateCount <= PreTrainedTokenizer.chatTemplateCacheLimit)
+        // The cache still serves the common case of one reused template.
+        let single = try Self.tokenizer(#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[]}}"#)
+        for _ in 0..<32 {
+            _ = try single.renderChatTemplate(
+                messages: [["role": "user", "content": "hi"]], chatTemplate: .literal("{{ 1 }}"))
+        }
+        #expect(single.compiledChatTemplateCount == 1)
     }
 }

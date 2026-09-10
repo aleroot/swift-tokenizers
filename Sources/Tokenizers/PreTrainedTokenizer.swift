@@ -55,8 +55,11 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     /// Built on first decode: embedding and reranking apps never pay for it.
     private let byteLevelDecodeTable: Lazy<ByteLevelDecodeTable>?
 
-    /// Compiled Jinja templates keyed by their source.
+    /// Compiled Jinja templates keyed by their source, bounded by ``chatTemplateCacheLimit``.
     private let compiledChatTemplates = Locked<[String: Template]>([:])
+
+    /// Number of templates currently cached. Exposed for tests.
+    var compiledChatTemplateCount: Int { compiledChatTemplates.withLock(\.count) }
 
     // MARK: - Initialization
 
@@ -310,6 +313,11 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         !tokenizerConfig.chatTemplate.isNull()
     }
 
+    /// A tokenizer declares one template, or a handful when the config names several. Callers
+    /// may also pass literal templates, so the cache is bounded: without a limit, a caller that
+    /// renders a freshly built template per request would retain every one of them.
+    static let chatTemplateCacheLimit = 16
+
     private func compiledTemplate(for source: String) throws -> Template {
         if let cached = compiledChatTemplates.withLock({ $0[source] }) {
             return cached
@@ -321,6 +329,10 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         )
         return compiledChatTemplates.withLock { cache in
             if let cached = cache[source] { return cached }
+            // Templates are interchangeable once compiled, so dropping the whole cache is as
+            // good as evicting one entry and keeps the common single-template path allocation
+            // free. Reaching the limit at all means the caller is not reusing templates.
+            if cache.count >= Self.chatTemplateCacheLimit { cache.removeAll(keepingCapacity: true) }
             cache[source] = compiled
             return compiled
         }

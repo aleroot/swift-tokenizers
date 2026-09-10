@@ -56,6 +56,36 @@ final class Vocabulary: @unchecked Sendable {
         slots.deallocate()
     }
 
+    // MARK: - Id space
+
+    /// Where an id's spelling comes from while the tables are being laid out.
+    private enum Source {
+        case absent
+        case packed(Int32)
+        case extra(Int32)
+    }
+
+    /// Largest dense id space the tables may span, whatever the file declares. `id → token` is
+    /// a direct index, so an id costs a slot whether or not it is populated: 4 Mi ids is 16 MB
+    /// of offsets and sixteen times the largest published vocabulary.
+    static let maximumIdSpace = 4 << 20
+
+    /// The id space a vocabulary of `entryCount` entries may span. Published vocabularies are
+    /// contiguous or nearly so, so a wide margin over the entry count still rejects a file that
+    /// declares one token at a huge id purely to force a large allocation. The floor keeps
+    /// small vocabularies working when their special tokens sit at a base model's high ids.
+    static func idSpace(entryCount: Int) -> Int {
+        let margin = entryCount < maximumIdSpace ? entryCount * 64 : maximumIdSpace
+        return min(maximumIdSpace, max(1 << 18, margin))
+    }
+
+    /// The dense id count for a vocabulary, or a `malformedVocab` error when the ids are too
+    /// sparse for the dense tables to be a reasonable representation.
+    private static func denseCount(maxId: Int, entryCount: Int) throws -> Int {
+        guard maxId < idSpace(entryCount: entryCount) else { throw TokenizerError.malformedVocab }
+        return maxId + 1
+    }
+
     // MARK: - Construction
 
     convenience init(vocab: [BinaryDistinctString: Config], addedTokens: [String: Int]) throws {
@@ -116,37 +146,36 @@ final class Vocabulary: @unchecked Sendable {
         var maxId = -1
         for id in packed.ids {
             let i = Int(id)
-            guard i >= 0, i < 64_000_000 else { throw TokenizerError.malformedVocab }
+            guard i >= 0 else { throw TokenizerError.malformedVocab }
             if i > maxId { maxId = i }
         }
-        var extraBytes = 0
-        for (token, id) in extra {
-            guard id >= 0, id < 64_000_000 else { throw TokenizerError.malformedVocab }
+        for (_, id) in extra {
+            guard id >= 0 else { throw TokenizerError.malformedVocab }
             if id > maxId { maxId = id }
-            extraBytes += token.utf8.count
         }
-        let count = maxId + 1
-        guard count <= 64_000_000 else { throw TokenizerError.malformedVocab }
+        let count = try Self.denseCount(maxId: maxId, entryCount: packed.count + extra.count)
 
         let presentBits = Self.allocateBits(count)
-        var packedLo = [UInt32](repeating: 0, count: count)
-        var packedHi = [UInt32](repeating: 0, count: count)
+        // Where each id's spelling comes from, so the layout pass needs no hashing and only one
+        // `count`-sized table. Added tokens override a packed row with the same id.
+        var sources = [Source](repeating: .absent, count: count)
         for i in 0..<packed.count {
             let id = Int(packed.ids[i])
-            packedLo[id] = packed.offsets[i]
-            packedHi[id] = packed.offsets[i + 1]
+            sources[id] = .packed(Int32(i))
             Self.set(bit: id, in: presentBits)
         }
-        // Index into `extra` per id (`-1`: none); dense so the layout loop performs no hashing.
-        var extraIndexById = [Int32](repeating: -1, count: count)
         for (index, (_, id)) in extra.enumerated() {
-            extraIndexById[id] = Int32(index)
+            sources[id] = .extra(Int32(index))
             Self.set(bit: id, in: presentBits)
         }
 
-        var totalBytes = extraBytes
-        for id in 0..<count where Self.contains(id: id, in: presentBits) && extraIndexById[id] < 0 {
-            totalBytes += Int(packedHi[id] - packedLo[id])
+        var totalBytes = 0
+        for source in sources {
+            switch source {
+            case .absent: break
+            case let .packed(i): totalBytes += Int(packed.offsets[Int(i) + 1] - packed.offsets[Int(i)])
+            case let .extra(i): totalBytes += extra[Int(i)].0.utf8.count
+            }
         }
 
         let bytes = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: max(totalBytes, 1))
@@ -156,22 +185,25 @@ final class Vocabulary: @unchecked Sendable {
         packed.utf8.withUnsafeBufferPointer { packedBytes in
             for id in 0..<count {
                 offsets[id] = UInt32(cursor)
-                guard Self.contains(id: id, in: presentBits) else { continue }
-                populated += 1
-                let extraIndex = extraIndexById[id]
-                if extraIndex >= 0 {
-                    var token = extra[Int(extraIndex)].0
+                switch sources[id] {
+                case .absent:
+                    continue
+                case let .extra(index):
+                    var token = extra[Int(index)].0
                     let length = token.utf8.count
                     token.withUTF8 { source in
                         (bytes.baseAddress! + cursor).update(from: source.baseAddress!, count: length)
                     }
                     cursor += length
-                } else if packedHi[id] > packedLo[id] {
-                    let length = Int(packedHi[id] - packedLo[id])
-                    (bytes.baseAddress! + cursor).update(
-                        from: packedBytes.baseAddress! + Int(packedLo[id]), count: length)
-                    cursor += length
+                case let .packed(index):
+                    let lo = Int(packed.offsets[Int(index)])
+                    let length = Int(packed.offsets[Int(index) + 1]) - lo
+                    if length > 0 {
+                        (bytes.baseAddress! + cursor).update(from: packedBytes.baseAddress! + lo, count: length)
+                        cursor += length
+                    }
                 }
+                populated += 1
             }
         }
         offsets[count] = UInt32(cursor)
@@ -213,28 +245,42 @@ final class Vocabulary: @unchecked Sendable {
         try self.init(entries: vocab.map { ($0.key, $0.value) })
     }
 
+    /// Drops entries whose id the dense tables cannot represent, so a caller-supplied
+    /// dictionary can never fail. Ids are embedding indices: a negative or absurdly large one
+    /// cannot be honoured, and refusing the whole vocabulary would be worse than ignoring it.
+    convenience init(retaining vocab: [String: Int]) {
+        let limit = Self.idSpace(entryCount: vocab.count)
+        var entries: [(String, Int)] = []
+        entries.reserveCapacity(vocab.count)
+        for (token, id) in vocab where id >= 0 && id < limit { entries.append((token, id)) }
+        self.init(validated: entries, count: entries.reduce(0) { max($0, $1.1 + 1) })
+    }
+
     /// Builds a vocabulary. Later entries win on string collisions (so added tokens can
     /// override base vocabulary ids); the id → string mapping keeps every id populated.
-    init(entries: [(String, Int)]) throws {
+    convenience init(entries: [(String, Int)]) throws {
         var maxId = -1
         for (_, id) in entries {
-            guard id >= 0, id < 64_000_000 else { throw TokenizerError.malformedVocab }
+            guard id >= 0 else { throw TokenizerError.malformedVocab }
             if id > maxId { maxId = id }
         }
-        let count = maxId + 1
-        guard count <= 64_000_000 else { throw TokenizerError.malformedVocab }
+        self.init(
+            validated: entries, count: try Self.denseCount(maxId: maxId, entryCount: entries.count))
+    }
 
-        // Lay out tokens by id. If several strings claim the same id, the last one wins.
-        var byId = [String?](repeating: nil, count: count)
-        for (token, id) in entries {
-            byId[id] = token
-        }
+    /// - Precondition: every id in `entries` is within `0..<count`.
+    private init(validated entries: [(String, Int)], count: Int) {
+        // Index of each id's spelling in `entries` (`-1`: unpopulated). Four bytes per id rather
+        // than a `[String?]`, which would also retain and release once per slot.
+        var entryById = [Int32](repeating: -1, count: count)
+        // If several strings claim the same id, the last one wins.
+        for (index, (_, id)) in entries.enumerated() { entryById[id] = Int32(index) }
+
         let presentBits = Self.allocateBits(count)
         var totalBytes = 0
-        for id in 0..<count {
-            guard let token = byId[id] else { continue }
+        for id in 0..<count where entryById[id] >= 0 {
             Self.set(bit: id, in: presentBits)
-            totalBytes += token.utf8.count
+            totalBytes += entries[Int(entryById[id])].0.utf8.count
         }
 
         let bytes = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: max(totalBytes, 1))
@@ -243,8 +289,10 @@ final class Vocabulary: @unchecked Sendable {
         var cursor = 0
         for id in 0..<count {
             offsets[id] = UInt32(cursor)
-            guard var token = byId[id] else { continue }
+            let index = entryById[id]
+            guard index >= 0 else { continue }
             populated += 1
+            var token = entries[Int(index)].0
             let length = token.utf8.count
             token.withUTF8 { source in
                 (bytes.baseAddress! + cursor).update(from: source.baseAddress!, count: length)

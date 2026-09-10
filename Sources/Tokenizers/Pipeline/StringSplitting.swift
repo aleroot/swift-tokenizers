@@ -37,6 +37,13 @@ enum StringSplitPattern {
 /// configuration error rather than crashing. The source is first translated from the
 /// Oniguruma dialect `tokenizers` uses to the ICU dialect Foundation implements.
 func compileRegex(_ pattern: String, component: String) throws -> NSRegularExpression {
+    // Published patterns are a few hundred bytes at most. ICU compiles a pattern into a program
+    // whose size grows with the source, and offers no way to bound matching afterwards, so an
+    // implausible one is refused rather than compiled.
+    guard pattern.utf8.count <= maximumRegexLength else {
+        throw TokenizerError.invalidConfiguration(
+            "\(component): regular expression is \(pattern.utf8.count) bytes, over the \(maximumRegexLength) limit")
+    }
     do {
         let source = OnigurumaDialect.translate(pattern)
         // ICU rejects an empty source; the empty group has the same zero-width matches.
@@ -47,6 +54,9 @@ func compileRegex(_ pattern: String, component: String) throws -> NSRegularExpre
             "\(component): invalid regular expression \(pattern.debugDescription)")
     }
 }
+
+/// Longest regular expression accepted from a configuration file.
+let maximumRegexLength = 8 << 10
 
 /// Regexes that come from a `tokenizer.json` field (`Split`, `Replace`) are compiled by
 /// `tokenizers` with Oniguruma, and by Foundation with ICU. The built-in `Whitespace` and

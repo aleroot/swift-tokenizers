@@ -33,8 +33,9 @@ public final class BertTokenizer: Sendable {
         fuseUnknownTokens: Bool = false,
         doLowerCase: Bool = true
     ) {
-        // A `[String: Int]` vocabulary is well-formed by construction.
-        let vocabulary = try! Vocabulary(vocab: vocab)
+        // Entries whose id cannot be represented are dropped rather than trapping; see
+        // `Vocabulary.init(retaining:)`.
+        let vocabulary = Vocabulary(retaining: vocab)
         self.init(
             vocabulary: vocabulary, tokenizeChineseChars: tokenizeChineseChars, bosToken: bosToken,
             eosToken: eosToken, fuseUnknownTokens: fuseUnknownTokens, doLowerCase: doLowerCase)

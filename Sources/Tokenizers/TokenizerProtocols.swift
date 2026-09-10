@@ -146,11 +146,19 @@ public protocol Tokenizer: Sendable {
     func encode(text: String, addSpecialTokens: Bool, withOffsets: Bool) throws -> TokenEncoding
     func callAsFunction(_ text: String, addSpecialTokens: Bool) -> [Int]
 
+    /// Renders `tokens` back to text.
+    ///
+    /// Ids that name no token — out of range, or a hole in a vocabulary with gaps — contribute
+    /// nothing and are not reported, as in `tokenizers`. Use ``convertIdToToken(_:)``, which
+    /// returns `nil` for exactly those ids, when a caller needs to detect them.
     func decode(tokens: [Int]) -> String
     func decode(tokens: [Int], skipSpecialTokens: Bool) -> String
 
+    /// The id of `token`, or `nil` when the vocabulary does not contain it. Models with an
+    /// unknown token answer with that token's id rather than `nil`.
     func convertTokenToId(_ token: String) -> Int?
     func convertTokensToIds(_ tokens: [String]) -> [Int?]
+    /// The token `id` names, or `nil` when the vocabulary has no entry for it.
     func convertIdToToken(_ id: Int) -> String?
     func convertIdsToTokens(_ ids: [Int]) -> [String?]
 
