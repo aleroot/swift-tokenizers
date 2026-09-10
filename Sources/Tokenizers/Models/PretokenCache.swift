@@ -1,7 +1,7 @@
 // Memoises pretoken → token ids in a fixed-size open-addressing table over two append-only
 // arenas: no allocation on lookup or insert until an arena fills and the table is reset. Access
-// is serialised by the owner, which holds `lock` (`tryLock()`) for one `encode` call and skips
-// the cache when another thread has it.
+// is serialised by the owner, which holds `lock` (`tryLock()`) for one `encode` call; a caller
+// that finds it taken memoises into a smaller private table instead (``PretokenCacheLease``).
 
 import Foundation
 
@@ -135,5 +135,40 @@ final class PretokenCache: @unchecked Sendable {
         for i in 0..<slotCount { slots[i].used = false }
         keyCount = 0
         idsCount = 0
+    }
+}
+
+/// The cache an encoder uses for one `encode` call: the model's shared cache when no other
+/// caller holds it, otherwise a smaller table private to the encoder, so concurrent callers all
+/// memoise without ever blocking on each other. After a failed attempt the shared cache is left
+/// alone for a number of calls: a contended `tryLock` still bounces its cache line between cores.
+struct PretokenCacheLease {
+    /// The table to use for the current call.
+    private(set) var cache: PretokenCache?
+    private var holdsShared = false
+    private var backoff = 0
+    private var fallback: PretokenCache?
+
+    private static let backoffCalls = 32
+
+    @inline(__always)
+    mutating func begin(shared: PretokenCache) {
+        if backoff == 0, shared.lock.tryLock() {
+            cache = shared
+            holdsShared = true
+            return
+        }
+        backoff = backoff > 0 ? backoff - 1 : Self.backoffCalls
+        if fallback == nil { fallback = PretokenCache(.compact) }
+        cache = fallback
+    }
+
+    @inline(__always)
+    mutating func finish(shared: PretokenCache) {
+        if holdsShared {
+            holdsShared = false
+            shared.lock.unlock()
+        }
+        cache = nil
     }
 }

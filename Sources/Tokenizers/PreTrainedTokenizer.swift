@@ -72,9 +72,11 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         var normalizedTokens: [AddedTokenSplitter.Token] = []
         var normalizedSpellings: [Int: String] = [:]
         let normalizer = try NormalizerFactory.fromConfig(config: tokenizerData["normalizer"])
-        for addedToken in tokenizerData["addedTokens"].array(or: []) {
-            guard let id = addedToken["id"].integer() else { continue }  // malformed: token with no id
-            guard let content = addedToken.content.string() else { continue }  // malformed: token with no content
+        let flagOverrides = AddedTokenFlags.overrides(tokenizerConfig: tokenizerConfig)
+        for serialized in tokenizerData["addedTokens"].array(or: []) {
+            guard let id = serialized["id"].integer() else { continue }  // malformed: token with no id
+            guard let content = serialized.content.string() else { continue }  // malformed: token with no content
+            let addedToken = flagOverrides.apply(to: serialized, id: id, content: content)
             addedTokens[content] = id
             if addedToken["special"].boolean(or: false) {
                 specialTokens[content] = id

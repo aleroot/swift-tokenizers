@@ -17,6 +17,53 @@ struct TokenizerRegressionTests {
         #expect(encoding.offsets == [0..<3, 0..<3, 3..<4, 4..<6])
     }
 
+    @Test("Unigram Viterbi ties resolve like the reference, whose scores are not correctly rounded")
+    func unigramTieBreaks() async throws {
+        // `▁`, `-` and `---` tie in exact arithmetic on "-------"; the reference parses
+        // `-12.130167007446289` one ulp off, which flips the winner to `▁ --- --- -`.
+        let tokenizer = try await HubFixtures.tokenizer(for: "google-t5/t5-small")
+        #expect(tokenizer.encode(text: "-------", addSpecialTokens: false) == [3, 14817, 14817, 18])
+        #expect(tokenizer.encode(text: "----------", addSpecialTokens: false) == [3, 14817, 14817, 18, 14817])
+        #expect(tokenizer.encode(text: "a -------", addSpecialTokens: false) == [3, 9, 3, 14817, 14817, 18])
+        #expect(tokenizer.encode(text: "x-------", addSpecialTokens: false) == [3, 226, 18, 14817, 14817])
+    }
+
+    @Test("XLM-R class default gives <mask> lstrip like XLMRobertaTokenizerFast")
+    func xlmRobertaMaskLstrip() async throws {
+        // xlm-roberta-base's tokenizer_config.json does not set `mask_token`, so the Python class
+        // rebuilds it as `AddedToken("<mask>", lstrip=True)`; offsets then cover the space.
+        let tokenizer = try await HubFixtures.tokenizer(for: "FacebookAI/xlm-roberta-base")
+        let encoding = try tokenizer.encode(text: "hello <mask>", withOffsets: true)
+        #expect(encoding.ids == [0, 33600, 31, 250_001, 2])
+        #expect(encoding.offsets == [nil, 0..<4, 4..<5, 5..<12, nil])
+        // multilingual-e5-small configures `mask_token`, so the serialized flags (no lstrip) stay.
+        let e5 = try await HubFixtures.tokenizer(for: "intfloat/multilingual-e5-small")
+        let e5Encoding = try e5.encode(text: "hello <mask>", withOffsets: true)
+        #expect(e5Encoding.offsets == [nil, 0..<4, 4..<5, 5..<6, 6..<12, nil])
+    }
+
+    @Test("tokenizer_config added_tokens_decoder flags override tokenizer.json")
+    func addedTokensDecoderOverridesFlags() throws {
+        let data: Config = [
+            "model": ["type": "WordLevel", "vocab": ["a": 0, "b": 1, "[MASK]": 2, "[UNK]": 3], "unk_token": "[UNK]"],
+            "pre_tokenizer": ["type": "WhitespaceSplit"],
+            "added_tokens": [
+                ["id": 2, "content": "[MASK]", "special": true, "lstrip": false, "rstrip": false, "normalized": false]
+            ],
+        ]
+        let plain = try PreTrainedTokenizer(tokenizerConfig: ["tokenizer_class": "BertTokenizer"], tokenizerData: data)
+        #expect(try plain.encode(text: "a [MASK] b", withOffsets: true).offsets == [0..<1, 2..<8, 9..<10])
+        let overridden = try PreTrainedTokenizer(
+            tokenizerConfig: [
+                "tokenizer_class": "BertTokenizer",
+                "added_tokens_decoder": [
+                    "2": ["content": "[MASK]", "special": true, "lstrip": false, "rstrip": true, "normalized": false]
+                ],
+            ],
+            tokenizerData: data)
+        #expect(try overridden.encode(text: "a [MASK] b", withOffsets: true).offsets == [0..<1, 2..<9, 9..<10])
+    }
+
     @Test("Folder loading rebuilds Llama post-processor like transformers")
     func folderPostProcessorPolicy() async throws {
         // Python `LlamaTokenizerFast.__init__` always calls `update_post_processor()`, even when

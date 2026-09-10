@@ -1,7 +1,9 @@
 // Maps a pair of symbol ids to its merge rank and merged id. Entries live in dense arrays and
-// an open-addressing index of 32-bit entry references resolves lookups.
+// an open-addressing index of 32-bit entry references resolves lookups. Once built, the tables
+// are read through raw pointers so the merge loop touches no reference counts.
 
-struct MergeTable: Sendable {
+/// Accumulates merges in rank order, then produces the immutable ``MergeTable``.
+struct MergeTableBuilder {
     /// `left << 32 | right` per entry.
     private var pairs: [UInt64] = []
     private var ranks: [UInt32] = []
@@ -22,14 +24,9 @@ struct MergeTable: Sendable {
         mergedIds.reserveCapacity(expectedCount)
     }
 
-    @inline(__always)
-    private static func key(_ left: Int32, _ right: Int32) -> UInt64 {
-        (UInt64(UInt32(bitPattern: left)) << 32) | UInt64(UInt32(bitPattern: right))
-    }
-
     /// Inserts or overwrites the merge for `(left, right)`.
     mutating func insert(left: Int32, right: Int32, rank: UInt32, merged: Int32) {
-        let key = Self.key(left, right)
+        let key = MergeTable.key(left, right)
         var slot = Int(truncatingIfNeeded: ByteHash.hash(key: key)) & mask
         while true {
             let reference = slots[slot]
@@ -48,6 +45,48 @@ struct MergeTable: Sendable {
             }
             slot = (slot + 1) & mask
         }
+    }
+
+    func build() -> MergeTable {
+        MergeTable(pairs: pairs, ranks: ranks, mergedIds: mergedIds, slots: slots, mask: mask)
+    }
+}
+
+/// `@unchecked Sendable`: the tables are written during initialization and read-only afterwards.
+final class MergeTable: @unchecked Sendable {
+    private let pairs: UnsafeMutablePointer<UInt64>
+    private let ranks: UnsafeMutablePointer<UInt32>
+    private let mergedIds: UnsafeMutablePointer<Int32>
+    private let slots: UnsafeMutablePointer<UInt32>
+    private let slotCount: Int
+    private let mask: Int
+
+    let count: Int
+
+    fileprivate init(pairs: [UInt64], ranks: [UInt32], mergedIds: [Int32], slots: [UInt32], mask: Int) {
+        count = pairs.count
+        self.pairs = .allocate(capacity: max(count, 1))
+        self.ranks = .allocate(capacity: max(count, 1))
+        self.mergedIds = .allocate(capacity: max(count, 1))
+        slotCount = slots.count
+        self.slots = .allocate(capacity: slotCount)
+        self.mask = mask
+        pairs.withUnsafeBufferPointer { self.pairs.initialize(from: $0.baseAddress!, count: count) }
+        ranks.withUnsafeBufferPointer { self.ranks.initialize(from: $0.baseAddress!, count: count) }
+        mergedIds.withUnsafeBufferPointer { self.mergedIds.initialize(from: $0.baseAddress!, count: count) }
+        slots.withUnsafeBufferPointer { self.slots.initialize(from: $0.baseAddress!, count: slotCount) }
+    }
+
+    deinit {
+        pairs.deallocate()
+        ranks.deallocate()
+        mergedIds.deallocate()
+        slots.deallocate()
+    }
+
+    @inline(__always)
+    static func key(_ left: Int32, _ right: Int32) -> UInt64 {
+        (UInt64(UInt32(bitPattern: left)) << 32) | UInt64(UInt32(bitPattern: right))
     }
 
     /// Entry index for the pair, or `-1`. Negative ids denote symbols outside the vocabulary

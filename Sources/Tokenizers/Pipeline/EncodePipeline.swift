@@ -378,21 +378,32 @@ final class EncodeScratch {
     }
 }
 
-/// A lock-protected free list of ``EncodeScratch`` objects so concurrent callers never share
-/// buffers, while a single caller reuses the same allocation across calls.
+/// Free lists of ``EncodeScratch`` objects so concurrent callers never share buffers, while a
+/// single caller reuses the same allocation across calls. The lists are striped by thread so
+/// that concurrent encodes of short inputs do not queue on one lock; a stripe holds at most
+/// ``stripeCapacity`` objects, so retained memory stays bounded however many threads encode.
 final class EncodeScratchPool: @unchecked Sendable {
-    private let free = Locked<[EncodeScratch]>([])
+    private static let stripeCount = 16
+    private static let stripeCapacity = 2
+    private let stripes: [Locked<[EncodeScratch]>] = (0..<stripeCount).map { _ in Locked([]) }
+
+    @inline(__always)
+    private var stripe: Locked<[EncodeScratch]> {
+        // The thread handle is stable for the thread's lifetime and reading it is a TLS load.
+        let thread = UInt(bitPattern: pthread_self())
+        return stripes[Int(truncatingIfNeeded: (thread >> 4) ^ (thread >> 12)) & (Self.stripeCount - 1)]
+    }
 
     @inline(__always)
     func take() -> EncodeScratch {
-        free.withLock { $0.popLast() } ?? EncodeScratch()
+        stripe.withLock { $0.popLast() } ?? EncodeScratch()
     }
 
     @inline(__always)
     func recycle(_ scratch: EncodeScratch) {
         guard scratch.reusable else { return }
-        free.withLock { pool in
-            if pool.count < 4 { pool.append(scratch) }
+        stripe.withLock { pool in
+            if pool.count < Self.stripeCapacity { pool.append(scratch) }
         }
     }
 }

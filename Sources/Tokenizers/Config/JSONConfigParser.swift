@@ -359,10 +359,13 @@ struct JSONConfigParser {
         return try floatingFallback(start)
     }
 
+    /// Floats follow the reference implementation's parsing, not correctly rounded conversion:
+    /// Unigram scores must be bit-identical to the reference for Viterbi ties to resolve alike.
     private func floatingFallback(_ start: Int) throws -> Config {
         let slice = UnsafeBufferPointer(rebasing: bytes[start..<pos])
-        let text = String(decoding: slice, as: UTF8.self)
-        guard let d = Double(text), d.isFinite else { throw JSONConfigError.invalidNumber(offset: start) }
+        guard let d = ReferenceFloatParser.parse(slice), d.isFinite else {
+            throw JSONConfigError.invalidNumber(offset: start)
+        }
         return Config(d)
     }
 

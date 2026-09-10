@@ -210,22 +210,15 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         let model: UnigramTokenizer
         let lattice = Lattice()
         @exclusivity(unchecked) private var alphabetScratch: [UInt8] = []
-        /// Whether this encoder owns the shared cache for the current call.
-        @exclusivity(unchecked) private(set) var usesCache = false
+        @exclusivity(unchecked) private var lease = PretokenCacheLease()
 
         init(model: UnigramTokenizer) {
             self.model = model
         }
 
-        override func begin() {
-            usesCache = model.cache.lock.tryLock()
-        }
+        override func begin() { lease.begin(shared: model.cache) }
 
-        override func finish() {
-            guard usesCache else { return }
-            usesCache = false
-            model.cache.lock.unlock()
-        }
+        override func finish() { lease.finish(shared: model.cache) }
 
         override func encode(piece: Substring, byteLevel: Bool, into ids: inout [Int]) {
             var copy = piece
@@ -241,10 +234,11 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
                 alphabetScratch.withUnsafeBufferPointer { encodeSegments($0, into: &ids) }
                 return
             }
-            if usesCache, model.cache.lookup(bytes, byteLevel: false, into: &ids) { return }
+            let cache = lease.cache
+            if let cache, cache.lookup(bytes, byteLevel: false, into: &ids) { return }
             let start = ids.count
             encodeSegments(bytes, into: &ids)
-            if usesCache { model.cache.insert(bytes, byteLevel: false, ids: ids[start...]) }
+            if let cache { cache.insert(bytes, byteLevel: false, ids: ids[start...]) }
         }
 
         private func encodeSegments(_ bytes: UnsafeBufferPointer<UInt8>, into ids: inout [Int]) {

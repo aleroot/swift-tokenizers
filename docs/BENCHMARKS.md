@@ -9,7 +9,7 @@ also use an M2. All figures are measurements, not projections.
 |---|---|
 | Machine | Apple M4 Pro, 24 GB, macOS 26.6.2 |
 | Toolchain | Apple Swift 6.3.3, `-c release`, Swift 6 language mode |
-| Concurrency | single-threaded everywhere; `RAYON_NUM_THREADS=1` for the Rust cores |
+| Concurrency | single-threaded everywhere except the "Concurrent encoding" section; `RAYON_NUM_THREADS=1` for the Rust cores |
 | Reference builds | Hugging Face `tokenizers` 0.22.2, `transformers` 4.57.6 (CPython), `tiktoken` 0.14.0, swift-transformers @ `c21fdcd` |
 | Correctness first | every swift-tokenizers result below was compared token-for-token with Hugging Face *before* it was timed — 0 mismatches (see [Correctness](#correctness-of-the-measured-outputs)) |
 | Units | `MB/s` is MiB/s (1,048,576 bytes) except in the end-to-end table, which is the harness's decimal MB/s |
@@ -338,6 +338,26 @@ swift-transformers matched only after alphabetically sorting the tool keys (3 of
 Falcon-H1R is the slowest family we ship: its split pattern has the most alternations of the
 hand-written scanners.
 
+## Concurrent encoding
+
+Aggregate `encode(text:)` throughput of one shared tokenizer called from N threads
+(`DispatchQueue.concurrentPerform`) over the mixed query / passage / multilingual corpus of the
+embedding benchmark, native Swift strings, M4 Pro:
+
+| Threads | Qwen3 (BPE) | Llama-2 (SentencePiece BPE) | XLM-R (Unigram) | BERT (WordPiece) |
+|---:|---:|---:|---:|---:|
+| 1 | 145 MB/s | 131 MB/s | 134 MB/s | 186 MB/s |
+| 2 | 268 MB/s | 242 MB/s | 243 MB/s | 320 MB/s |
+| 4 | 429 MB/s | 389 MB/s | 407 MB/s | 503 MB/s |
+| 8 | 446 MB/s | 381 MB/s | 360 MB/s | 390 MB/s |
+
+Before the shared reference counts were removed from the per-word paths, eight threads reached
+143 MB/s on Qwen3 and 25 MB/s on XLM-R: each contended atomic on a shared object costs more than
+encoding a short query. The remaining gap to linear scaling is per-call ARC traffic on the
+tokenizer and model objects; eight independent processes reach 1040 MB/s aggregate on Qwen3.
+Every thread memoises: the first caller to reach the shared pretoken cache uses it, the others
+use a 0.4 MB table of their own that lives with their pooled scratch.
+
 ## Where the time goes
 
 115 KB of prose through the Qwen3 pipeline, per stage:
@@ -403,7 +423,13 @@ hand-written over UTF-8 with NEON lane masks instead of being expressed as regul
   when they share a first byte), sections and pieces are byte ranges, model encoders and their
   working state (Viterbi lattice, merge buffers, WordPiece scratch) are pooled with the
   per-call scratch, and the pretoken → ids cache (WordPiece, BPE and Unigram) is an
-  arena-backed table with a `tryLock` so concurrent encodes never block.
+  arena-backed table with a `tryLock`; a caller that finds it taken memoises into a smaller
+  table of its own, so concurrent encodes never block.
+* **No shared reference counts on the hot path.** Tables read per byte or per word (vocabulary,
+  merges, symbol ids, the Metaspace marker) are raw buffers owned by their model, and per-match
+  appends borrow their source once. A retain on an object shared by every thread is an atomic
+  on one cache line, and a handful per word was enough to make eight threads slower than one.
+  Scratch free lists are striped by thread for the same reason.
   Scratch used by inputs larger than 1 MiB is released so document-sized outliers do not
   permanently enlarge a live tokenizer's buffer pool.
 * **WordPiece on bytes.** A word costs one hash probe when it is in the vocabulary; otherwise
@@ -420,7 +446,8 @@ hand-written over UTF-8 with NEON lane masks instead of being expressed as regul
 * **Fast configuration loading.** A purpose-built JSON parser produces `Config` trees directly
   (2.4× faster than `JSONSerialization` on a 10.9 MiB `tokenizer.json`, and 1.5× faster than
   the generic `Config(jsonData:)` path) and packs vocabularies and merges into flat buffers,
-  with `Double` precision so Unigram scores round exactly like the Rust implementation.
+  and reads floating-point scores with `serde_json`'s algorithm, so Unigram scores are
+  bit-identical to the Rust implementation's and Viterbi ties resolve the same way.
   Unicode classification tables ship as 2.6k run-length entries and the normalization tables as
   2.5k runs plus 1.5k decompositions; all expand in ~0.05 ms instead of querying scalar
   properties at launch.

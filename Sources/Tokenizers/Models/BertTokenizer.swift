@@ -263,20 +263,15 @@ extension BertTokenizer: FastTokenizingModel {
         let model: BertTokenizer
         @exclusivity(unchecked) private var scratch = WordpieceTokenizer.Scratch()
         @exclusivity(unchecked) private var alphabetScratch: [UInt8] = []
-        /// Whether this encoder owns the shared cache for the current call.
-        @exclusivity(unchecked) private(set) var usesCache = false
+        @exclusivity(unchecked) private var lease = PretokenCacheLease()
 
-        init(model: BertTokenizer) { self.model = model }
-
-        override func begin() {
-            usesCache = model.cache.lock.tryLock()
+        init(model: BertTokenizer) {
+            self.model = model
         }
 
-        override func finish() {
-            guard usesCache else { return }
-            usesCache = false
-            model.cache.lock.unlock()
-        }
+        override func begin() { lease.begin(shared: model.cache) }
+
+        override func finish() { lease.finish(shared: model.cache) }
 
         override func encode(piece: Substring, byteLevel: Bool, into ids: inout [Int]) {
             var copy = piece
@@ -292,7 +287,8 @@ extension BertTokenizer: FastTokenizingModel {
                 return
             }
             let mark = ids.count
-            if usesCache, model.cache.lookup(bytes, byteLevel: false, into: &ids) { return }
+            let cache = lease.cache
+            if let cache, cache.lookup(bytes, byteLevel: false, into: &ids) { return }
             if model.serializedWordPiece {
                 if !model.wordpieceTokenizer.encode(bytes, into: &ids, scratch: &scratch),
                     let unknown = model.unknownTokenId
@@ -307,7 +303,7 @@ extension BertTokenizer: FastTokenizingModel {
                     }
                 }
             }
-            if usesCache { model.cache.insert(bytes, byteLevel: false, ids: ids[mark...]) }
+            if let cache { cache.insert(bytes, byteLevel: false, ids: ids[mark...]) }
         }
     }
 }

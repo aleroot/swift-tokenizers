@@ -48,7 +48,7 @@ func compileRegex(_ pattern: String, component: String) throws -> NSRegularExpre
         let source = OnigurumaDialect.translate(pattern)
         // ICU rejects an empty source; the empty group has the same zero-width matches.
         return try NSRegularExpression(
-            pattern: source.isEmpty ? "(?:)" : source, options: [.anchorsMatchLines])
+            pattern: source.isEmpty ? "(?:)" : source, options: [.anchorsMatchLines, .useUnixLineSeparators])
     } catch {
         throw TokenizerError.invalidConfiguration(
             "\(component): invalid regular expression \(pattern.debugDescription)")
@@ -67,29 +67,62 @@ let maximumRegexLength = 8 << 10
 /// - `\w`, which is `[\p{Alphabetic}\p{M}\p{N}\p{Pc}]` in Oniguruma. ICU (like the `regex`
 ///   crate) adds ZWJ/ZWNJ and keeps only `\p{Nd}` of the numeric categories, so `½` and `²`
 ///   are word characters for Oniguruma but not for ICU.
+/// - Apple's ICU gives U+F7F0–U+F8FF (its corporate private-use area) letter, mark, number,
+///   punctuation and symbol categories; Unicode and Oniguruma classify them as `Co`. Every
+///   `\p{…}` is therefore intersected with or extended by that range.
 /// - `^` and `$`, which match at every line boundary in Oniguruma's Ruby syntax but only at
 ///   the start and end of the subject in ICU unless `.anchorsMatchLines` is set.
+/// - Line terminators: Oniguruma knows only `\n`, so `$` matches between `\r` and `\n` and `.`
+///   matches `\r`, U+0085, U+2028 and U+2029. ICU treats all of those as terminators, and
+///   `\r\n` as one, unless `.useUnixLineSeparators` is set.
+/// - `.`, which never matches `\n` in Ruby syntax and matches everything under its `m` option
+///   (anchors are always multi-line there, so `m` has nothing else to mean). ICU's dot-all
+///   also swallows `\r\n` as a unit, so `.` is spelled out as a class instead.
 ///
-/// Rewriting the class escapes and enabling `.anchorsMatchLines` removes both differences.
+/// Rewriting the escapes, `.` and options and enabling both ICU options removes the differences.
 enum OnigurumaDialect {
     /// Oniguruma's Unicode word characters, as a union usable inside a character class.
     static let wordMembers = #"\p{Alphabetic}\p{M}\p{N}\p{Pc}"#
 
+    /// Apple's ICU assigns letters, marks, numbers, punctuation and symbols to its corporate
+    /// private-use range; Unicode (and Oniguruma) classify those code points as `Co`.
+    static let applePrivateUse = #"[\x{F7F0}-\x{F8FF}]"#
+
+    /// Properties that contain the private-use range in Unicode, so the range is added to
+    /// them instead of removed.
+    private static let privateUseProperties: Set<String> = [
+        "c", "co", "other", "privateuse", "private_use", "gc=c", "gc=co", "generalcategory=c",
+        "general_category=c", "generalcategory=co", "general_category=co", "any", "assigned",
+        "unknown", "zzzz", "sc=zzzz", "sc=unknown", "script=unknown", "script=zzzz",
+    ]
+
     /// The ICU spelling of `\w` or `\W`. Inside a character class the positive form is a plain
     /// union; the complement stays a nested set, which ICU also accepts there.
     private static func expansion(word: Bool, inClass: Bool) -> String {
-        switch (word, inClass) {
-        case (true, true): return wordMembers
-        case (true, false): return "[\(wordMembers)]"
-        case (false, _): return "[^\(wordMembers)]"
-        }
+        word
+            ? "[[\(wordMembers)]--\(applePrivateUse)]"
+            : "[[^\(wordMembers)]\(applePrivateUse)]"
     }
 
-    /// Returns `pattern` with `\w` and `\W` rewritten to explicit ICU character classes.
-    /// Everything else — including escaped backslashes, `\p{…}` blocks and nested sets — is
-    /// copied through unchanged.
+    /// The ICU spelling of `\p{name}` (`positive`) or `\P{name}`, with the private-use range
+    /// classified as Unicode does.
+    private static func property(_ name: String, positive: Bool) -> String {
+        let key = name.lowercased().filter { $0 != " " && $0 != "-" }
+        let containsPrivateUse =
+            privateUseProperties.contains(key)
+            || privateUseProperties.contains(key.replacingOccurrences(of: "_", with: ""))
+        let escape = "\\\(positive ? "p" : "P"){\(name)}"
+        return containsPrivateUse == positive
+            ? "[\(escape)\(applePrivateUse)]"
+            : "[\(escape)--\(applePrivateUse)]"
+    }
+
+    /// Returns `pattern` with `\w` and `\W` rewritten to explicit ICU character classes, `.`
+    /// spelled out with Ruby's line semantics, and the `m` option consumed. Everything else —
+    /// including escaped backslashes, `\p{…}` blocks and nested sets — is copied through
+    /// unchanged.
     static func translate(_ pattern: String) -> String {
-        guard pattern.contains("\\w") || pattern.contains("\\W") else { return pattern }
+        guard pattern.contains("\\") || pattern.contains("(?") || pattern.contains(".") else { return pattern }
         let characters = Array(pattern)
         var output = String()
         output.reserveCapacity(pattern.count + 32)
@@ -97,6 +130,11 @@ enum OnigurumaDialect {
         /// Set after an expansion: a following `-` would read as an ICU range or set-difference
         /// operator, so it has to be escaped.
         var expanded = false
+        /// Whether `.` currently matches `\n` (Ruby's `m`), with the values to restore when the
+        /// enclosing groups close. ICU's dot-all consumes `\r\n` as a unit, so the option is
+        /// applied by spelling `.` out instead of being passed through.
+        var dotAll = false
+        var dotAllStack: [Bool] = []
         var index = 0
         while index < characters.count {
             let character = characters[index]
@@ -107,6 +145,30 @@ enum OnigurumaDialect {
                 if escaped == "w" || escaped == "W" {
                     output += expansion(word: escaped == "w", inClass: classDepth > 0)
                     expanded = true
+                } else if escaped == "p" || escaped == "P", index + 2 < characters.count {
+                    // `\p{Name}` or the single-letter `\pL` form.
+                    var name = ""
+                    var cursor = index + 2
+                    if characters[cursor] == "{" {
+                        cursor += 1
+                        while cursor < characters.count, characters[cursor] != "}" {
+                            name.append(characters[cursor])
+                            cursor += 1
+                        }
+                        cursor += 1
+                    } else {
+                        name = String(characters[cursor])
+                        cursor += 1
+                    }
+                    if name.hasPrefix("^") {
+                        name.removeFirst()
+                        output += property(name, positive: escaped == "P")
+                    } else {
+                        output += property(name, positive: escaped == "p")
+                    }
+                    expanded = true
+                    index = min(cursor, characters.count)
+                    continue
                 } else {
                     output.append(character)
                     output.append(escaped)
@@ -117,6 +179,44 @@ enum OnigurumaDialect {
             }
             if expanded, classDepth > 0, character == "-" { output.append("\\") }
             expanded = false
+            if classDepth == 0 {
+                // Option groups `(?imx-imx)` and `(?imx-imx:…)`.
+                if character == "(", index + 2 < characters.count, characters[index + 1] == "?" {
+                    var cursor = index + 2
+                    var options = ""
+                    var nextDotAll = dotAll
+                    var negated = false
+                    while cursor < characters.count, "imxadlu-".contains(characters[cursor]) {
+                        let option = characters[cursor]
+                        if option == "-" { negated = true }
+                        if option == "m" { nextDotAll = !negated } else { options.append(option) }
+                        cursor += 1
+                    }
+                    if options.hasSuffix("-") { options.removeLast() }
+                    if cursor < characters.count, characters[cursor] == ")", cursor > index + 2 {
+                        dotAll = nextDotAll
+                        if options != "-", !options.isEmpty { output += "(?" + options + ")" }
+                        index = cursor + 1
+                        continue
+                    }
+                    if cursor < characters.count, characters[cursor] == ":", cursor > index + 2 {
+                        dotAllStack.append(dotAll)
+                        dotAll = nextDotAll
+                        output += options.isEmpty || options == "-" ? "(?:" : "(?" + options + ":"
+                        index = cursor + 1
+                        continue
+                    }
+                }
+                if character == "(" {
+                    dotAllStack.append(dotAll)
+                } else if character == ")" {
+                    dotAll = dotAllStack.popLast() ?? false
+                } else if character == "." {
+                    output += dotAll ? #"[\s\S]"# : #"[^\n]"#
+                    index += 1
+                    continue
+                }
+            }
             switch character {
             case "[": classDepth += 1
             case "]" where classDepth > 0: classDepth -= 1

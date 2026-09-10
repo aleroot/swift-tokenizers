@@ -35,10 +35,11 @@ let prompt = try tokenizer.applyChatTemplate(messages: [
 ## Highlights
 
 - **Differentially tested.** Token IDs, decoded text, and source offsets are checked against
-  Hugging Face `tokenizers` 0.23.2 — whole tokenizers and each pipeline component on its own —
-  with Unicode conformance and regression tests.
+  Hugging Face `tokenizers` 0.23.2, whole tokenizers and each pipeline component on its own,
+  with Unicode conformance, regression and randomized differential tests.
 - **Fast inference.** SIMD scans, packed vocabulary storage, reusable buffers, and bounded
-  pretoken caches. Published performance comparisons specify their workloads and reference versions.
+  pretoken caches; concurrent encodes on one tokenizer scale across cores without blocking.
+  Published performance comparisons specify their workloads and reference versions.
 - **Complete inference surface.** Every model, normalizer, pre-tokenizer, post-processor and
   decoder of `tokenizers` 0.23.2, plus added and special tokens, chat templates with tools, and
   O(1) vocabulary lookup. Original-source offsets are available through an opt-in `encode`
@@ -78,7 +79,10 @@ let tokenizer = try await AutoTokenizer.from(modelFolder: modelFolder) // async
 ```
 
 Unknown `tokenizer_class` names resolve through the `model.type` of `tokenizer.json`, so new
-Hub classes load without a library update.
+Hub classes load without a library update. Added-token flags follow `transformers`: an
+`added_tokens_decoder` entry in `tokenizer_config.json` overrides the flags serialized in
+`tokenizer.json`, and the RoBERTa, XLM-R, BART, CamemBERT and related classes give `<mask>`
+`lstrip` when the configuration leaves `mask_token` unset.
 
 For in-memory tokenizer JSON, use `Config(tokenizerJSON:)`. It preserves byte-distinct vocabulary
 keys that Foundation's `JSONDecoder` can merge through Unicode canonical equivalence.
@@ -117,8 +121,15 @@ Swift/Foundation Unicode data, so behavior for newer characters can differ acros
 Source offsets preserve original positions even when unrecognized symbols are dropped.
 
 Regular expressions in `Split` and `Replace` configurations are written for Oniguruma, which
-differs from Foundation's ICU engine on `\w`/`\W` and on the `^`/`$` anchors. Those are
-translated at load time, so a configured pattern selects the same characters as upstream.
+differs from Foundation's ICU engine on `\w`/`\W`, on the `^`/`$` anchors and `.` (Ruby syntax
+knows only `\n` as a line terminator, and its `m` option is ICU's `s`), and on Apple's private-use
+range U+F7F0-U+F8FF, which Apple's ICU classifies as letters, numbers and symbols instead of
+`Co`. Those are translated at load time, so a configured pattern selects the same characters as
+upstream.
+
+Unigram scores are parsed with the same algorithm as the Rust `serde_json` reader rather than
+with correctly rounded conversion: a few scores differ by one ulp, and those decide Viterbi ties
+(T5 segments `-------` as `▁ --- --- -` for that reason).
 
 ### Chat templates and tools
 

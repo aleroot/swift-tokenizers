@@ -403,7 +403,10 @@ final class UnicodeScriptsPreTokenizer: ByteSplitter {
 
 /// Replaces spaces with a replacement character (SentencePiece's `▁`) and optionally
 /// prepends it, then splits so every chunk starts with the replacement.
-final class MetaspacePreTokenizer: ByteRewriter {
+///
+/// `@unchecked Sendable`: the replacement bytes are written once in `init` and only read
+/// afterwards.
+final class MetaspacePreTokenizer: ByteRewriter, @unchecked Sendable {
     static func validate(_ config: Config) throws {
         if !config.replacement.isNull(), config.replacement.string()?.unicodeScalars.count != 1 {
             throw TokenizerError.invalidConfiguration("Metaspace replacement must be one Unicode scalar")
@@ -412,8 +415,12 @@ final class MetaspacePreTokenizer: ByteRewriter {
     let addPrefixSpace: Bool
     let replacement: String
     let stringReplacement: String
-    private let replacementBytes: [UInt8]
+    /// The replacement's UTF-8, in storage owned by this instance: hot loops read it without
+    /// touching a shared reference count, which would serialize concurrent encodes.
+    private let replacementBytes: UnsafeBufferPointer<UInt8>
     private let stringReplacementBytes: [UInt8]
+
+    deinit { replacementBytes.deallocate() }
     /// `str_rep` differs from a plain space, so spaces are substituted rather than copied.
     private let substitutesSpace: Bool
     /// `str_rep` equals the multi-byte `replacement`: substitution and split fuse into one pass.
@@ -443,7 +450,9 @@ final class MetaspacePreTokenizer: ByteRewriter {
         replacement = config.replacement.string(or: " ")
         stringReplacement = config.strRep.string(or: replacement)
         split = config.split.boolean(or: true)
-        replacementBytes = Array(replacement.utf8)
+        let marker = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: replacement.utf8.count)
+        _ = marker.initialize(from: replacement.utf8)
+        replacementBytes = UnsafeBufferPointer(marker)
         stringReplacementBytes = Array(stringReplacement.utf8)
         substitutesSpace = stringReplacementBytes != [0x20]
         fusesMarker = stringReplacementBytes.elementsEqual(replacementBytes) && replacementBytes.count > 1
@@ -500,7 +509,7 @@ final class MetaspacePreTokenizer: ByteRewriter {
             var start = 0
             var i = 0
             while i + m <= length {
-                if text[i] == marker[0], m == 1 || memcmp(text.baseAddress! + i, marker, m) == 0 {
+                if text[i] == marker[0], m == 1 || memcmp(text.baseAddress! + i, marker.baseAddress!, m) == 0 {
                     if i > start { pieces.append(start..<i) }
                     start = i
                     i += m
@@ -530,7 +539,8 @@ final class MetaspacePreTokenizer: ByteRewriter {
             pieces.append(0..<(output.count - base))
             return
         }
-        replacementBytes.withUnsafeBufferPointer { marker in
+        do {
+            let marker = replacementBytes
             let lead = marker[0]
             let split = self.split
             output.appendUninitialized(maximum: (prefix ? m : 0) + n * m) { out in
@@ -736,14 +746,12 @@ final class DigitsPreTokenizer: ByteSplitter {
         if cursor < end { pieces.append(cursor..<end) }
     }
 
-    /// Rust `char::is_numeric` (general categories Nd, Nl, No).
+    /// Rust `char::is_numeric` (general categories Nd, Nl, No), from the table shared with the
+    /// regex scanners rather than a per-scalar property lookup.
     @inline(__always)
     private static func isDigit(_ value: UInt32) -> Bool {
         if value < 0x80 { return value >= 0x30 && value <= 0x39 }
-        switch Unicode.Scalar(value)?.properties.generalCategory {
-        case .decimalNumber, .letterNumber, .otherNumber: return true
-        default: return false
-        }
+        return ScalarClassifier.flags(value: value) & ScalarFlags.number != 0
     }
 }
 
@@ -755,8 +763,9 @@ final class SplitPreTokenizer: ByteSplitter {
     let invert: Bool
     /// Set when the regex is one of the hand-optimised byte-level patterns.
     let known: KnownSplitPattern?
-    /// `[0-9]` with `Isolated` behaviour (Falcon-H1): every ASCII digit becomes its own chunk.
-    let asciiDigitsIsolated: Bool
+    /// `[0-9]` (Falcon-H1) or `[0-9][0-9][0-9]` / `[0-9]{3}` (Falcon) with `Isolated`
+    /// behaviour: runs of ASCII digits are cut into groups of this many digits, left to right.
+    let asciiDigitGroup: Int?
     /// A literal (`pattern.String`) delimiter, split on raw UTF-8 with `behavior`.
     let literal: [UInt8]?
     let behavior: PunctuationPreTokenizer.Behavior
@@ -772,15 +781,17 @@ final class SplitPreTokenizer: ByteSplitter {
         } else {
             known = nil
         }
-        asciiDigitsIsolated =
-            source == "[0-9]" && !config.invert.boolean(or: false)
-            && (config.behavior.string() ?? "Isolated") == "Isolated"
+        if let source, !config.invert.boolean(or: false), (config.behavior.string() ?? "Isolated") == "Isolated" {
+            asciiDigitGroup = Self.asciiDigitGroup(of: source)
+        } else {
+            asciiDigitGroup = nil
+        }
         if let string = config.pattern.String.string(), !string.isEmpty, !config.invert.boolean(or: false) {
             literal = Array(string.utf8)
         } else {
             literal = nil
         }
-        if known == nil, !asciiDigitsIsolated, literal == nil, let pattern {
+        if known == nil, asciiDigitGroup == nil, literal == nil, let pattern {
             switch pattern {
             case .regexp(let regex): fallbackRegex = regex
             case .string(let string):
@@ -799,8 +810,8 @@ final class SplitPreTokenizer: ByteSplitter {
     func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
         if let known {
             known.split(bytes, into: &pieces)
-        } else if asciiDigitsIsolated {
-            Self.splitASCIIDigits(bytes, into: &pieces)
+        } else if let asciiDigitGroup {
+            Self.splitASCIIDigits(bytes, group: asciiDigitGroup, into: &pieces)
         } else if let literal {
             splitLiteral(bytes, literal, into: &pieces)
         } else if let fallbackRegex {
@@ -894,13 +905,44 @@ final class SplitPreTokenizer: ByteSplitter {
 
     /// Isolates ASCII digits. The byte-level alphabet maps `0`–`9` to themselves, so the split
     /// is identical on raw and on mapped text.
-    static func splitASCIIDigits(_ bytes: UnsafeBufferPointer<UInt8>, into pieces: inout [Range<Int>]) {
-        var start = 0
-        for i in 0..<bytes.count where bytes[i] >= 0x30 && bytes[i] <= 0x39 {
-            if i > start { pieces.append(start..<i) }
-            pieces.append(i..<i + 1)
-            start = i + 1
+    /// The digit count when `source` is `[0-9]`, `[0-9][0-9]…` or `[0-9]{n}`, else `nil`.
+    static func asciiDigitGroup(of source: String) -> Int? {
+        let unit = "[0-9]"
+        guard source.hasPrefix(unit) else { return nil }
+        var count = 0
+        var rest = Substring(source)
+        while rest.hasPrefix(unit) {
+            count += 1
+            rest = rest.dropFirst(unit.count)
         }
-        if start < bytes.count { pieces.append(start..<bytes.count) }
+        if rest.isEmpty { return count }
+        guard count == 1, rest.hasPrefix("{"), rest.hasSuffix("}") else { return nil }
+        guard let n = Int(rest.dropFirst().dropLast()), n > 0 else { return nil }
+        return n
+    }
+
+    /// Every match of `[0-9]{group}` (greedy, left to right, as the regex would find them)
+    /// becomes its own chunk; shorter digit runs and remainders stay with the text around them.
+    static func splitASCIIDigits(_ bytes: UnsafeBufferPointer<UInt8>, group: Int, into pieces: inout [Range<Int>]) {
+        let n = bytes.count
+        var start = 0
+        var i = 0
+        while i < n {
+            guard bytes[i] >= 0x30, bytes[i] <= 0x39 else {
+                i += 1
+                continue
+            }
+            var end = i
+            while end < n, bytes[end] >= 0x30, bytes[end] <= 0x39 { end += 1 }
+            var cursor = i
+            while end - cursor >= group {
+                if cursor > start { pieces.append(start..<cursor) }
+                pieces.append(cursor..<cursor + group)
+                cursor += group
+                start = cursor
+            }
+            i = end
+        }
+        if start < n { pieces.append(start..<n) }
     }
 }

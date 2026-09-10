@@ -961,6 +961,19 @@ enum StringReplacePattern: Sendable {
     static func replaceLiteral(
         _ bytes: UnsafeBufferPointer<UInt8>, pattern: [UInt8], with replacement: [UInt8], into output: inout [UInt8]
     ) {
+        // Borrow both arrays once: appending from the array values inside the loop would retain
+        // and release shared storage per match, which serializes concurrent encodes.
+        pattern.withUnsafeBufferPointer { pattern in
+            replacement.withUnsafeBufferPointer { replacement in
+                replaceLiteral(bytes, pattern: pattern, with: replacement, into: &output)
+            }
+        }
+    }
+
+    private static func replaceLiteral(
+        _ bytes: UnsafeBufferPointer<UInt8>, pattern: UnsafeBufferPointer<UInt8>,
+        with replacement: UnsafeBufferPointer<UInt8>, into output: inout [UInt8]
+    ) {
         let n = bytes.count
         let m = pattern.count
         if m == 0 {
@@ -970,13 +983,13 @@ enum StringReplacePattern: Sendable {
             while i < n {
                 output.append(contentsOf: replacement)
                 let end = i + UTF8Cursor.width(bytes[i])
-                output.append(contentsOf: bytes[i..<end])
+                output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<end]))
                 i = end
             }
             output.append(contentsOf: replacement)
             return
         }
-        guard m > 0, m <= n, let base = bytes.baseAddress else {
+        guard m > 0, m <= n, let base = bytes.baseAddress, let patternBase = pattern.baseAddress else {
             output.append(contentsOf: bytes)
             return
         }
@@ -986,7 +999,7 @@ enum StringReplacePattern: Sendable {
         while i + m <= n {
             guard let hit = memchr(base + i, first, n - m + 1 - i) else { break }
             let p = UnsafePointer<UInt8>(hit.assumingMemoryBound(to: UInt8.self)) - base
-            if m == 1 || memcmp(base + p, pattern, m) == 0 {
+            if m == 1 || memcmp(base + p, patternBase, m) == 0 {
                 output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[cursor..<p]))
                 output.append(contentsOf: replacement)
                 cursor = p + m

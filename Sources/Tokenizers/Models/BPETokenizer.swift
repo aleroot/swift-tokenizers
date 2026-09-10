@@ -21,18 +21,33 @@ struct BytePair: Hashable, Sendable {
     }
 }
 
-final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendable {
+/// `@unchecked Sendable`: the symbol tables are filled during initialization and read-only
+/// afterwards. They are raw buffers owned by the instance so the per-symbol loops never touch a
+/// reference count shared between concurrent encodes.
+final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchecked Sendable {
     let vocab: Vocabulary
     let modelVocabulary: ModelVocabulary
     let merges: MergeTable
 
     /// Ids of the single-alphabet-character tokens for every byte value (`-1` if missing).
-    let byteSymbolIds: [Int32]
+    let byteSymbolIds: UnsafeBufferPointer<Int32>
     /// Ids of single-scalar tokens for scalars below `scalarTableLimit` (`-1` if missing).
-    let scalarSymbolIds: [Int32]
+    let scalarSymbolIds: UnsafeBufferPointer<Int32>
     static let scalarTableLimit: UInt32 = 0x800
     /// Ids of `<0xNN>` byte-fallback tokens (`-1` if missing).
-    let hexaTokenIds: [Int32]
+    let hexaTokenIds: UnsafeBufferPointer<Int32>
+
+    deinit {
+        byteSymbolIds.deallocate()
+        scalarSymbolIds.deallocate()
+        hexaTokenIds.deallocate()
+    }
+
+    private static func owned(_ values: [Int32]) -> UnsafeBufferPointer<Int32> {
+        let buffer = UnsafeMutableBufferPointer<Int32>.allocate(capacity: values.count)
+        _ = buffer.initialize(from: values)
+        return UnsafeBufferPointer(buffer)
+    }
 
     /// Number of symbol ids in use (vocabulary size plus synthetic merge products).
     let symbolCount: Int
@@ -101,7 +116,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         let prefixBytes: [UInt8]
         var synthetic: [BinaryDistinctString: Int32] = [:]
         var nextSynthetic: Int32
-        var table: MergeTable
+        var table: MergeTableBuilder
         var concat: [UInt8] = []
         var chunkingSafe: Bool
         var guards: [(bytes: [UInt8], offset: Int)] = []
@@ -113,7 +128,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
             self.vocab = vocab
             prefixBytes = continuingPrefix.isEmpty ? [] : Array(continuingPrefix.utf8)
             nextSynthetic = Int32(vocab.count)
-            table = MergeTable(expectedCount: expectedCount)
+            table = MergeTableBuilder(expectedCount: expectedCount)
             concat.reserveCapacity(64)
             chunkingSafe =
                 vocab.id(of: sentencePieceUnderline) != nil && continuingPrefix.isEmpty && endSuffix.isEmpty
@@ -180,7 +195,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
 
         func finish() -> (table: MergeTable, symbolCount: Int, chunking: Bool, guards: [(bytes: [UInt8], offset: Int)])
         {
-            (table, Int(nextSynthetic), chunkingSafe, chunkingSafe ? guards : [])
+            (table.build(), Int(nextSynthetic), chunkingSafe, chunkingSafe ? guards : [])
         }
     }
 
@@ -268,20 +283,20 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         for b in 0..<256 {
             byteIds[b] = modelVocabulary.id(ofScalar: Unicode.Scalar(ByteLevelAlphabet.byteToScalar[b])!)
         }
-        byteSymbolIds = byteIds
+        byteSymbolIds = Self.owned(byteIds)
 
         var scalarIds = [Int32](repeating: -1, count: Int(Self.scalarTableLimit))
         for v in 0..<Self.scalarTableLimit {
             guard let scalar = Unicode.Scalar(v) else { continue }
             scalarIds[Int(v)] = modelVocabulary.id(ofScalar: scalar)
         }
-        scalarSymbolIds = scalarIds
+        scalarSymbolIds = Self.owned(scalarIds)
 
         var hexa = [Int32](repeating: -1, count: 256)
         for b in 0..<256 {
             hexa[b] = Int32(modelVocabulary.id(of: Self.hexaTokenStrings[b]) ?? -1)
         }
-        hexaTokenIds = hexa
+        hexaTokenIds = Self.owned(hexa)
 
         if let unk = TokenizerModel.unknownToken(from: tokenizerConfig) ?? tokenizerData.model.unkToken.string() {
             unknownToken = unk
@@ -569,7 +584,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
 
     /// Stateful encoder holding scratch buffers, pooled across `encode` calls. Each call tries
     /// to take ownership of the shared pretoken cache; if another thread holds it, encoding
-    /// proceeds without memoisation rather than blocking.
+    /// memoises into a private table rather than blocking.
     ///
     /// The buffers are only ever touched by the single caller holding the encoder, so dynamic
     /// exclusivity enforcement on them is pure overhead.
@@ -578,23 +593,16 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         @exclusivity(unchecked) var symbols: [Symbol] = []
         @exclusivity(unchecked) var scratch = MergeScratch()
         @exclusivity(unchecked) var fallbackBytes: [UInt8] = []
-        /// Whether this encoder owns the shared cache for the current call.
-        @exclusivity(unchecked) private(set) var usesCache = false
+        @exclusivity(unchecked) private var lease = PretokenCacheLease()
 
         init(model: BPETokenizer) {
             self.model = model
             symbols.reserveCapacity(64)
         }
 
-        override func begin() {
-            usesCache = model.cache.lock.tryLock()
-        }
+        override func begin() { lease.begin(shared: model.cache) }
 
-        override func finish() {
-            guard usesCache else { return }
-            usesCache = false
-            model.cache.lock.unlock()
-        }
+        override func finish() { lease.finish(shared: model.cache) }
 
         override func encode(piece: Substring, byteLevel: Bool, into ids: inout [Int]) {
             var word = piece
@@ -656,7 +664,8 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
         }
 
         private func encodeWord(_ bytes: UnsafeBufferPointer<UInt8>, byteLevel: Bool, into ids: inout [Int]) {
-            if usesCache, model.cache.lookup(bytes, byteLevel: byteLevel, into: &ids) {
+            let cache = lease.cache
+            if let cache, cache.lookup(bytes, byteLevel: byteLevel, into: &ids) {
                 return
             }
             let start = ids.count
@@ -672,7 +681,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
                 }
                 if id >= 0 {
                     ids.append(Int(id))
-                    if usesCache { model.cache.insert(bytes, byteLevel: byteLevel, ids: ids[start...]) }
+                    if let cache { cache.insert(bytes, byteLevel: byteLevel, ids: ids[start...]) }
                     return
                 }
             }
@@ -695,8 +704,8 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sendabl
                 }
             }
 
-            if usesCache {
-                model.cache.insert(bytes, byteLevel: byteLevel, ids: ids[start...])
+            if let cache {
+                cache.insert(bytes, byteLevel: byteLevel, ids: ids[start...])
             }
         }
 

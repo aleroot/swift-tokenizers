@@ -594,15 +594,84 @@ struct OnigurumaDialectTests {
         #expect(normalizer.normalize(text: "a\n  b\n  c") == "a\nb\nc")
     }
 
+    @Test("Only \\n is a line terminator, as in Ruby syntax")
+    func lineTerminators() throws {
+        // `$` matches between `\r` and `\n`; `.` matches `\r`, NEL and the Unicode separators.
+        let anchored = try SplitPreTokenizer(
+            config: ["pattern": ["Regex": #"^\s+|\s+$|\s+"#], "behavior": "Isolated", "invert": false])
+        #expect(anchored.preTokenize(text: "crlf\r\nend") == ["crlf", "\r", "\n", "end"])
+        let dot = try SplitPreTokenizer(
+            config: ["pattern": ["Regex": #"[a-z]+|."#], "behavior": "Isolated", "invert": false])
+        #expect(
+            dot.preTokenize(text: "a\rb\u{85}c\u{2028}d\ne") == [
+                "a", "\r", "b", "\u{85}", "c", "\u{2028}", "d", "\n", "e",
+            ])
+        // Ruby's `m` option is ICU's `s`: `.` also matches `\n`.
+        let dotall = try SplitPreTokenizer(
+            config: ["pattern": ["Regex": #"(?m)[a-z]+|."#], "behavior": "Isolated", "invert": false])
+        #expect(dotall.preTokenize(text: "ab\r\n\ncd") == ["ab", "\r", "\n", "\n", "cd"])
+        #expect(OnigurumaDialect.translate(#"(?m)a."#) == #"a[\s\S]"#)
+        #expect(OnigurumaDialect.translate(#"(?mi:a.)|(?-m)b."#) == #"(?i:a[\s\S])|b[^\n]"#)
+        #expect(OnigurumaDialect.translate(#"(?m)(a.)."#) == #"(a[\s\S])[\s\S]"#)
+        #expect(OnigurumaDialect.translate(#"(?i-m:a.)."#) == #"(?i:a[^\n])[^\n]"#)
+        #expect(OnigurumaDialect.translate(#"(?i:'s|'m)"#) == #"(?i:'s|'m)"#)
+        #expect(OnigurumaDialect.translate(#"[(?m).]\."#) == #"[(?m).]\."#)
+        #expect(OnigurumaDialect.translate(#"(?=.)(?!.)(?<=.)"#) == #"(?=[^\n])(?![^\n])(?<=[^\n])"#)
+    }
+
+    @Test("ASCII digit groups take the scanner path with regex results")
+    func asciiDigitGroups() throws {
+        // Expectations from `tokenizers.pre_tokenizers.Split(Regex(pattern), "isolated")`.
+        for pattern in [#"[0-9][0-9][0-9]"#, #"[0-9]{3}"#] {
+            let split = try SplitPreTokenizer(
+                config: ["pattern": ["Regex": Config(pattern)], "behavior": "Isolated", "invert": false])
+            #expect(split.preTokenize(text: "12345") == ["123", "45"])
+            #expect(split.preTokenize(text: "a1234567b") == ["a", "123", "456", "7b"])
+            #expect(split.preTokenize(text: "12 345 6789") == ["12 ", "345", " ", "678", "9"])
+            #expect(split.preTokenize(text: "١٢٣45") == ["١٢٣45"])
+            #expect(split.preTokenize(text: "123") == ["123"])
+            #expect(split.preTokenize(text: "") == [])
+        }
+        let single = try SplitPreTokenizer(
+            config: ["pattern": ["Regex": #"[0-9]"#], "behavior": "Isolated", "invert": false])
+        #expect(single.preTokenize(text: "١٢٣45") == ["١٢٣", "4", "5"])
+        #expect(SplitPreTokenizer.asciiDigitGroup(of: "[0-9]") == 1)
+        #expect(SplitPreTokenizer.asciiDigitGroup(of: "[0-9]{12}") == 12)
+        #expect(SplitPreTokenizer.asciiDigitGroup(of: "[0-9]+") == nil)
+        #expect(SplitPreTokenizer.asciiDigitGroup(of: "[0-9]{1,3}") == nil)
+        #expect(SplitPreTokenizer.asciiDigitGroup(of: "[0-9][0-9]{3}") == nil)
+    }
+
     @Test("Escapes, nested classes and complements survive translation")
     func translation() {
+        let members = OnigurumaDialect.wordMembers
+        let pua = OnigurumaDialect.applePrivateUse
         #expect(OnigurumaDialect.translate(#"abc"#) == #"abc"#)
         #expect(OnigurumaDialect.translate(#"\\w"#) == #"\\w"#)  // an escaped backslash, then a literal `w`
-        #expect(OnigurumaDialect.translate(#"\w"#) == "[\(OnigurumaDialect.wordMembers)]")
-        #expect(OnigurumaDialect.translate(#"[\w]"#) == "[\(OnigurumaDialect.wordMembers)]")
-        #expect(OnigurumaDialect.translate(#"[\w-]"#) == "[\(OnigurumaDialect.wordMembers)\\-]")
-        #expect(OnigurumaDialect.translate(#"\W"#) == "[^\(OnigurumaDialect.wordMembers)]")
-        #expect(OnigurumaDialect.translate(#"\p{L}\d\s"#) == #"\p{L}\d\s"#)
+        #expect(OnigurumaDialect.translate(#"\w"#) == "[[\(members)]--\(pua)]")
+        #expect(OnigurumaDialect.translate(#"[\w]"#) == "[[[\(members)]--\(pua)]]")
+        #expect(OnigurumaDialect.translate(#"[\w-]"#) == "[[[\(members)]--\(pua)]\\-]")
+        #expect(OnigurumaDialect.translate(#"\W"#) == "[[^\(members)]\(pua)]")
+        #expect(OnigurumaDialect.translate(#"\d\s"#) == #"\d\s"#)
+        #expect(OnigurumaDialect.translate(#"\p{L}"#) == "[\\p{L}--\(pua)]")
+        #expect(OnigurumaDialect.translate(#"\P{L}"#) == "[\\P{L}\(pua)]")
+        #expect(OnigurumaDialect.translate(#"\p{^L}"#) == "[\\P{L}\(pua)]")
+        #expect(OnigurumaDialect.translate(#"\pL"#) == "[\\p{L}--\(pua)]")
+        #expect(OnigurumaDialect.translate(#"\p{Co}"#) == "[\\p{Co}\(pua)]")
+        #expect(OnigurumaDialect.translate(#"\P{Co}"#) == "[\\P{Co}--\(pua)]")
+        #expect(OnigurumaDialect.translate(#"[^\r\n\p{L}\p{N}]"#) == "[^\\r\\n[\\p{L}--\(pua)][\\p{N}--\(pua)]]")
+    }
+
+    @Test("Apple private-use code points keep their Unicode category")
+    func applePrivateUse() throws {
+        // U+F8E1 is `\p{S}` and U+F8C1 is `\p{L}` for Apple's ICU; Unicode says `Co`.
+        let pattern = #"[\p{P}\p{S}]+|[\p{L}\p{M}]+|\p{N}+|\w+|[^\s\p{L}\p{N}\p{P}\p{S}]+"#
+        let split = try SplitPreTokenizer(
+            config: ["pattern": ["Regex": Config(pattern)], "behavior": "Isolated", "invert": false])
+        #expect(split.preTokenize(text: "a\u{F8E1}*\u{F8C1}b") == ["a", "\u{F8E1}", "*", "\u{F8C1}", "b"])
+        let other = try SplitPreTokenizer(
+            config: ["pattern": ["Regex": #"\p{Co}+"#], "behavior": "Isolated", "invert": false])
+        #expect(other.preTokenize(text: "a\u{F8E1}\u{E000}b") == ["a", "\u{F8E1}\u{E000}", "b"])
     }
 
     @Test("Every translated pattern still compiles")
