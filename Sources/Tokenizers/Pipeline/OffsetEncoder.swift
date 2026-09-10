@@ -143,14 +143,10 @@ extension EncodePipeline {
             if let normalizer { part = try part.normalized(by: normalizer) }
             for (subrange, token) in sections(part, normalizedSplitter) {
                 if let token { onToken(token, part.slice(subrange)); continue }
-                let options: PreTokenizerOptions = part.sourceRange(subrange).lowerBound == 0 ? [.firstSection] : []
+                let flags: PreTokenizerFlags = part.sourceRange(subrange).lowerBound == 0 ? .firstSection : []
                 let piece = part.slice(subrange)
-                if let preTokenizer {
-                    try preTokenizer.runAligned(piece, options: options) { piece, byteLevel in
-                        try onPiece(piece, byteLevel)
-                    }
-                } else {
-                    try onPiece(piece, false)
+                try preTokenizer.runAligned(piece, flags: flags) { piece, byteLevel in
+                    try onPiece(piece, byteLevel)
                 }
             }
         }
@@ -203,25 +199,24 @@ extension EncodePipeline {
 }
 
 extension PreTokenizationRunner {
-    func runAligned(_ text: AlignedText, options: PreTokenizerOptions,
+    func runAligned(_ text: AlignedText, flags: PreTokenizerFlags,
                     _ body: (AlignedText, Bool) throws -> Void) throws {
-        if stages.contains(where: { if case .rewrite = $0 { return true }; return false }) {
-            for (piece, byteLevel) in try alignedPieces(text, options: options) { try body(piece, byteLevel) }
-            return
-        }
-        var current = [0..<text.bytes.count]
-        var next: [Range<Int>] = []
-        var byteLevel = false
-        try text.bytes.withUnsafeBufferPointer { bytes in
-            for stage in stages {
-                switch stage {
-                case .byteLevel: byteLevel = true
-                case let .split(splitter):
+        // No stages: the text is its own single piece, empty or not, exactly as for a tokenizer
+        // that declares no pre-tokenizer.
+        guard !stages.isEmpty else { return try body(text, false) }
+        guard rewritesText else {
+            // Only a trailing `byteLevel` marker can appear here: a marker followed by more
+            // stages is compiled into a rewrite, which is what `rewritesText` reports.
+            let byteLevel = stages.last?.shape == .byteLevel
+            var current = [0..<text.bytes.count]
+            var next: [Range<Int>] = []
+            try text.bytes.withUnsafeBufferPointer { bytes in
+                for stage in stages where stage.shape == .split {
                     next.removeAll(keepingCapacity: true)
                     for range in current {
                         let mark = next.count
-                        splitter.split(UnsafeBufferPointer(rebasing: bytes[range]),
-                            options: range.lowerBound == 0 ? options : [], into: &next)
+                        stage.split(UnsafeBufferPointer(rebasing: bytes[range]),
+                            flags: range.lowerBound == 0 ? flags : [], into: &next)
                         if range.lowerBound != 0 {
                             for i in mark..<next.count {
                                 next[i] = next[i].lowerBound + range.lowerBound..<next[i].upperBound + range.lowerBound
@@ -229,36 +224,37 @@ extension PreTokenizationRunner {
                         }
                     }
                     swap(&current, &next)
-                case .rewrite: break
                 }
+                for range in current where !range.isEmpty { try body(text.slice(range), byteLevel) }
             }
-            for range in current where !range.isEmpty { try body(text.slice(range), byteLevel) }
+            return
         }
+        for (piece, byteLevel) in try alignedPieces(text, flags: flags) { try body(piece, byteLevel) }
     }
 
-    func alignedPieces(_ text: AlignedText, options: PreTokenizerOptions) throws -> [(AlignedText, Bool)] {
-        var pieces: [(AlignedText, PreTokenizerOptions)] = [(text, options)]
+    func alignedPieces(_ text: AlignedText, flags: PreTokenizerFlags) throws -> [(AlignedText, Bool)] {
+        var pieces: [(AlignedText, PreTokenizerFlags)] = [(text, flags)]
         var byteLevel = false
         for stage in stages {
-            switch stage {
+            switch stage.shape {
             case .byteLevel: byteLevel = true
-            case let .split(splitter):
-                pieces = pieces.flatMap { text, options in
+            case .split:
+                pieces = pieces.flatMap { text, flags in
                     var ranges: [Range<Int>] = []
-                    text.bytes.withUnsafeBufferPointer { splitter.split($0, options: options, into: &ranges) }
+                    text.bytes.withUnsafeBufferPointer { stage.split($0, flags: flags, into: &ranges) }
                     return ranges.filter { !$0.isEmpty }.map {
-                        (
-                            text.slice($0),
-                            text.sourceRange($0).lowerBound == 0 ? PreTokenizerOptions([.firstSection]) : []
-                        )
+                        (text.slice($0), text.sourceRange($0).lowerBound == 0 ? PreTokenizerFlags.firstSection : [])
                     }
                 }
-            case let .rewrite(rewriter):
-                var next: [(AlignedText, PreTokenizerOptions)] = []
-                for (text, options) in pieces {
+            case .rewrite:
+                guard let rewriter = stage.source as? any ByteRewriter else {
+                    throw TokenizerError.unsupportedComponent("offsets for pre-tokenizer \(type(of: stage))")
+                }
+                var next: [(AlignedText, PreTokenizerFlags)] = []
+                for (text, flags) in pieces {
                     var bytes: [UInt8] = []
                     var ranges: [Range<Int>] = []
-                    text.bytes.withUnsafeBufferPointer { rewriter.rewrite($0, options: options, into: &bytes, pieces: &ranges) }
+                    text.bytes.withUnsafeBufferPointer { rewriter.rewrite($0, flags: flags, into: &bytes, pieces: &ranges) }
                     var origins: [Range<Int>] = []
                     origins.reserveCapacity(bytes.count)
                     switch rewriter {
@@ -282,7 +278,7 @@ extension PreTokenizationRunner {
                             replacement = Array(metaspace.stringReplacement.utf8)
                             let marker = Array(metaspace.replacement.utf8)
                             let needsPrefix = metaspace.prependScheme == .always
-                                || metaspace.prependScheme == .first && options.contains(.firstSection)
+                                || metaspace.prependScheme == .first && flags.contains(.firstSection)
                             prefix = !text.bytes.isEmpty && needsPrefix && !text.bytes.starts(with: marker)
                                 && !(text.bytes.first == 0x20 && replacement.starts(with: marker))
                         } else if rewriter is ByteLevelPreTokenizer.PrefixSpaceRewriter {
@@ -305,7 +301,7 @@ extension PreTokenizationRunner {
                     next.append(contentsOf: ranges.filter { !$0.isEmpty }.map {
                             (
                                 rewritten.slice($0),
-                                rewritten.sourceRange($0).lowerBound == 0 ? PreTokenizerOptions([.firstSection]) : []
+                                rewritten.sourceRange($0).lowerBound == 0 ? PreTokenizerFlags.firstSection : []
                             )
                         })
                 }

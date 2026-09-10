@@ -6,57 +6,76 @@ import Foundation
 
 // MARK: - Pre-tokenization runner
 
-/// Executes ``PreTokenizationStage``s over a chunk of UTF-8 text.
-struct PreTokenizationRunner: Sendable {
+/// Executes compiled ``PreTokenizationStage``s over a chunk of UTF-8 text.
+///
+/// The runner owns its stages and lends them out by unmanaged reference, so running one is a
+/// single virtual call and no reference counting. A tokenizer is shared by every thread that
+/// encodes with it, and so are its stages: reading them out of an array per piece costs a
+/// contended atomic pair per stage, which is what stops the pipeline scaling past a few threads.
+final class PreTokenizationRunner: @unchecked Sendable {
     /// The stages, with a non-final `byteLevel` marker compiled into a rewrite that
     /// materialises the alphabet form (the following stages then see plain text, as in
     /// `tokenizers`).
     let stages: [PreTokenizationStage]
+    /// ``stages`` as unmanaged references, for the hot loop to borrow. The array above is what
+    /// keeps them alive.
+    private let borrowed: UnsafeMutableBufferPointer<Unmanaged<PreTokenizationStage>>
     let needsOriginalStart: Bool
     let rewritesBeforeFirst: Bool
+    /// Whether any stage replaces the text later stages see. The offset pipeline branches on it.
+    let rewritesText: Bool
 
     init(stages: [PreTokenizationStage]) {
         var compiled: [PreTokenizationStage] = []
         for (index, stage) in stages.enumerated() {
-            if case .byteLevel = stage, index != stages.count - 1 {
-                compiled.append(.rewrite(ByteLevelMaterializer()))
+            if stage.shape == .byteLevel, index != stages.count - 1 {
+                compiled.append(RewriteStage(ByteLevelMaterializer()))
             } else {
                 compiled.append(stage)
             }
         }
         self.stages = compiled
-        needsOriginalStart = compiled.contains {
-            if case let .rewrite(rewriter) = $0, let metaspace = rewriter as? MetaspacePreTokenizer {
-                return metaspace.prependScheme == .first
-            }
-            return false
-        }
+        let table = UnsafeMutableBufferPointer<Unmanaged<PreTokenizationStage>>.allocate(capacity: compiled.count)
+        for (index, stage) in compiled.enumerated() { table[index] = .passUnretained(stage) }
+        borrowed = table
+
+        // Metaspace's `prepend_scheme: first` tests the offset in the *original* text, so the
+        // stages have to be run through the alignment pipeline whenever anything rewrote the
+        // text before that Metaspace.
+        needsOriginalStart = compiled.contains { Self.prependsToFirstSectionOnly($0) }
         var rewritten = false
         var needsMapping = false
-        for stage in compiled {
-            if case let .rewrite(rewriter) = stage {
-                if let metaspace = rewriter as? MetaspacePreTokenizer, metaspace.prependScheme == .first {
-                    needsMapping = needsMapping || rewritten
-                }
-                rewritten = true
-            }
+        for stage in compiled where stage.shape == .rewrite {
+            if Self.prependsToFirstSectionOnly(stage) { needsMapping = needsMapping || rewritten }
+            rewritten = true
         }
+        rewritesText = rewritten
         rewritesBeforeFirst = needsMapping
     }
 
+    deinit { borrowed.deallocate() }
+
+    /// Whether `stage` is a Metaspace that prepends its replacement only to the first section.
+    private static func prependsToFirstSectionOnly(_ stage: PreTokenizationStage) -> Bool {
+        (stage.source as? MetaspacePreTokenizer)?.prependScheme == .first
+    }
+
     /// Calls `body(piece, byteLevel)` for every piece of `bytes`, in order.
-    /// - Parameter options: `.firstSection` is passed on only to the piece that still starts at
+    /// - Parameter flags: `.firstSection` is passed on only to the piece that still starts at
     ///   offset 0 of the text, as in `tokenizers` (Metaspace's `prepend_scheme: first` checks
     ///   the original offset, so a leading-whitespace split loses it).
     func run(
-        _ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, scratch: ScratchBuffers,
+        _ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, scratch: ScratchBuffers,
         _ body: (UnsafeBufferPointer<UInt8>, Bool) -> Void
     ) {
+        // No stages: the text is its own single piece, as it is for a tokenizer that declares no
+        // pre-tokenizer at all.
+        guard !borrowed.isEmpty else { return body(bytes, false) }
         if rewritesBeforeFirst {
             let source = AlignedText(
                 bytes: Array(bytes)[...], origins: nil,
-                sourceStart: options.contains(.firstSection) ? 0 : 1)
-            if let pieces = try? alignedPieces(source, options: options) {
+                sourceStart: flags.contains(.firstSection) ? 0 : 1)
+            if let pieces = try? alignedPieces(source, flags: flags) {
                 for (piece, byteLevel) in pieces { piece.bytes.withUnsafeBufferPointer { body($0, byteLevel) } }
                 return
             }
@@ -73,43 +92,42 @@ struct PreTokenizationRunner: Sendable {
         }
         current.append(0..<bytes.count)
         var byteLevel = false
-        // Avoid allocating a `Set` per call for the common `[.firstSection]` / `[]` inputs.
-        let rest: PreTokenizerOptions =
-            options.count == 1 && options.contains(.firstSection) || options.isEmpty
-            ? [] : options.subtracting([.firstSection])
-        var first = options
+        var first = flags
+        let rest = flags.subtracting(.firstSection)
 
-        for stage in stages {
-            switch stage {
-            case .byteLevel:
-                byteLevel = true
-                continue
-            case let .split(splitter):
-                next.removeAll(keepingCapacity: true)
-                if rewritten {
-                    text.withUnsafeBufferPointer { Self.split(splitter, $0, current, first, rest, into: &next) }
-                } else {
-                    Self.split(splitter, bytes, current, first, rest, into: &next)
-                }
-            case let .rewrite(rewriter):
-                // Rewriters compact surviving pieces into a new buffer. Once a split has
-                // removed the original start, its new byte offset zero is not the start
-                // of the input. Ordinary split-only pipelines need no extra origin check.
-                if current.first?.lowerBound != 0 { first = rest }
-                next.removeAll(keepingCapacity: true)
-                var output = scratch.take()
-                if rewritten {
-                    text.withUnsafeBufferPointer {
-                        Self.rewrite(rewriter, $0, current, first, rest, into: &output, pieces: &next)
+        for index in 0..<borrowed.count {
+            borrowed[index]._withUnsafeGuaranteedRef { stage in
+                switch stage.shape {
+                case .byteLevel:
+                    byteLevel = true
+                case .split:
+                    next.removeAll(keepingCapacity: true)
+                    if rewritten {
+                        text.withUnsafeBufferPointer { Self.split(stage, $0, current, first, rest, into: &next) }
+                    } else {
+                        Self.split(stage, bytes, current, first, rest, into: &next)
                     }
-                    scratch.recycle(text)
-                } else {
-                    Self.rewrite(rewriter, bytes, current, first, rest, into: &output, pieces: &next)
+                    swap(&current, &next)
+                case .rewrite:
+                    // Rewriters compact surviving pieces into a new buffer. Once a split has
+                    // removed the original start, its new byte offset zero is not the start
+                    // of the input. Ordinary split-only pipelines need no extra origin check.
+                    if current.first?.lowerBound != 0 { first = rest }
+                    next.removeAll(keepingCapacity: true)
+                    var output = scratch.take()
+                    if rewritten {
+                        text.withUnsafeBufferPointer {
+                            Self.rewrite(stage, $0, current, first, rest, into: &output, pieces: &next)
+                        }
+                        scratch.recycle(text)
+                    } else {
+                        Self.rewrite(stage, bytes, current, first, rest, into: &output, pieces: &next)
+                    }
+                    text = output
+                    rewritten = true
+                    swap(&current, &next)
                 }
-                text = output
-                rewritten = true
             }
-            swap(&current, &next)
         }
 
         if rewritten {
@@ -128,32 +146,32 @@ struct PreTokenizationRunner: Sendable {
     /// Splits every piece of `text`, appending absolute ranges to `output`.
     @inline(__always)
     private static func split(
-        _ splitter: any ByteSplitter, _ text: UnsafeBufferPointer<UInt8>, _ pieces: [Range<Int>],
-        _ first: PreTokenizerOptions, _ rest: PreTokenizerOptions, into output: inout [Range<Int>]
+        _ stage: PreTokenizationStage, _ text: UnsafeBufferPointer<UInt8>, _ pieces: [Range<Int>],
+        _ first: PreTokenizerFlags, _ rest: PreTokenizerFlags, into output: inout [Range<Int>]
     ) {
         for range in pieces {
             let mark = output.count
-            splitter.split(
-                UnsafeBufferPointer(rebasing: text[range]), options: range.lowerBound == 0 ? first : rest, into: &output
-            )
-            Self.offset(&output, from: mark, by: range.lowerBound)
+            stage.split(
+                UnsafeBufferPointer(rebasing: text[range]), flags: range.lowerBound == 0 ? first : rest,
+                into: &output)
+            offset(&output, from: mark, by: range.lowerBound)
         }
     }
 
     /// Rewrites every piece of `text` into `rewritten`, appending absolute ranges to `output`.
     @inline(__always)
     private static func rewrite(
-        _ rewriter: any ByteRewriter, _ text: UnsafeBufferPointer<UInt8>, _ pieces: [Range<Int>],
-        _ first: PreTokenizerOptions, _ rest: PreTokenizerOptions, into rewritten: inout [UInt8],
+        _ stage: PreTokenizationStage, _ text: UnsafeBufferPointer<UInt8>, _ pieces: [Range<Int>],
+        _ first: PreTokenizerFlags, _ rest: PreTokenizerFlags, into rewritten: inout [UInt8],
         pieces output: inout [Range<Int>]
     ) {
         for range in pieces {
             let base = rewritten.count
             let mark = output.count
-            rewriter.rewrite(
-                UnsafeBufferPointer(rebasing: text[range]), options: range.lowerBound == 0 ? first : rest,
+            stage.rewrite(
+                UnsafeBufferPointer(rebasing: text[range]), flags: range.lowerBound == 0 ? first : rest,
                 into: &rewritten, pieces: &output)
-            Self.offset(&output, from: mark, by: base)
+            offset(&output, from: mark, by: base)
         }
     }
 
@@ -172,7 +190,7 @@ struct PreTokenizationRunner: Sendable {
         init(config: Config) { self.init() }
 
         func rewrite(
-            _ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into output: inout [UInt8],
+            _ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into output: inout [UInt8],
             pieces: inout [Range<Int>]
         ) {
             let base = output.count
@@ -225,7 +243,10 @@ struct EncodePipeline: Sendable {
     let normalizer: (any ByteNormalizer)?
     /// Splits around added tokens declared `normalized: true`, matched after normalization.
     let normalizedSplitter: AddedTokenSplitter?
-    let preTokenizer: PreTokenizationRunner?
+    /// Never `nil`: a tokenizer with no pre-tokenizer gets a runner with no stages, which hands
+    /// back the text it is given as one piece. Reading an optional reference per section would
+    /// cost a pair of contended reference-count updates on a shared tokenizer.
+    let preTokenizer: PreTokenizationRunner
     /// Collapse runs of the unknown id inside each section (`fuse_unk`, WordPiece models).
     let fuseUnknownId: Int?
 
@@ -235,7 +256,7 @@ struct EncodePipeline: Sendable {
         _ bytes: UnsafeBufferPointer<UInt8>, scratch: EncodeScratch,
         onToken: (Int) -> Void, onPiece: (UnsafeBufferPointer<UInt8>, Bool) -> Void
     ) {
-        if preTokenizer?.needsOriginalStart == true, let normalizer, !normalizer.isIdentity(on: bytes) {
+        if preTokenizer.needsOriginalStart, let normalizer, !normalizer.isIdentity(on: bytes) {
             // Only `first` needs provenance in the IDs-only path. Prepare before
             // calling consumers so a failed optional trace cannot emit partial IDs.
             var sections: [(Int?, AlignedText, Bool)] = []
@@ -265,16 +286,16 @@ struct EncodePipeline: Sendable {
                 onToken(id)
             case let .text(range):
                 // `firstSection`: the text starts the input (`tokenizers` checks original offset 0).
-                let options: PreTokenizerOptions = range.lowerBound == 0 ? [.firstSection] : []
+                let flags: PreTokenizerFlags = range.lowerBound == 0 ? .firstSection : []
                 let raw = UnsafeBufferPointer(rebasing: bytes[range])
                 if let normalizer, !normalizer.isIdentity(on: raw) {
                     scratch.normalized.removeAll(keepingCapacity: true)
                     normalizer.normalize(raw, into: &scratch.normalized, scratch: scratch.buffers)
                     scratch.normalized.withUnsafeBufferPointer { normalized in
-                        preTokenizeNormalized(normalized, options: options, scratch: scratch, onToken, onPiece)
+                        preTokenizeNormalized(normalized, flags: flags, scratch: scratch, onToken, onPiece)
                     }
                 } else {
-                    preTokenizeNormalized(raw, options: options, scratch: scratch, onToken, onPiece)
+                    preTokenizeNormalized(raw, flags: flags, scratch: scratch, onToken, onPiece)
                 }
             }
         }
@@ -283,12 +304,12 @@ struct EncodePipeline: Sendable {
     /// Splits normalized text around `normalized: true` added tokens, then pre-tokenizes.
     @inline(__always)
     private func preTokenizeNormalized(
-        _ normalized: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, scratch: EncodeScratch,
+        _ normalized: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, scratch: EncodeScratch,
         _ onToken: (Int) -> Void, _ onPiece: (UnsafeBufferPointer<UInt8>, Bool) -> Void
     ) {
         guard !normalized.isEmpty else { return }
         guard let normalizedSplitter else {
-            preTokenize(normalized, options: options, scratch: scratch, onPiece)
+            preTokenizer.run(normalized, flags: flags, scratch: scratch.buffers, onPiece)
             return
         }
         scratch.subsections.removeAll(keepingCapacity: true)
@@ -297,22 +318,10 @@ struct EncodePipeline: Sendable {
             switch subsection {
             case let .token(id): onToken(id)
             case let .text(subrange):
-                preTokenize(
+                preTokenizer.run(
                     UnsafeBufferPointer(rebasing: normalized[subrange]),
-                    options: subrange.lowerBound == 0 ? options : [], scratch: scratch, onPiece)
+                    flags: subrange.lowerBound == 0 ? flags : [], scratch: scratch.buffers, onPiece)
             }
-        }
-    }
-
-    @inline(__always)
-    private func preTokenize(
-        _ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, scratch: EncodeScratch,
-        _ onPiece: (UnsafeBufferPointer<UInt8>, Bool) -> Void
-    ) {
-        if let preTokenizer {
-            preTokenizer.run(bytes, options: options, scratch: scratch.buffers, onPiece)
-        } else {
-            onPiece(bytes, false)
         }
     }
 
@@ -369,20 +378,24 @@ final class EncodeScratch {
     private var encoder: PieceEncoder?
     private var encoderModel: ObjectIdentifier?
 
-    /// The pooled encoder for `model`, created on first use.
+    /// The pooled encoder for the model `identity` names, created by `make` on first use.
     ///
-    /// - Parameter identity: the model's identity, which the tokenizer resolves once so the
-    ///   check costs no reference counting. It is what makes reuse safe: a scratch outlives
-    ///   the tokenizer it was lent to, so it can be handed to a different tokenizer whose
-    ///   model needs a different encoder. Comparing identities is sound because the encoder
-    ///   holds its model, so an equal identity is necessarily the same live object.
+    /// - Parameters:
+    ///   - identity: the model's identity, which the tokenizer resolves once so the check costs
+    ///     no reference counting. It is what makes reuse safe: a scratch outlives the tokenizer
+    ///     it was lent to, so it can be handed to a different tokenizer whose model needs a
+    ///     different encoder. Comparing identities is sound because the encoder holds its model,
+    ///     so an equal identity is necessarily the same live object.
+    ///   - make: builds the encoder, or answers `nil` when the model has no byte-level path. It
+    ///     runs at most once per model per scratch, which is where the caller can afford to read
+    ///     the model itself: the cached path copies no existential.
     @inline(__always)
-    func encoder(for model: any FastTokenizingModel, identity: ObjectIdentifier?) -> PieceEncoder {
-        if let encoder, let identity, encoderModel == identity { return encoder }
-        let encoder = model.makeEncoder()
-        self.encoder = encoder
+    func encoder(identity: ObjectIdentifier, make: () -> PieceEncoder?) -> PieceEncoder? {
+        if let encoder, encoderModel == identity { return encoder }
+        guard let made = make() else { return nil }
+        encoder = made
         encoderModel = identity
-        return encoder
+        return made
     }
 }
 

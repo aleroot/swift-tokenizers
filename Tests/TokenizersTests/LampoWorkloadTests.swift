@@ -46,7 +46,8 @@ struct LampoWorkloadTests {
         let pool = EncodeScratchPool()
         let scratch = pool.take()
         let pipeline = EncodePipeline(
-            splitter: nil, normalizer: nil, normalizedSplitter: nil, preTokenizer: nil, fuseUnknownId: nil)
+            splitter: nil, normalizer: nil, normalizedSplitter: nil,
+            preTokenizer: PreTokenizationRunner(stages: []), fuseUnknownId: nil)
         func run(_ count: Int) {
             [UInt8](repeating: 0x61, count: count).withUnsafeBufferPointer {
                 pipeline.run($0, scratch: scratch, onToken: { _ in }, onPiece: { _, _ in })

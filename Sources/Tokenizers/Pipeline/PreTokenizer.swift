@@ -40,14 +40,22 @@ public extension PreTokenizer {
 
 // MARK: - Byte-level contracts
 
-/// One step of byte-level pre-tokenization.
-enum PreTokenizationStage: Sendable {
-    /// Splits each piece into sub-pieces (ranges of the same text).
-    case split(any ByteSplitter)
-    /// Rewrites each piece's text, then splits the rewritten text.
-    case rewrite(any ByteRewriter)
-    /// Marks every piece as byte-level (`ByteLevel` as the final stage).
-    case byteLevel
+/// The pre-tokenizer options as the byte-level stages carry them.
+///
+/// ``PreTokenizerOptions`` is the public spelling, a `Set` keyed by name like `tokenizers`'. The
+/// byte-level path evaluates the options per piece, where a `Set` would hash and allocate, so
+/// the stages carry these instead and the two spellings meet once, at the string boundary.
+struct PreTokenizerFlags: OptionSet, Sendable {
+    let rawValue: UInt8
+
+    /// The text being processed starts the input (before any added token or other piece).
+    static let firstSection = PreTokenizerFlags(rawValue: 1 << 0)
+
+    init(rawValue: UInt8) { self.rawValue = rawValue }
+
+    init(_ options: PreTokenizerOptions) {
+        rawValue = options.contains(.firstSection) ? Self.firstSection.rawValue : 0
+    }
 }
 
 /// A pre-tokenizer expressed as byte-level stages. Built-in pre-tokenizers all conform.
@@ -61,7 +69,7 @@ extension StagedPreTokenizer {
         var pieces: [String] = []
         let runner = PreTokenizationRunner(stages: stages)
         copy.withUTF8 { bytes in
-            runner.run(bytes, options: options, scratch: ScratchBuffers()) { piece, byteLevel in
+            runner.run(bytes, flags: PreTokenizerFlags(options), scratch: ScratchBuffers()) { piece, byteLevel in
                 pieces.append(
                     byteLevel ? ByteLevelAlphabet.encode(piece) : String(decoding: piece, as: UTF8.self))
             }
@@ -72,11 +80,11 @@ extension StagedPreTokenizer {
 
 /// Splits a chunk into pieces given as byte ranges of the chunk.
 protocol ByteSplitter: StagedPreTokenizer {
-    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>])
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into pieces: inout [Range<Int>])
 }
 
 extension ByteSplitter {
-    var stages: [PreTokenizationStage] { [.split(self)] }
+    var stages: [PreTokenizationStage] { [SplitStage(self)] }
 }
 
 /// Rewrites a chunk's text and splits the result.
@@ -84,13 +92,99 @@ protocol ByteRewriter: StagedPreTokenizer {
     /// Appends the rewritten form of `bytes` to `output`, and the pieces it splits into as
     /// ranges relative to the appended text.
     func rewrite(
-        _ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into output: inout [UInt8],
+        _ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into output: inout [UInt8],
         pieces: inout [Range<Int>]
     )
 }
 
 extension ByteRewriter {
-    var stages: [PreTokenizationStage] { [.rewrite(self)] }
+    var stages: [PreTokenizationStage] { [RewriteStage(self)] }
+}
+
+// MARK: - Compiled stages
+
+/// One step of byte-level pre-tokenization, compiled for ``PreTokenizationRunner``.
+///
+/// A stage is a class the runner borrows through an unmanaged reference, so running one is a
+/// single virtual call and no reference counting. That is what lets one tokenizer be shared by
+/// many threads: every thread runs the same stages, and reading them out of an array per piece
+/// costs a contended atomic pair per stage. Each stage is generic over the pre-tokenizer it
+/// compiles, so the call into that pre-tokenizer stays statically dispatched.
+///
+/// A subclass names its ``Shape`` in its own initializer and overrides the one operation that
+/// shape runs; the runner never calls the other.
+class PreTokenizationStage: @unchecked Sendable {
+    /// The operation the runner performs, fixed by the subclass that sets it.
+    enum Shape: UInt8 {
+        /// Splits each piece into sub-pieces (ranges of the same text).
+        case split
+        /// Rewrites each piece's text, then splits the rewritten text.
+        case rewrite
+        /// Marks every piece as byte-level and leaves the text alone.
+        case byteLevel
+    }
+
+    let shape: Shape
+
+    init(shape: Shape) { self.shape = shape }
+
+    /// The pre-tokenizer this stage was compiled from. The offset pipeline needs it because it
+    /// has to reason about particular pre-tokenizers instead of only running them; `nil` for the
+    /// byte-level marker.
+    var source: (any StagedPreTokenizer)? { nil }
+
+    /// Appends the pieces `bytes` splits into to `output`.
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into output: inout [Range<Int>]) {}
+
+    /// Appends the rewritten form of `bytes` to `output` and the pieces it splits into to
+    /// `pieces`.
+    func rewrite(
+        _ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into output: inout [UInt8],
+        pieces: inout [Range<Int>]
+    ) {}
+}
+
+/// Compiles a ``ByteSplitter`` into a stage.
+final class SplitStage<Splitter: ByteSplitter>: PreTokenizationStage, @unchecked Sendable {
+    private let splitter: Splitter
+
+    init(_ splitter: Splitter) {
+        self.splitter = splitter
+        super.init(shape: .split)
+    }
+
+    override var source: (any StagedPreTokenizer)? { splitter }
+
+    override func split(
+        _ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into output: inout [Range<Int>]
+    ) {
+        splitter.split(bytes, flags: flags, into: &output)
+    }
+}
+
+/// Compiles a ``ByteRewriter`` into a stage.
+final class RewriteStage<Rewriter: ByteRewriter>: PreTokenizationStage, @unchecked Sendable {
+    private let rewriter: Rewriter
+
+    init(_ rewriter: Rewriter) {
+        self.rewriter = rewriter
+        super.init(shape: .rewrite)
+    }
+
+    override var source: (any StagedPreTokenizer)? { rewriter }
+
+    override func rewrite(
+        _ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into output: inout [UInt8],
+        pieces: inout [Range<Int>]
+    ) {
+        rewriter.rewrite(bytes, flags: flags, into: &output, pieces: &pieces)
+    }
+}
+
+/// The terminal `ByteLevel` marker: the pieces that follow it are encoded through the byte-level
+/// alphabet.
+final class ByteLevelStage: PreTokenizationStage, @unchecked Sendable {
+    init() { super.init(shape: .byteLevel) }
 }
 
 // MARK: - Factory
@@ -139,7 +233,7 @@ struct PreTokenizerFactory {
 final class BertPreTokenizer: ByteSplitter {
     required init(config: Config) {}
 
-    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into pieces: inout [Range<Int>]) {
         ScalarClassifier.bmp.withUnsafeBufferPointer { table in
             var i = 0
             var start = 0
@@ -194,7 +288,7 @@ final class WhitespacePreTokenizer: ByteSplitter {
     let splitWords: Bool
     required init(config: Config) { splitWords = config.type.string() == "Whitespace" }
 
-    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into pieces: inout [Range<Int>]) {
         let n = bytes.count
         var i = 0
         var start = -1
@@ -292,7 +386,7 @@ final class CharDelimiterSplitPreTokenizer: ByteSplitter {
         self.delimiter = Array(delimiter.utf8)
     }
 
-    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into pieces: inout [Range<Int>]) {
         let end = bytes.count
         let width = delimiter.count
         let first = delimiter[0]
@@ -329,7 +423,7 @@ final class FixedLengthPreTokenizer: ByteSplitter {
         guard length > 0 else { throw TokenizerError.invalidConfiguration("FixedLength length must be positive") }
     }
 
-    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into pieces: inout [Range<Int>]) {
         let end = bytes.count
         var start = 0
         var i = 0
@@ -379,7 +473,7 @@ extension UnicodeScriptTable {
 final class UnicodeScriptsPreTokenizer: ByteSplitter {
     required init(config: Config) {}
 
-    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into pieces: inout [Range<Int>]) {
         let end = bytes.count
         guard end > 0 else { return }
         // Upstream collects the boundary offsets, appends the length and takes the pairwise
@@ -466,7 +560,7 @@ final class MetaspacePreTokenizer: ByteRewriter, @unchecked Sendable {
     }
 
     func rewrite(
-        _ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into output: inout [UInt8],
+        _ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into output: inout [UInt8],
         pieces: inout [Range<Int>]
     ) {
         // `NormalizedString::prepend` is a no-op on empty input.
@@ -475,7 +569,7 @@ final class MetaspacePreTokenizer: ByteRewriter, @unchecked Sendable {
         let needsPrefix: Bool
         switch prependScheme {
         case .always: needsPrefix = true
-        case .first: needsPrefix = options.contains(.firstSection)
+        case .first: needsPrefix = flags.contains(.firstSection)
         case .never: needsPrefix = false
         }
         // The reference substitutes spaces first, then prepends unless the text already
@@ -602,9 +696,9 @@ final class ByteLevelPreTokenizer: StagedPreTokenizer {
 
     var stages: [PreTokenizationStage] {
         var stages: [PreTokenizationStage] = []
-        if addPrefixSpace { stages.append(.rewrite(PrefixSpaceRewriter())) }
-        if useRegex { stages.append(.split(KnownSplitPattern.gpt2)) }
-        stages.append(.byteLevel)
+        if addPrefixSpace { stages.append(RewriteStage(PrefixSpaceRewriter())) }
+        if useRegex { stages.append(SplitStage(KnownSplitPattern.gpt2)) }
+        stages.append(ByteLevelStage())
         return stages
     }
 
@@ -614,7 +708,7 @@ final class ByteLevelPreTokenizer: StagedPreTokenizer {
         init(config: Config) { self.init() }
 
         func rewrite(
-            _ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into output: inout [UInt8],
+            _ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into output: inout [UInt8],
             pieces: inout [Range<Int>]
         ) {
             let base = output.count
@@ -635,7 +729,7 @@ extension KnownSplitPattern: ByteSplitter {
         self = known
     }
 
-    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into pieces: inout [Range<Int>]) {
         split(bytes, into: &pieces)
     }
 }
@@ -657,7 +751,7 @@ final class PunctuationPreTokenizer: ByteSplitter {
         behavior = config.behavior.string().flatMap(Behavior.init(rawValue:)) ?? .isolated
     }
 
-    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into pieces: inout [Range<Int>]) {
         Self.splitRanges(bytes, behavior: behavior, into: &pieces)
     }
 
@@ -720,7 +814,7 @@ final class DigitsPreTokenizer: ByteSplitter {
         individualDigits = config.individualDigits.boolean(or: false)
     }
 
-    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into pieces: inout [Range<Int>]) {
         let end = bytes.count
         var cursor = 0
         var i = 0
@@ -803,11 +897,7 @@ final class SplitPreTokenizer: ByteSplitter {
         }
     }
 
-    var stages: [PreTokenizationStage] {
-        [.split(self)]
-    }
-
-    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, flags: PreTokenizerFlags, into pieces: inout [Range<Int>]) {
         if let known {
             known.split(bytes, into: &pieces)
         } else if let asciiDigitGroup {

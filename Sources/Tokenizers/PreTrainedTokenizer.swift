@@ -50,8 +50,10 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     /// Raw text → pieces, over UTF-8 bytes.
     private let pipeline: EncodePipeline
     private let scratchPool = EncodeScratchPool()
-    private let fastModel: (any FastTokenizingModel)?
-    /// ``fastModel``'s identity, resolved once so the pooled-encoder check stays trivial.
+    /// The identity of the model's byte-level fast path, or `nil` when it has none and encoding
+    /// goes through token strings. Only the identity is stored: the hot path has to know
+    /// *whether* there is a fast path, and reading an optional existential to find out copies
+    /// it, which is a pair of contended reference-count updates per encode on a shared model.
     private let fastModelIdentity: ObjectIdentifier?
     /// The id-level post-processing step, resolved once at load so that encoding reads a single
     /// non-optional reference and allocates no callback.
@@ -121,9 +123,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         let model = try TokenizerModel.from(
             tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData, addedTokens: addedTokens, strict: strict)
         self.model = model
-        let fastModel = model as? any FastTokenizingModel
-        self.fastModel = fastModel
-        fastModelIdentity = fastModel.map { ObjectIdentifier($0 as AnyObject) }
+        fastModelIdentity = (model as? any FastTokenizingModel).map { ObjectIdentifier($0 as AnyObject) }
 
         // `fuse_unk` is a property of the WordPiece-style models; BPE and Unigram fuse
         // (or byte-fall-back) unknowns themselves.
@@ -132,7 +132,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             splitter: AddedTokenSplitter(tokens: splitterTokens),
             normalizer: normalizer,
             normalizedSplitter: AddedTokenSplitter(tokens: normalizedTokens),
-            preTokenizer: preTokenizer.map { PreTokenizationRunner(stages: $0.stages) },
+            preTokenizer: PreTokenizationRunner(stages: preTokenizer?.stages ?? []),
             fuseUnknownId: fusesUnknown ? model.unknownTokenId : nil
         )
 
@@ -222,7 +222,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     }
 
     public func encode(text: String, addSpecialTokens: Bool = true) -> [Int] {
-        guard fastModel != nil else {
+        guard fastModelIdentity != nil else {
             return encodeViaStrings(text: text, addSpecialTokens: addSpecialTokens)
         }
         var ids = encodeWithoutPostProcessing(text: text)
@@ -246,15 +246,32 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 
     /// Runs the pipeline up to (excluding) the post-processor.
     func encodeWithoutPostProcessing(text: String) -> [Int] {
-        guard let fastModel else {
-            return tokenize(text: text).compactMap { model.convertTokenToId($0) }
-        }
-        return withScratch { scratch in
-            let encoder = scratch.encoder(for: fastModel, identity: fastModelIdentity)
-            encoder.begin()
-            defer { encoder.finish() }
-            return pipeline.encode(text, encoder: encoder, scratch: scratch)
-        }
+        withEncoder { encoder, scratch in
+            pipeline.encode(text, encoder: encoder, scratch: scratch)
+        } ?? encodeViaTokenStrings(text: text)
+    }
+
+    /// Runs `body` with this tokenizer's pooled scratch and the model's pooled encoder, or
+    /// returns `nil` when the model has no byte-level fast path.
+    @inline(__always)
+    private func withEncoder<R>(_ body: (PieceEncoder, EncodeScratch) -> R) -> R? {
+        guard let identity = fastModelIdentity else { return nil }
+        let scratch = scratchPool.take()
+        defer { scratchPool.recycle(scratch) }
+        // The model is cast only when the scratch has no encoder for it yet, so the cached path
+        // copies no existential.
+        let encoder = scratch.encoder(
+            identity: identity, make: { (model as? any FastTokenizingModel)?.makeEncoder() })
+        guard let encoder else { return nil }
+        encoder.begin()
+        defer { encoder.finish() }
+        return body(encoder, scratch)
+    }
+
+    /// The reference path for a model with no byte-level encoder: token strings mapped through
+    /// the vocabulary.
+    private func encodeViaTokenStrings(text: String) -> [Int] {
+        tokenize(text: text).compactMap { model.convertTokenToId($0) }
     }
 
     /// Applies the configured post-processor to a sequence of ids.
