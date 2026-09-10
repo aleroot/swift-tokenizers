@@ -54,8 +54,7 @@ extension PostProcessor {
                 case .sequenceA: result.append(contentsOf: tokens)
                 case let .special(token, special):
                     guard addSpecialTokens else { continue }
-                    var ids: [Int] = []
-                    TemplateProcessing.appendIds(token, special, resolve, to: &ids)
+                    let ids = TemplateProcessing.ids(of: token, special, resolving: resolve)
                     result.append(contentsOf: ids.map { AlignedToken(id: $0, offset: nil) })
                 case .sequenceB, .ignored: break
                 }

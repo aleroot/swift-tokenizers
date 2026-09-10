@@ -15,9 +15,49 @@ public extension PostProcessor {
     }
 }
 
-/// Internal id-level fast path. `resolve` maps a special token string to its id.
-protocol FastPostProcessor: PostProcessor {
-    func postProcess(ids: inout [Int], addSpecialTokens: Bool, resolve: (String) -> Int?)
+/// The id-level half of post-processing: splicing special-token ids into a sequence.
+///
+/// Deliberately not a refinement of ``PostProcessor``, so that a tokenizer can hold one
+/// non-optional reference to whatever performs the step. Reading an optional existential
+/// property per encode call costs a pair of reference-count updates on an object every encoding
+/// thread shares, which is what stops a shared tokenizer scaling past a few threads.
+protocol IdPostProcessor: Sendable {
+    func postProcess(ids: inout [Int], addSpecialTokens: Bool)
+
+    /// This processor with everything it needs from a vocabulary already resolved. The default
+    /// is `self`, which is right for every processor whose special pieces declare their own ids;
+    /// binding happens once, when the tokenizer is loaded, so encoding never borrows the model.
+    func bound(resolving resolve: (String) -> Int?) -> any IdPostProcessor
+}
+
+extension IdPostProcessor {
+    func bound(resolving resolve: (String) -> Int?) -> any IdPostProcessor { self }
+}
+
+/// Leaves ids untouched, for a tokenizer that declares no post-processor. An empty struct, so
+/// the existential holding it is copied without touching a reference count.
+struct NoIdPostProcessing: IdPostProcessor {
+    func postProcess(ids: inout [Int], addSpecialTokens: Bool) {}
+}
+
+/// Round-trips through token strings, for a processor that has no id-level path. A class so the
+/// two existentials it holds stay inside the ``IdPostProcessor`` existential instead of being
+/// boxed on the heap.
+final class StringIdPostProcessing: IdPostProcessor {
+    private let processor: any PostProcessor
+    private let model: any TokenizingModel
+
+    init(processor: any PostProcessor, model: any TokenizingModel) {
+        self.processor = processor
+        self.model = model
+    }
+
+    func postProcess(ids: inout [Int], addSpecialTokens: Bool) {
+        let tokens = ids.map { model.convertIdToToken($0) ?? "" }
+        let processed = processor.postProcess(
+            tokens: tokens, tokensPair: nil, addSpecialTokens: addSpecialTokens)
+        ids = processed.compactMap { model.convertTokenToId($0) }
+    }
 }
 
 enum PostProcessorType: String {
@@ -42,7 +82,7 @@ struct PostProcessorFactory {
     }
 }
 
-final class TemplateProcessing: PostProcessor, FastPostProcessor {
+final class TemplateProcessing: PostProcessor, IdPostProcessor {
     /// One `SpecialToken` entry of the processor's own `special_tokens` map. A piece can
     /// expand to several tokens, and its ids are authoritative: `tokenizers` inserts them
     /// without consulting the vocabulary.
@@ -67,13 +107,25 @@ final class TemplateProcessing: PostProcessor, FastPostProcessor {
         case ignored
     }
 
+    /// A template piece in id space: literal ids to splice, or the sequence itself.
+    private enum IdItem: Equatable {
+        case ids([Int])
+        case sequence
+    }
+
     let single: [Config]
     let pair: [Config]
     let singleItems: [Item]
     let pairItems: [Item]
-    /// Ids to splice around the sequence, resolved once for the overwhelmingly common
-    /// `[specials…] $A [specials…]` template whose pieces all declare their own ids.
-    private let staticAffixes: (prefix: [Int], suffix: [Int])?
+    /// `singleItems` compiled to ids.
+    private let idItems: [IdItem]
+    /// The ids around the sequence, when the compiled template contains exactly one sequence
+    /// piece: the overwhelmingly common `[specials] $A [specials]` shape then costs two splices,
+    /// with no loop and no temporary array.
+    private let affixes: (prefix: [Int], suffix: [Int])?
+    /// Whether a special piece has no declared ids, so binding to a vocabulary can change what
+    /// the template compiles to.
+    private let needsVocabulary: Bool
 
     required init(config: Config) throws {
         single = try require(config.single.array(), "TemplateProcessing", field: "single")
@@ -91,32 +143,72 @@ final class TemplateProcessing: PostProcessor, FastPostProcessor {
         else {
             throw TokenizerError.invalidConfiguration("TemplateProcessing single template references sequence B")
         }
-        staticAffixes = Self.staticAffixes(of: singleItems)
+        needsVocabulary = singleItems.contains {
+            if case let .special(_, special) = $0 { return special == nil }; return false
+        }
+        // Unbound: a special piece with no declared ids resolves to nothing, which is what a
+        // failed vocabulary lookup contributes.
+        idItems = Self.compile(singleItems) { _ in nil }
+        affixes = Self.affixes(of: idItems)
     }
 
-    /// Splits `items` into the ids before and after the single `$A`, or `nil` when the shape
-    /// or the declared ids make that impossible and the general path has to run.
-    private static func staticAffixes(of items: [Item]) -> (prefix: [Int], suffix: [Int])? {
-        var prefix: [Int] = []
-        var suffix: [Int] = []
-        var seenSequence = false
-        for item in items {
+    private init(
+        single: [Config], pair: [Config], singleItems: [Item], pairItems: [Item],
+        resolving resolve: (String) -> Int?
+    ) {
+        self.single = single
+        self.pair = pair
+        self.singleItems = singleItems
+        self.pairItems = pairItems
+        needsVocabulary = false
+        idItems = Self.compile(singleItems, resolving: resolve)
+        affixes = Self.affixes(of: idItems)
+    }
+
+    func bound(resolving resolve: (String) -> Int?) -> any IdPostProcessor {
+        guard needsVocabulary else { return self }
+        return TemplateProcessing(
+            single: single, pair: pair, singleItems: singleItems, pairItems: pairItems, resolving: resolve)
+    }
+
+    /// Resolves a template to ids. Sequence B and the pieces a template ignores contribute
+    /// nothing at either level, so they drop out here.
+    private static func compile(_ items: [Item], resolving resolve: (String) -> Int?) -> [IdItem] {
+        items.compactMap { item in
             switch item {
-            case .sequenceA:
-                if seenSequence { return nil }
-                seenSequence = true
-            case let .special(_, special):
-                guard let special else { return nil }  // needs a vocabulary lookup
-                if seenSequence {
-                    suffix.append(contentsOf: special.ids)
-                } else {
-                    prefix.append(contentsOf: special.ids)
-                }
-            case .sequenceB, .ignored:
-                return nil
+            case .sequenceA: return .sequence
+            case let .special(token, special):
+                let ids = Self.ids(of: token, special, resolving: resolve)
+                return ids.isEmpty ? nil : .ids(ids)
+            case .sequenceB, .ignored: return nil
             }
         }
-        return seenSequence ? (prefix, suffix) : nil
+    }
+
+    /// The ids a special piece contributes: its declared ids, or a vocabulary lookup for
+    /// hand-written configurations that omit the `special_tokens` map.
+    static func ids(of token: String, _ special: SpecialToken?, resolving resolve: (String) -> Int?) -> [Int] {
+        special?.ids ?? resolve(token).map { [$0] } ?? []
+    }
+
+    /// Splits `items` into the ids before and after the sequence, or `nil` when the template
+    /// names the sequence zero or several times and the general path has to run.
+    private static func affixes(of items: [IdItem]) -> (prefix: [Int], suffix: [Int])? {
+        guard
+            let sequence = items.firstIndex(of: .sequence),
+            !items[items.index(after: sequence)...].contains(.sequence)
+        else { return nil }
+        var prefix: [Int] = []
+        var suffix: [Int] = []
+        for (index, item) in items.enumerated() {
+            guard case let .ids(ids) = item else { continue }
+            if index < sequence {
+                prefix.append(contentsOf: ids)
+            } else {
+                suffix.append(contentsOf: ids)
+            }
+        }
+        return (prefix, suffix)
     }
 
     private static func item(_ config: Config, specials: [String: SpecialToken]) -> Item {
@@ -147,41 +239,26 @@ final class TemplateProcessing: PostProcessor, FastPostProcessor {
         return out
     }
 
-    func postProcess(ids: inout [Int], addSpecialTokens: Bool, resolve: (String) -> Int?) {
+    func postProcess(ids: inout [Int], addSpecialTokens: Bool) {
         // Pre-resolved affixes: two splices, no lookups and no temporary arrays.
-        if let staticAffixes {
+        if let affixes {
             guard addSpecialTokens else { return }
-            if !staticAffixes.prefix.isEmpty { ids.insert(contentsOf: staticAffixes.prefix, at: 0) }
-            if !staticAffixes.suffix.isEmpty { ids.append(contentsOf: staticAffixes.suffix) }
+            if !affixes.prefix.isEmpty { ids.insert(contentsOf: affixes.prefix, at: 0) }
+            if !affixes.suffix.isEmpty { ids.append(contentsOf: affixes.suffix) }
             return
         }
         let input = ids
         ids.removeAll(keepingCapacity: true)
-        for item in singleItems {
+        for item in idItems {
             switch item {
-            case .sequenceA: ids.append(contentsOf: input)
-            case let .special(token, special):
-                if addSpecialTokens { Self.appendIds(token, special, resolve, to: &ids) }
-            case .sequenceB, .ignored: break
+            case .sequence: ids.append(contentsOf: input)
+            case let .ids(specials): if addSpecialTokens { ids.append(contentsOf: specials) }
             }
-        }
-    }
-
-    /// Appends the ids a special piece contributes: its declared ids, or a vocabulary lookup
-    /// for hand-written configurations that omit the `special_tokens` map.
-    @inline(__always)
-    static func appendIds(
-        _ token: String, _ special: SpecialToken?, _ resolve: (String) -> Int?, to output: inout [Int]
-    ) {
-        if let special {
-            output.append(contentsOf: special.ids)
-        } else if let id = resolve(token) {
-            output.append(id)
         }
     }
 }
 
-final class ByteLevelPostProcessor: PostProcessor, FastPostProcessor {
+final class ByteLevelPostProcessor: PostProcessor, IdPostProcessor {
     let trimOffsets: Bool
     let addPrefixSpace: Bool
 
@@ -194,10 +271,10 @@ final class ByteLevelPostProcessor: PostProcessor, FastPostProcessor {
         tokens
     }
 
-    func postProcess(ids: inout [Int], addSpecialTokens: Bool, resolve: (String) -> Int?) {}
+    func postProcess(ids: inout [Int], addSpecialTokens: Bool) {}
 }
 
-final class RobertaProcessing: PostProcessor, FastPostProcessor {
+final class RobertaProcessing: PostProcessor, IdPostProcessor {
     let sep: (UInt, String)
     let cls: (UInt, String)
     /// Trim all remaining space, or leave one space character if `addPrefixSpace` is `true`.
@@ -226,7 +303,7 @@ final class RobertaProcessing: PostProcessor, FastPostProcessor {
         return outTokens
     }
 
-    func postProcess(ids: inout [Int], addSpecialTokens: Bool, resolve: (String) -> Int?) {
+    func postProcess(ids: inout [Int], addSpecialTokens: Bool) {
         guard addSpecialTokens else { return }
         // The ids declared next to each token are authoritative, as in `tokenizers`.
         ids.insert(Int(cls.0), at: 0)
@@ -234,7 +311,7 @@ final class RobertaProcessing: PostProcessor, FastPostProcessor {
     }
 }
 
-final class BertProcessing: PostProcessor, FastPostProcessor {
+final class BertProcessing: PostProcessor, IdPostProcessor {
     let sep: (UInt, String)
     let cls: (UInt, String)
 
@@ -252,19 +329,28 @@ final class BertProcessing: PostProcessor, FastPostProcessor {
         return outTokens
     }
 
-    func postProcess(ids: inout [Int], addSpecialTokens: Bool, resolve: (String) -> Int?) {
+    func postProcess(ids: inout [Int], addSpecialTokens: Bool) {
         guard addSpecialTokens else { return }
         ids.insert(Int(cls.0), at: 0)
         ids.append(Int(sep.0))
     }
 }
 
-final class SequenceProcessing: PostProcessor, FastPostProcessor {
+final class SequenceProcessing: PostProcessor, IdPostProcessor {
     let processors: [any PostProcessor]
+    /// The nested processors that have an id-level path, in order. Resolved once, so encoding a
+    /// sequence neither casts nor skips anything.
+    private let idProcessors: [any IdPostProcessor]
 
     required init(config: Config) throws {
         let configs = try require(config.processors.array(), "Sequence post-processor", field: "processors")
         processors = try configs.compactMap { try PostProcessorFactory.fromConfig(config: $0) }
+        idProcessors = processors.compactMap { $0 as? any IdPostProcessor }
+    }
+
+    private init(processors: [any PostProcessor], idProcessors: [any IdPostProcessor]) {
+        self.processors = processors
+        self.idProcessors = idProcessors
     }
 
     func postProcess(tokens: [String], tokensPair: [String]?, addSpecialTokens: Bool = true) -> [String] {
@@ -278,15 +364,19 @@ final class SequenceProcessing: PostProcessor, FastPostProcessor {
         return currentTokens
     }
 
-    func postProcess(ids: inout [Int], addSpecialTokens: Bool, resolve: (String) -> Int?) {
-        for processor in processors {
-            guard let fast = processor as? any FastPostProcessor else { continue }
-            fast.postProcess(ids: &ids, addSpecialTokens: addSpecialTokens, resolve: resolve)
+    func postProcess(ids: inout [Int], addSpecialTokens: Bool) {
+        for processor in idProcessors {
+            processor.postProcess(ids: &ids, addSpecialTokens: addSpecialTokens)
         }
     }
 
-    /// `true` if every nested processor supports the id-level fast path.
+    func bound(resolving resolve: (String) -> Int?) -> any IdPostProcessor {
+        SequenceProcessing(processors: processors, idProcessors: idProcessors.map { $0.bound(resolving: resolve) })
+    }
+
+    /// `true` if every nested processor supports the id-level path. A sequence that contains one
+    /// which does not has to go through the string path, so that every piece of it still runs.
     var supportsFastPath: Bool {
-        processors.allSatisfy { $0 is any FastPostProcessor }
+        processors.allSatisfy { $0 is any IdPostProcessor }
     }
 }

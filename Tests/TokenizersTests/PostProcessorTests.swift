@@ -66,7 +66,7 @@ struct PostProcessorTests {
             let processor = try RobertaProcessing(config: PostProcessorTests.robertaConfig())
             var ids = [7, 8]
             // A vocabulary lookup that would answer differently must not be consulted.
-            processor.postProcess(ids: &ids, addSpecialTokens: true) { _ in 999 }
+            processor.bound { _ in 999 }.postProcess(ids: &ids, addSpecialTokens: true)
             #expect(ids == [0, 7, 8, 1])
         }
     }
@@ -92,7 +92,7 @@ struct PostProcessorTests {
         func usesDeclaredIds() throws {
             let processor = try BertProcessing(config: Self.config)
             var ids = [5]
-            processor.postProcess(ids: &ids, addSpecialTokens: true) { _ in 999 }
+            processor.bound { _ in 999 }.postProcess(ids: &ids, addSpecialTokens: true)
             #expect(ids == [101, 5, 102])
         }
     }
@@ -128,7 +128,7 @@ struct PostProcessorTests {
             let processor = try TemplateProcessing(
                 config: Self.config(single: [Self.cls, Self.sequenceA, Self.sep], specialTokens: Self.specials))
             var ids = [5, 6]
-            processor.postProcess(ids: &ids, addSpecialTokens: true) { _ in 999 }
+            processor.bound { _ in 999 }.postProcess(ids: &ids, addSpecialTokens: true)
             #expect(ids == [101, 5, 6, 102])
             #expect(
                 processor.postProcess(tokens: ["a", "b"], tokensPair: nil) == ["[CLS]", "a", "b", "[SEP]"])
@@ -140,7 +140,7 @@ struct PostProcessorTests {
             let processor = try TemplateProcessing(
                 config: Self.config(single: [pair, Self.sequenceA], specialTokens: Self.specials))
             var ids = [5]
-            processor.postProcess(ids: &ids, addSpecialTokens: true) { _ in 999 }
+            processor.bound { _ in 999 }.postProcess(ids: &ids, addSpecialTokens: true)
             #expect(ids == [7, 8, 5])
             #expect(processor.postProcess(tokens: ["a"], tokensPair: nil) == ["[A]", "[B]", "a"])
         }
@@ -152,7 +152,7 @@ struct PostProcessorTests {
                     single: [Self.cls, Self.sequenceA, Self.sep, Self.sequenceA, Self.sep],
                     specialTokens: Self.specials))
             var ids = [5]
-            processor.postProcess(ids: &ids, addSpecialTokens: true) { _ in 999 }
+            processor.bound { _ in 999 }.postProcess(ids: &ids, addSpecialTokens: true)
             #expect(ids == [101, 5, 102, 5, 102])
         }
 
@@ -161,7 +161,7 @@ struct PostProcessorTests {
             let processor = try TemplateProcessing(
                 config: Self.config(single: [Self.cls, Self.sequenceA], specialTokens: Config()))
             var ids = [5]
-            processor.postProcess(ids: &ids, addSpecialTokens: true) { $0 == "[CLS]" ? 42 : nil }
+            processor.bound { $0 == "[CLS]" ? 42 : nil }.postProcess(ids: &ids, addSpecialTokens: true)
             #expect(ids == [42, 5])
         }
 
@@ -170,7 +170,7 @@ struct PostProcessorTests {
             let processor = try TemplateProcessing(
                 config: Self.config(single: [Self.cls, Self.sequenceA, Self.sep], specialTokens: Self.specials))
             var ids = [5, 6]
-            processor.postProcess(ids: &ids, addSpecialTokens: false) { _ in 999 }
+            processor.bound { _ in 999 }.postProcess(ids: &ids, addSpecialTokens: false)
             #expect(ids == [5, 6])
         }
 

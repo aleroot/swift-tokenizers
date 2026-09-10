@@ -53,7 +53,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     private let fastModel: (any FastTokenizingModel)?
     /// ``fastModel``'s identity, resolved once so the pooled-encoder check stays trivial.
     private let fastModelIdentity: ObjectIdentifier?
-    private let fastPostProcessor: (any FastPostProcessor)?
+    /// The id-level post-processing step, resolved once at load so that encoding reads a single
+    /// non-optional reference and allocates no callback.
+    private let idPostProcessor: any IdPostProcessor
     /// Built on first decode: embedding and reranking apps never pay for it.
     private let byteLevelDecodeTable: Lazy<ByteLevelDecodeTable>?
 
@@ -134,11 +136,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             fuseUnknownId: fusesUnknown ? model.unknownTokenId : nil
         )
 
-        if let sequence = postProcessor as? SequenceProcessing {
-            fastPostProcessor = sequence.supportsFastPath ? sequence : nil
-        } else {
-            fastPostProcessor = postProcessor as? any FastPostProcessor
-        }
+        idPostProcessor = Self.makeIdPostProcessor(postProcessor, model: model)
 
         if decoder is ByteLevelDecoder, normalizedSpellings.isEmpty, let bpe = model as? BPETokenizer {
             byteLevelDecodeTable = Lazy { ByteLevelDecodeTable(vocabulary: bpe.vocab) }
@@ -261,18 +259,21 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 
     /// Applies the configured post-processor to a sequence of ids.
     func applyPostProcessor(to ids: inout [Int], addSpecialTokens: Bool) {
-        guard let postProcessor else { return }
-        if let fastPostProcessor {
-            fastPostProcessor.postProcess(ids: &ids, addSpecialTokens: addSpecialTokens) { [model] token in
-                model.convertTokenToId(token)
-            }
-        } else {
-            // Generic processors work on strings: round-trip through token strings.
-            let tokens = ids.map { model.convertIdToToken($0) ?? "" }
-            let processed = postProcessor.postProcess(
-                tokens: tokens, tokensPair: nil, addSpecialTokens: addSpecialTokens)
-            ids = processed.compactMap { model.convertTokenToId($0) }
+        idPostProcessor.postProcess(ids: &ids, addSpecialTokens: addSpecialTokens)
+    }
+
+    /// Resolves the id-level post-processing step: the processor's own, bound to this
+    /// vocabulary, a string round-trip when it has none, or nothing when the tokenizer
+    /// declares no post-processor at all.
+    private static func makeIdPostProcessor(
+        _ postProcessor: (any PostProcessor)?, model: any TokenizingModel
+    ) -> any IdPostProcessor {
+        guard let postProcessor else { return NoIdPostProcessing() }
+        let sequenceIsFast = (postProcessor as? SequenceProcessing)?.supportsFastPath ?? true
+        guard sequenceIsFast, let idProcessor = postProcessor as? any IdPostProcessor else {
+            return StringIdPostProcessing(processor: postProcessor, model: model)
         }
+        return idProcessor.bound { model.convertTokenToId($0) }
     }
 
     /// Reference pipeline over token strings (used for models without a fast path).
