@@ -319,3 +319,46 @@ struct GraphemeExtensionInvariantTests {
         #expect(missing.isEmpty, "unflagged extenders: \(missing.prefix(20).map { String($0, radix: 16) })")
     }
 }
+
+@Suite("Upstream normalizers added for parity")
+struct AddedNormalizerTests {
+    /// `normalizers/unicode.rs::do_nmt`: a fixed set of control scalars is dropped and the
+    /// remaining whitespace-like scalars fold to a plain space.
+    @Test("Nmt drops controls and folds whitespace-like scalars")
+    func nmt() {
+        let normalizer = NmtNormalizer(config: [:])
+        #expect(normalizer.normalize(text: "") == "")
+        #expect(normalizer.normalize(text: "Hello world") == "Hello world")
+        // U+0000 is not in the dropped range; U+0001…U+0008 are.
+        #expect(normalizer.normalize(text: "a\u{0001}\u{0008}b") == "ab")
+        #expect(normalizer.normalize(text: "a\u{000B}b") == "ab")
+        #expect(normalizer.normalize(text: "a\u{001F}\u{007F}\u{008F}\u{009F}b") == "ab")
+        for scalar: Unicode.Scalar in [
+            "\u{0009}", "\u{000A}", "\u{000C}", "\u{000D}", "\u{1680}",
+            "\u{200B}", "\u{200F}", "\u{2028}", "\u{2029}", "\u{2581}",
+            "\u{FEFF}", "\u{FFFD}",
+        ] {
+            #expect(normalizer.normalize(text: "a\(scalar)b") == "a b")
+        }
+        // U+00A0 and U+3000 are whitespace but are not in the NMT map.
+        #expect(normalizer.normalize(text: "a\u{00A0}b") == "a\u{00A0}b")
+        #expect(normalizer.normalize(text: "a\u{0000}b") == "a\u{0000}b")
+    }
+
+    /// `normalizers/byte_level.rs::test_byte_level_normalize`.
+    @Test("ByteLevel normalizer maps every byte to the byte-level alphabet")
+    func byteLevel() {
+        let normalizer = ByteLevelNormalizer(config: [:])
+        #expect(normalizer.normalize(text: "") == "")
+        #expect(
+            normalizer.normalize(text: "Hello 我今天能为你做什么")
+                == "HelloĠæĪĳä»Ĭå¤©èĥ½ä¸ºä½łåģļä»Ģä¹Ī")
+        #expect(normalizer.normalize(text: " ") == "Ġ")
+    }
+
+    @Test("Both are reachable through the factory")
+    func factory() throws {
+        #expect(try NormalizerFactory.fromConfig(config: ["type": "Nmt"]) is NmtNormalizer)
+        #expect(try NormalizerFactory.fromConfig(config: ["type": "ByteLevel"]) is ByteLevelNormalizer)
+    }
+}

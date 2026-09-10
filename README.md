@@ -11,10 +11,10 @@
 </p>
 
 swift-tokenizers is a native Swift 6 implementation of the tokenizers used by today's language
-models: byte-level and SentencePiece **BPE**, **Unigram** and **WordPiece**, engineered for
-speed. It loads `tokenizer.json` files published on the Hugging Face Hub, with encode and decode
-parity checked against pinned Hugging Face references. Performance depends on the model, text,
-and cache state; see the [benchmarks](docs/BENCHMARKS.md). It ships
+models: byte-level and SentencePiece **BPE**, **Unigram**, **WordPiece** and **WordLevel**,
+engineered for speed. It loads `tokenizer.json` files published on the Hugging Face Hub, with
+encode and decode parity checked against pinned Hugging Face references. Performance depends on
+the model, text, and cache state; see the [benchmarks](docs/BENCHMARKS.md). It ships
 as a drop-in replacement for the `Tokenizers` product of
 [swift-transformers](https://github.com/huggingface/swift-transformers), plugs seamlessly into
 [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm), and is the tokenizer behind
@@ -35,14 +35,14 @@ let prompt = try tokenizer.applyChatTemplate(messages: [
 ## Highlights
 
 - **Differentially tested.** Token IDs, decoded text, and source offsets are checked against
-  Hugging Face `tokenizers` 0.23.2, with Unicode conformance and regression tests.
+  Hugging Face `tokenizers` 0.23.2 — whole tokenizers and each pipeline component on its own —
+  with Unicode conformance and regression tests.
 - **Fast inference.** SIMD scans, packed vocabulary storage, reusable buffers, and bounded
   pretoken caches. Published performance comparisons specify their workloads and reference versions.
-- **Inference components.** Added and special tokens, common normalization and pre-tokenization
-  pipelines, post-processors, decoders, chat templates with tools, and O(1) vocabulary lookup.
-  Original-source offsets are available through an opt-in `encode` overload.
-  This is not the full Hugging Face training/Encoding API: pair encodings, padding,
-  and stochastic tokenization are outside the supported surface.
+- **Complete inference surface.** Every model, normalizer, pre-tokenizer, post-processor and
+  decoder of `tokenizers` 0.23.2, plus added and special tokens, chat templates with tools, and
+  O(1) vocabulary lookup. Original-source offsets are available through an opt-in `encode`
+  overload. Training, padding, truncation and pair encodings are out of scope.
 - **Drop-in.** Same `Tokenizer`, `PreTrainedTokenizer`, `AutoTokenizer`, `Config` and
   `TokenizerError` API as swift-transformers; existing consumers compile unchanged.
 - **Lean.** A single dependency, [swift-jinja](https://github.com/huggingface/swift-jinja), for
@@ -116,6 +116,10 @@ Case mapping, numeric classification, grapheme segmentation, and arbitrary regex
 Swift/Foundation Unicode data, so behavior for newer characters can differ across OS versions.
 Source offsets preserve original positions even when unrecognized symbols are dropped.
 
+Regular expressions in `Split` and `Replace` configurations are written for Oniguruma, which
+differs from Foundation's ICU engine on `\w`/`\W` and on the `^`/`$` anchors. Those are
+translated at load time, so a configured pattern selects the same characters as upstream.
+
 ### Chat templates and tools
 
 ```swift
@@ -149,11 +153,13 @@ byte-identical to Python for standard schemas. To pin the order of your own keys
 
 | | |
 |---|---|
-| **Models** | byte-level and SentencePiece BPE (GPT-2, Llama 2 / 3, Qwen, Mistral, Gemma, DeepSeek, Phi, Falcon, Whisper, Cohere, RoBERTa, o200k …), Unigram (T5, XLM-RoBERTa, multilingual-e5, bge-m3 …), WordPiece (BERT, DistilBERT, MiniLM, bge, nomic …) |
-| **Normalizers** | Sequence, Prepend, Replace, Lowercase, NFC, NFD, NFKC, NFKD, BertNormalizer, Precompiled, StripAccents, Strip |
-| **Pre-tokenizers** | Sequence, ByteLevel, Split, Metaspace, Whitespace, WhitespaceSplit, Punctuation, Digits, BertPreTokenizer |
+| **Models** | byte-level and SentencePiece BPE (GPT-2, Llama 2 / 3, Qwen, Mistral, Gemma, DeepSeek, Phi, Falcon, Whisper, Cohere, RoBERTa, o200k …), Unigram (T5, XLM-RoBERTa, multilingual-e5, bge-m3 …), WordPiece (BERT, DistilBERT, MiniLM, bge, nomic …), WordLevel |
+| **Normalizers** | Sequence, Prepend, Replace, Lowercase, NFC, NFD, NFKC, NFKD, BertNormalizer, Precompiled, StripAccents, Strip, Nmt, ByteLevel |
+| **Pre-tokenizers** | Sequence, ByteLevel, Split, Metaspace, Whitespace, WhitespaceSplit, Punctuation, Digits, BertPreTokenizer, CharDelimiterSplit, FixedLength, UnicodeScripts |
 | **Post-processors** | TemplateProcessing, ByteLevel, RobertaProcessing, BertProcessing, Sequence |
-| **Decoders** | Sequence, ByteLevel, ByteFallback, Fuse, Strip, Replace, Metaspace, WordPiece |
+| **Decoders** | Sequence, ByteLevel, ByteFallback, Fuse, Strip, Replace, Metaspace, WordPiece, BPEDecoder, CTC |
+
+Trainers, padding, truncation, pair encodings and BPE dropout are outside the supported surface.
 
 ## Performance
 

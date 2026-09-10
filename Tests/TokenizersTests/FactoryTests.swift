@@ -126,3 +126,58 @@ struct FactoryTests {
         }
     }
 }
+
+@Suite("WordLevel model")
+struct WordLevelTokenizerTests {
+    /// `models/wordlevel/mod.rs::test_tokenize_unk`, `::test_tokenize_missing_unk_token`.
+    static func tokenizer(
+        vocab: String, unk: String? = "<unk>", pre: String = "WhitespaceSplit"
+    ) throws
+        -> PreTrainedTokenizer
+    {
+        let unkField = unk.map { #""unk_token": "\#($0)","# } ?? ""
+        let json = """
+            {"model": {"type": "WordLevel", \(unkField) "vocab": \(vocab)},
+             "pre_tokenizer": {"type": "\(pre)"}}
+            """
+        return try PreTrainedTokenizer(
+            tokenizerConfig: ["tokenizer_class": "PreTrainedTokenizerFast"],
+            tokenizerData: try Config(tokenizerJSON: Data(json.utf8)))
+    }
+
+    @Test("Whole chunks map to ids, unknown chunks to the unknown token")
+    func tokenizeUnknown() throws {
+        let tokenizer = try Self.tokenizer(vocab: #"{"<unk>": 0, "a": 1, "b": 2}"#)
+        #expect(tokenizer.tokenize(text: "a") == ["a"])
+        #expect(tokenizer.tokenize(text: "c") == ["<unk>"])
+        #expect(tokenizer.encode(text: "a b c", addSpecialTokens: false) == [1, 2, 0])
+        // Unknowns are not fused: one pre-token is always one token.
+        #expect(tokenizer.encode(text: "c c", addSpecialTokens: false) == [0, 0])
+        #expect(tokenizer.encode(text: "", addSpecialTokens: false) == [])
+        #expect(tokenizer.decode(tokens: [1, 2]) == "a b")
+    }
+
+    @Test("A chunk absent from the vocabulary without an unknown token is dropped")
+    func missingUnknownToken() throws {
+        let tokenizer = try Self.tokenizer(vocab: #"{"a": 0, "b": 1}"#, unk: nil)
+        #expect(tokenizer.tokenize(text: "a") == ["a"])
+        #expect(tokenizer.tokenize(text: "c") == [])
+        #expect(tokenizer.encode(text: "a c b", addSpecialTokens: false) == [0, 1])
+    }
+
+    @Test("Source offsets cover the whole chunk")
+    func offsets() throws {
+        let tokenizer = try Self.tokenizer(vocab: #"{"<unk>": 0, "hello": 1, "wörld": 2}"#)
+        let encoding = try tokenizer.encode(text: "hello wörld nope", addSpecialTokens: false, withOffsets: true)
+        #expect(encoding.ids == [1, 2, 0])
+        #expect(encoding.offsets ?? [] == [0..<5, 6..<12, 13..<17])
+    }
+
+    @Test("Resolves through model.type regardless of tokenizer_class")
+    func factory() throws {
+        let tokenizer = try Self.tokenizer(vocab: #"{"<unk>": 0, "a": 1}"#)
+        #expect(tokenizer.model is WordLevelTokenizer)
+        #expect(tokenizer.unknownToken == "<unk>")
+        #expect(tokenizer.unknownTokenId == 0)
+    }
+}

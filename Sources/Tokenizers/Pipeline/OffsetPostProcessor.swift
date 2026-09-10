@@ -52,8 +52,11 @@ extension PostProcessor {
             for item in template.singleItems {
                 switch item {
                 case .sequenceA: result.append(contentsOf: tokens)
-                case let .special(token):
-                    if addSpecialTokens, let id = resolve(token) { result.append(AlignedToken(id: id, offset: nil)) }
+                case let .special(token, special):
+                    guard addSpecialTokens else { continue }
+                    var ids: [Int] = []
+                    TemplateProcessing.appendIds(token, special, resolve, to: &ids)
+                    result.append(contentsOf: ids.map { AlignedToken(id: $0, offset: nil) })
                 case .sequenceB, .ignored: break
                 }
             }
@@ -63,15 +66,15 @@ extension PostProcessor {
         case let roberta as RobertaProcessing:
             var result = roberta.trimOffset ? Self.trim(tokens, prefixSpace: roberta.addPrefixSpace, spelling: spelling) : tokens
             if addSpecialTokens {
-                if let id = resolve(roberta.cls.1) { result.insert(AlignedToken(id: id, offset: nil), at: 0) }
-                if let id = resolve(roberta.sep.1) { result.append(AlignedToken(id: id, offset: nil)) }
+                result.insert(AlignedToken(id: Int(roberta.cls.0), offset: nil), at: 0)
+                result.append(AlignedToken(id: Int(roberta.sep.0), offset: nil))
             }
             return result
         case let bert as BertProcessing:
             guard addSpecialTokens else { return tokens }
             var result = tokens
-            if let id = resolve(bert.cls.1) { result.insert(AlignedToken(id: id, offset: nil), at: 0) }
-            if let id = resolve(bert.sep.1) { result.append(AlignedToken(id: id, offset: nil)) }
+            result.insert(AlignedToken(id: Int(bert.cls.0), offset: nil), at: 0)
+            result.append(AlignedToken(id: Int(bert.sep.0), offset: nil))
             return result
         case let sequence as SequenceProcessing:
             return try sequence.processors.reduce(tokens) {

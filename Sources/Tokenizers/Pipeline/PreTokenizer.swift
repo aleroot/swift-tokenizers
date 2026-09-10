@@ -105,6 +105,9 @@ enum PreTokenizerType: String {
     case WhitespaceSplit
     case Metaspace
     case BertPreTokenizer
+    case CharDelimiterSplit
+    case FixedLength
+    case UnicodeScripts
     case Unknown = ""
 }
 
@@ -122,6 +125,9 @@ struct PreTokenizerFactory {
             try MetaspacePreTokenizer.validate(config)
             return MetaspacePreTokenizer(config: config)
         case .BertPreTokenizer: return BertPreTokenizer(config: config)
+        case .CharDelimiterSplit: return try CharDelimiterSplitPreTokenizer(config: config)
+        case .FixedLength: return try FixedLengthPreTokenizer(config: config)
+        case .UnicodeScripts: return UnicodeScriptsPreTokenizer(config: config)
         default: throw TokenizerError.unsupportedComponent("pre-tokenizer `\(typeName)`")
         }
     }
@@ -271,6 +277,127 @@ final class WhitespacePreTokenizer: ByteSplitter {
                 || value == 0x5F
         }
         return ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.word != 0
+    }
+}
+
+/// `CharDelimiterSplit`: splits on one character, which is removed. Empty pieces are dropped,
+/// so runs of the delimiter collapse.
+final class CharDelimiterSplitPreTokenizer: ByteSplitter {
+    private let delimiter: [UInt8]
+
+    required init(config: Config) throws {
+        guard let delimiter = config.delimiter.string(), delimiter.unicodeScalars.count == 1 else {
+            throw TokenizerError.invalidConfiguration("CharDelimiterSplit delimiter must be one Unicode scalar")
+        }
+        self.delimiter = Array(delimiter.utf8)
+    }
+
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+        let end = bytes.count
+        let width = delimiter.count
+        let first = delimiter[0]
+        var start = 0
+        var i = 0
+        while i + width <= end {
+            guard bytes[i] == first else {
+                i += 1
+                continue
+            }
+            var matched = true
+            for k in 1..<width where bytes[i + k] != delimiter[k] {
+                matched = false
+                break
+            }
+            guard matched else {
+                i += 1
+                continue
+            }
+            if start < i { pieces.append(start..<i) }
+            i += width
+            start = i
+        }
+        if start < end { pieces.append(start..<end) }
+    }
+}
+
+/// `FixedLength`: consecutive chunks of `length` Unicode scalars. Empty input yields no pieces.
+final class FixedLengthPreTokenizer: ByteSplitter {
+    private let length: Int
+
+    required init(config: Config) throws {
+        length = config.length.integer(or: 5)
+        guard length > 0 else { throw TokenizerError.invalidConfiguration("FixedLength length must be positive") }
+    }
+
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+        let end = bytes.count
+        var start = 0
+        var i = 0
+        var scalars = 0
+        while i < end {
+            // Only the leading byte of each scalar advances the count.
+            i += 1
+            while i < end, bytes[i] & 0xC0 == 0x80 { i += 1 }
+            scalars += 1
+            if scalars == length {
+                pieces.append(start..<i)
+                start = i
+                scalars = 0
+            }
+        }
+        if start < end { pieces.append(start..<end) }
+    }
+}
+
+extension UnicodeScriptTable {
+    /// Direct table for ASCII, which dominates real inputs.
+    private static let ascii: [UInt8] = (0..<128).map { search(UInt32($0)) }
+
+    /// The script id of `value`.
+    @inline(__always)
+    static func script(of value: UInt32) -> UInt8 {
+        value < 128 ? ascii[Int(value)] : search(value)
+    }
+
+    /// Script of the run containing `value`: the last start not greater than it.
+    private static func search(_ value: UInt32) -> UInt8 {
+        starts.withUnsafeBufferPointer { starts in
+            var low = 0
+            var high = starts.count
+            while low < high {
+                let mid = (low + high) / 2
+                if starts[mid] <= value { low = mid + 1 } else { high = mid }
+            }
+            return scripts[low - 1]
+        }
+    }
+}
+
+/// `UnicodeScripts`: splits where the script changes, treating spaces (and every scalar with
+/// no script) as belonging to whichever script surrounds them. Hiragana, Katakana and the
+/// prolonged sound mark count as Han, as in SentencePiece.
+final class UnicodeScriptsPreTokenizer: ByteSplitter {
+    required init(config: Config) {}
+
+    func split(_ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, into pieces: inout [Range<Int>]) {
+        let end = bytes.count
+        guard end > 0 else { return }
+        // Upstream collects the boundary offsets, appends the length and takes the pairwise
+        // windows, so a leading run that belongs to every script starts no piece.
+        var start = -1
+        var previous: UInt8?
+        var i = 0
+        while i < end {
+            let (value, width) = UTF8Cursor.decode(bytes, at: i)
+            let script = UnicodeScriptTable.script(of: value)
+            if script != UnicodeScriptTable.any, previous != UnicodeScriptTable.any, previous != script {
+                if start >= 0 { pieces.append(start..<i) }
+                start = i
+            }
+            if script != UnicodeScriptTable.any { previous = script }
+            i += width
+        }
+        if start >= 0 { pieces.append(start..<end) }
     }
 }
 
@@ -481,9 +608,11 @@ final class ByteLevelPreTokenizer: StagedPreTokenizer {
             pieces: inout [Range<Int>]
         ) {
             let base = output.count
-            if bytes.first != UInt8(ascii: " ") { output.append(UInt8(ascii: " ")) }
+            // `NormalizedString::prepend` has nothing to attach the space to on empty input,
+            // so upstream leaves the chunk empty and it is dropped instead of becoming `Ġ`.
+            if !bytes.isEmpty, bytes[0] != UInt8(ascii: " ") { output.append(UInt8(ascii: " ")) }
             output.append(contentsOf: bytes)
-            pieces.append(0..<(output.count - base))
+            if output.count > base { pieces.append(0..<(output.count - base)) }
         }
     }
 }

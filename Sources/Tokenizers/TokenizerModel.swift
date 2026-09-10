@@ -31,6 +31,7 @@ enum TokenizerModel {
         "BPE": BPETokenizer.self,
         "Unigram": UnigramTokenizer.self,
         "WordPiece": BertTokenizer.self,
+        "WordLevel": WordLevelTokenizer.self,
     ]
 
     static func unknownToken(from tokenizerConfig: Config) -> String? {

@@ -34,14 +34,88 @@ enum StringSplitPattern {
 }
 
 /// Compiles a regular expression from a `tokenizer.json` field, reporting failures as a
-/// configuration error rather than crashing.
+/// configuration error rather than crashing. The source is first translated from the
+/// Oniguruma dialect `tokenizers` uses to the ICU dialect Foundation implements.
 func compileRegex(_ pattern: String, component: String) throws -> NSRegularExpression {
     do {
+        let source = OnigurumaDialect.translate(pattern)
         // ICU rejects an empty source; the empty group has the same zero-width matches.
-        return try NSRegularExpression(pattern: pattern.isEmpty ? "(?:)" : pattern, options: [])
+        return try NSRegularExpression(
+            pattern: source.isEmpty ? "(?:)" : source, options: [.anchorsMatchLines])
     } catch {
         throw TokenizerError.invalidConfiguration(
             "\(component): invalid regular expression \(pattern.debugDescription)")
+    }
+}
+
+/// Regexes that come from a `tokenizer.json` field (`Split`, `Replace`) are compiled by
+/// `tokenizers` with Oniguruma, and by Foundation with ICU. The built-in `Whitespace` and
+/// `ByteLevel` patterns instead go through the Rust `regex` crate, whose classes already
+/// match ICU's; only the configurable ones need translating. The two dialects agree on
+/// `\d`, `\s`, `\p{…}` and the general syntax, but not on:
+///
+/// - `\w`, which is `[\p{Alphabetic}\p{M}\p{N}\p{Pc}]` in Oniguruma. ICU (like the `regex`
+///   crate) adds ZWJ/ZWNJ and keeps only `\p{Nd}` of the numeric categories, so `½` and `²`
+///   are word characters for Oniguruma but not for ICU.
+/// - `^` and `$`, which match at every line boundary in Oniguruma's Ruby syntax but only at
+///   the start and end of the subject in ICU unless `.anchorsMatchLines` is set.
+///
+/// Rewriting the class escapes and enabling `.anchorsMatchLines` removes both differences.
+enum OnigurumaDialect {
+    /// Oniguruma's Unicode word characters, as a union usable inside a character class.
+    static let wordMembers = #"\p{Alphabetic}\p{M}\p{N}\p{Pc}"#
+
+    /// The ICU spelling of `\w` or `\W`. Inside a character class the positive form is a plain
+    /// union; the complement stays a nested set, which ICU also accepts there.
+    private static func expansion(word: Bool, inClass: Bool) -> String {
+        switch (word, inClass) {
+        case (true, true): return wordMembers
+        case (true, false): return "[\(wordMembers)]"
+        case (false, _): return "[^\(wordMembers)]"
+        }
+    }
+
+    /// Returns `pattern` with `\w` and `\W` rewritten to explicit ICU character classes.
+    /// Everything else — including escaped backslashes, `\p{…}` blocks and nested sets — is
+    /// copied through unchanged.
+    static func translate(_ pattern: String) -> String {
+        guard pattern.contains("\\w") || pattern.contains("\\W") else { return pattern }
+        let characters = Array(pattern)
+        var output = String()
+        output.reserveCapacity(pattern.count + 32)
+        var classDepth = 0
+        /// Set after an expansion: a following `-` would read as an ICU range or set-difference
+        /// operator, so it has to be escaped.
+        var expanded = false
+        var index = 0
+        while index < characters.count {
+            let character = characters[index]
+            // An escape and the character it escapes always travel together, so a literal
+            // backslash can never be mistaken for the start of `\w`.
+            if character == "\\", index + 1 < characters.count {
+                let escaped = characters[index + 1]
+                if escaped == "w" || escaped == "W" {
+                    output += expansion(word: escaped == "w", inClass: classDepth > 0)
+                    expanded = true
+                } else {
+                    output.append(character)
+                    output.append(escaped)
+                    expanded = false
+                }
+                index += 2
+                continue
+            }
+            if expanded, classDepth > 0, character == "-" { output.append("\\") }
+            expanded = false
+            switch character {
+            case "[": classDepth += 1
+            case "]" where classDepth > 0: classDepth -= 1
+            default: break
+            }
+            output.append(character)
+            index += 1
+        }
+        return output
     }
 }
 

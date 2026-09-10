@@ -54,6 +54,8 @@ enum NormalizerType: String {
     case Precompiled
     case StripAccents
     case Strip
+    case Nmt
+    case ByteLevel
     case Unknown = ""
 }
 
@@ -73,6 +75,8 @@ struct NormalizerFactory {
         case .Precompiled: return try PrecompiledNormalizer(config: config)
         case .StripAccents: return StripAccentsNormalizer(config: config)
         case .Strip: return StripNormalizer(config: config)
+        case .Nmt: return NmtNormalizer(config: config)
+        case .ByteLevel: return ByteLevelNormalizer(config: config)
         default: throw TokenizerError.unsupportedComponent("normalizer `\(typeName)`")
         }
     }
@@ -134,6 +138,71 @@ final class PrependNormalizer: ByteNormalizer {
         // `NormalizedString::prepend` is a no-op on empty input.
         if !bytes.isEmpty { output.append(contentsOf: prependBytes) }
         output.append(contentsOf: bytes)
+    }
+}
+
+/// `Nmt`: SentencePiece's NMT clean-up. Drops a fixed set of control scalars and folds the
+/// remaining "whitespace-like" scalars to a plain space. Ported from
+/// `tokenizers::normalizers::unicode::do_nmt`.
+final class NmtNormalizer: ByteNormalizer {
+    required init(config: Config) {}
+
+    /// The affected scalars are all outside ASCII except for the C0 controls, so an all-ASCII
+    /// chunk without controls is unchanged.
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
+        for byte in bytes where byte < 0x20 || byte >= 0x7F { return false }
+        return true
+    }
+
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        output.reserveCapacity(output.count + bytes.count)
+        var i = 0
+        while i < bytes.count {
+            let byte = bytes[i]
+            // ASCII outside the C0/DEL range is never rewritten; copy the run in one go.
+            if byte > 0x20, byte < 0x7F {
+                let start = i
+                repeat { i += 1 } while i < bytes.count && bytes[i] > 0x20 && bytes[i] < 0x7F
+                output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[start..<i]))
+                continue
+            }
+            let (value, width) = UTF8Cursor.decode(bytes, at: i)
+            switch Self.action(value) {
+            case .keep: output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<i + width]))
+            case .space: output.append(UInt8(ascii: " "))
+            case .drop: break
+            }
+            i += width
+        }
+    }
+
+    enum Action { case keep, drop, space }
+
+    @inline(__always)
+    static func action(_ value: UInt32) -> Action {
+        switch value {
+        case 0x0001...0x0008, 0x000B, 0x000E...0x001F, 0x007F, 0x008F, 0x009F:
+            return .drop
+        case 0x0009, 0x000A, 0x000C, 0x000D, 0x1680, 0x200B...0x200F, 0x2028, 0x2029, 0x2581, 0xFEFF, 0xFFFD:
+            return .space
+        default:
+            return .keep
+        }
+    }
+}
+
+/// `ByteLevel` as a normalizer: rewrites the text so every UTF-8 byte becomes its byte-level
+/// alphabet scalar, before pre-tokenization instead of after it.
+final class ByteLevelNormalizer: ByteNormalizer {
+    required init(config: Config) {}
+
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool { bytes.isEmpty }
+
+    func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        // Upstream leaves an empty string alone; every byte otherwise maps to one or two bytes.
+        guard !bytes.isEmpty else { return }
+        output.reserveCapacity(output.count + bytes.count * 2)
+        ByteLevelAlphabet.appendEncoded(bytes, to: &output)
     }
 }
 

@@ -513,3 +513,102 @@ struct MetaspaceFirstInSequenceTests {
         #expect(sequence.preTokenize(text: "hello world") == ["▁hello", "world"])
     }
 }
+
+@Suite("Upstream pre-tokenizers added for parity")
+struct AddedPreTokenizerTests {
+    /// `pre_tokenizers/unicode_scripts/pre_tokenizer.rs::basic` and
+    /// `::spaces_are_included_in_every_script`.
+    @Test("UnicodeScripts splits at script changes")
+    func unicodeScripts() {
+        let pre = UnicodeScriptsPreTokenizer(config: [:])
+        #expect(pre.preTokenize(text: "どこで生れ。Yes") == ["どこで生れ", "。", "Yes"])
+        #expect(pre.preTokenize(text: "Apples are りんご 林檎") == ["Apples are ", "りんご 林檎"])
+        // Hiragana, Katakana and the prolonged sound mark all count as Han.
+        #expect(pre.preTokenize(text: "グッド") == ["グッド"])
+        #expect(pre.preTokenize(text: "コーヒー") == ["コーヒー"])
+        #expect(pre.preTokenize(text: "") == [])
+        // A leading run that belongs to every script starts no piece, as upstream.
+        #expect(pre.preTokenize(text: " abc") == ["abc"])
+        #expect(pre.preTokenize(text: "   ") == [])
+    }
+
+    /// `pre_tokenizers/fixed_length.rs::basic`, `::custom_length`, `::utf8_characters`.
+    @Test("FixedLength chunks by Unicode scalar count")
+    func fixedLength() throws {
+        let five = try FixedLengthPreTokenizer(config: ["length": 5])
+        #expect(five.preTokenize(text: "Hello world") == ["Hello", " worl", "d"])
+        #expect(five.preTokenize(text: "Short") == ["Short"])
+        #expect(five.preTokenize(text: "") == [])
+        let three = try FixedLengthPreTokenizer(config: ["length": 3])
+        #expect(three.preTokenize(text: "Hello world") == ["Hel", "lo ", "wor", "ld"])
+        #expect(three.preTokenize(text: "Hello 👋 world") == ["Hel", "lo ", "👋 w", "orl", "d"])
+        // The default matches `default_length` upstream.
+        #expect(try FixedLengthPreTokenizer(config: [:]).preTokenize(text: "Hello world") == ["Hello", " worl", "d"])
+        #expect(throws: TokenizerError.self) { try FixedLengthPreTokenizer(config: ["length": 0]) }
+    }
+
+    /// `pre_tokenizers/delimiter.rs`: a `Removed` split, so empty pieces disappear.
+    @Test("CharDelimiterSplit removes the delimiter and empty pieces")
+    func charDelimiterSplit() throws {
+        let space = try CharDelimiterSplitPreTokenizer(config: ["delimiter": " "])
+        #expect(space.preTokenize(text: "Hey friend!") == ["Hey", "friend!"])
+        #expect(space.preTokenize(text: "  Hey   friend!  ") == ["Hey", "friend!"])
+        #expect(space.preTokenize(text: "") == [])
+        #expect(space.preTokenize(text: "   ") == [])
+        let marker = try CharDelimiterSplitPreTokenizer(config: ["delimiter": "▁"])
+        #expect(marker.preTokenize(text: "▁Hello▁there") == ["Hello", "there"])
+        #expect(throws: TokenizerError.self) { try CharDelimiterSplitPreTokenizer(config: ["delimiter": "ab"]) }
+    }
+
+    /// `NormalizedString::prepend` cannot attach to an empty string, so `add_prefix_space`
+    /// leaves an empty chunk empty instead of emitting a lone `Ġ`.
+    @Test("ByteLevel add_prefix_space is a no-op on empty input")
+    func byteLevelEmptyInput() {
+        for useRegex in [true, false] {
+            let pre = ByteLevelPreTokenizer(config: ["add_prefix_space": true, "use_regex": Config(useRegex)])
+            #expect(pre.preTokenize(text: "") == [])
+            #expect(pre.preTokenize(text: "Hello") == ["ĠHello"])
+        }
+    }
+}
+
+@Suite("Oniguruma dialect translation")
+struct OnigurumaDialectTests {
+    /// `tokenizers` compiles `Split` and `Replace` patterns with Oniguruma, whose `\\w` is
+    /// `[\\p{Alphabetic}\\p{M}\\p{N}\\p{Pc}]`; ICU's adds ZWJ/ZWNJ and drops `Nl`/`No`.
+    @Test("Word classes follow Oniguruma, not ICU")
+    func wordClass() throws {
+        let split = try SplitPreTokenizer(
+            config: ["pattern": ["Regex": #"\w+"#], "behavior": "Isolated", "invert": false])
+        // ½ (No), ² (No), Ⅰ (Nl) and ⓒ (So but Alphabetic) are all word characters upstream.
+        #expect(split.preTokenize(text: "½²Ⅰ letters") == ["½²Ⅰ", " ", "letters"])
+        #expect(split.preTokenize(text: "Hi ⓒ here") == ["Hi", " ", "ⓒ", " ", "here"])
+        // ZWNJ / ZWJ are word characters for ICU but not for Oniguruma.
+        #expect(split.preTokenize(text: "x\u{200C}y") == ["x", "\u{200C}", "y"])
+    }
+
+    @Test("Anchors match at every line boundary")
+    func anchors() throws {
+        let normalizer = try ReplaceNormalizer(
+            config: ["pattern": ["Regex": #"^\s*"#], "content": ""])
+        #expect(normalizer.normalize(text: "a\n  b\n  c") == "a\nb\nc")
+    }
+
+    @Test("Escapes, nested classes and complements survive translation")
+    func translation() {
+        #expect(OnigurumaDialect.translate(#"abc"#) == #"abc"#)
+        #expect(OnigurumaDialect.translate(#"\\w"#) == #"\\w"#)  // an escaped backslash, then a literal `w`
+        #expect(OnigurumaDialect.translate(#"\w"#) == "[\(OnigurumaDialect.wordMembers)]")
+        #expect(OnigurumaDialect.translate(#"[\w]"#) == "[\(OnigurumaDialect.wordMembers)]")
+        #expect(OnigurumaDialect.translate(#"[\w-]"#) == "[\(OnigurumaDialect.wordMembers)\\-]")
+        #expect(OnigurumaDialect.translate(#"\W"#) == "[^\(OnigurumaDialect.wordMembers)]")
+        #expect(OnigurumaDialect.translate(#"\p{L}\d\s"#) == #"\p{L}\d\s"#)
+    }
+
+    @Test("Every translated pattern still compiles")
+    func compiles() throws {
+        for pattern in [#"\w+"#, #"[\w-]+"#, #"[^\w\s]+"#, #"\W"#, #"(?i:\w)"#, #"^\w$"#, #"[\W]"#] {
+            #expect(throws: Never.self) { try compileRegex(pattern, component: "test") }
+        }
+    }
+}

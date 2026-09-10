@@ -43,8 +43,25 @@ struct PostProcessorFactory {
 }
 
 final class TemplateProcessing: PostProcessor, FastPostProcessor {
+    /// One `SpecialToken` entry of the processor's own `special_tokens` map. A piece can
+    /// expand to several tokens, and its ids are authoritative: `tokenizers` inserts them
+    /// without consulting the vocabulary.
+    struct SpecialToken: Sendable {
+        let ids: [Int]
+        let tokens: [String]
+
+        init?(config: Config) {
+            guard let tokens = config.tokens.array()?.compactMap({ $0.string() }), !tokens.isEmpty,
+                let ids = config.ids.array()?.compactMap({ $0.integer() }), ids.count == tokens.count
+            else { return nil }
+            self.ids = ids
+            self.tokens = tokens
+        }
+    }
+
     enum Item: Sendable {
-        case special(String)
+        /// The template's identifier, and its `special_tokens` entry when the file has one.
+        case special(String, SpecialToken?)
         case sequenceA
         case sequenceB
         case ignored
@@ -54,12 +71,19 @@ final class TemplateProcessing: PostProcessor, FastPostProcessor {
     let pair: [Config]
     let singleItems: [Item]
     let pairItems: [Item]
+    /// Ids to splice around the sequence, resolved once for the overwhelmingly common
+    /// `[specials…] $A [specials…]` template whose pieces all declare their own ids.
+    private let staticAffixes: (prefix: [Int], suffix: [Int])?
 
     required init(config: Config) throws {
         single = try require(config.single.array(), "TemplateProcessing", field: "single")
         pair = try require(config.pair.array(), "TemplateProcessing", field: "pair")
-        singleItems = single.map(Self.item)
-        pairItems = pair.map(Self.item)
+        var specials: [String: SpecialToken] = [:]
+        for (key, value) in config.specialTokens.dictionary(or: [:]) {
+            specials[key.string] = SpecialToken(config: value)
+        }
+        singleItems = single.map { Self.item($0, specials: specials) }
+        pairItems = pair.map { Self.item($0, specials: specials) }
         guard
             !singleItems.contains(where: {
                 if case .sequenceB = $0 { return true }; return false
@@ -67,10 +91,36 @@ final class TemplateProcessing: PostProcessor, FastPostProcessor {
         else {
             throw TokenizerError.invalidConfiguration("TemplateProcessing single template references sequence B")
         }
+        staticAffixes = Self.staticAffixes(of: singleItems)
     }
 
-    private static func item(_ config: Config) -> Item {
-        if let id = config.SpecialToken.id.string() { return .special(id) }
+    /// Splits `items` into the ids before and after the single `$A`, or `nil` when the shape
+    /// or the declared ids make that impossible and the general path has to run.
+    private static func staticAffixes(of items: [Item]) -> (prefix: [Int], suffix: [Int])? {
+        var prefix: [Int] = []
+        var suffix: [Int] = []
+        var seenSequence = false
+        for item in items {
+            switch item {
+            case .sequenceA:
+                if seenSequence { return nil }
+                seenSequence = true
+            case let .special(_, special):
+                guard let special else { return nil }  // needs a vocabulary lookup
+                if seenSequence {
+                    suffix.append(contentsOf: special.ids)
+                } else {
+                    prefix.append(contentsOf: special.ids)
+                }
+            case .sequenceB, .ignored:
+                return nil
+            }
+        }
+        return seenSequence ? (prefix, suffix) : nil
+    }
+
+    private static func item(_ config: Config, specials: [String: SpecialToken]) -> Item {
+        if let id = config.SpecialToken.id.string() { return .special(id, specials[id] ?? nil) }
         switch config.Sequence.id.string() {
         case "A": return .sequenceA
         case "B": return .sequenceB
@@ -84,8 +134,8 @@ final class TemplateProcessing: PostProcessor, FastPostProcessor {
         out.reserveCapacity(tokens.count + (tokensPair?.count ?? 0) + items.count)
         for item in items {
             switch item {
-            case let .special(id):
-                if addSpecialTokens { out.append(id) }
+            case let .special(id, special):
+                if addSpecialTokens { out.append(contentsOf: special?.tokens ?? [id]) }
             case .sequenceA:
                 out.append(contentsOf: tokens)
             case .sequenceB:
@@ -98,43 +148,35 @@ final class TemplateProcessing: PostProcessor, FastPostProcessor {
     }
 
     func postProcess(ids: inout [Int], addSpecialTokens: Bool, resolve: (String) -> Int?) {
-        // Fast path for the overwhelmingly common `[specials…] A [specials…]` shape.
-        let sequenceCount = singleItems.reduce(0) { count, item in
-            if case .sequenceA = item { return count + 1 }
-            return count
-        }
-        if sequenceCount != 1 {
-            let input = ids
-            ids.removeAll(keepingCapacity: true)
-            for item in singleItems {
-                switch item {
-                case .sequenceA: ids.append(contentsOf: input)
-                case let .special(token):
-                    if addSpecialTokens, let id = resolve(token) { ids.append(id) }
-                case .sequenceB, .ignored: break
-                }
-            }
+        // Pre-resolved affixes: two splices, no lookups and no temporary arrays.
+        if let staticAffixes {
+            guard addSpecialTokens else { return }
+            if !staticAffixes.prefix.isEmpty { ids.insert(contentsOf: staticAffixes.prefix, at: 0) }
+            if !staticAffixes.suffix.isEmpty { ids.append(contentsOf: staticAffixes.suffix) }
             return
         }
-        var prefix: [Int] = []
-        var suffix: [Int] = []
-        var seenA = false
+        let input = ids
+        ids.removeAll(keepingCapacity: true)
         for item in singleItems {
             switch item {
-            case let .special(token):
-                guard addSpecialTokens, let id = resolve(token) else { continue }
-                if seenA { suffix.append(id) } else { prefix.append(id) }
-            case .sequenceA:
-                seenA = true
-            case .sequenceB, .ignored:
-                break
+            case .sequenceA: ids.append(contentsOf: input)
+            case let .special(token, special):
+                if addSpecialTokens { Self.appendIds(token, special, resolve, to: &ids) }
+            case .sequenceB, .ignored: break
             }
         }
-        if !prefix.isEmpty {
-            ids.insert(contentsOf: prefix, at: 0)
-        }
-        if !suffix.isEmpty {
-            ids.append(contentsOf: suffix)
+    }
+
+    /// Appends the ids a special piece contributes: its declared ids, or a vocabulary lookup
+    /// for hand-written configurations that omit the `special_tokens` map.
+    @inline(__always)
+    static func appendIds(
+        _ token: String, _ special: SpecialToken?, _ resolve: (String) -> Int?, to output: inout [Int]
+    ) {
+        if let special {
+            output.append(contentsOf: special.ids)
+        } else if let id = resolve(token) {
+            output.append(id)
         }
     }
 }
@@ -172,20 +214,10 @@ final class RobertaProcessing: PostProcessor, FastPostProcessor {
 
     func postProcess(tokens: [String], tokensPair: [String]?, addSpecialTokens: Bool = true) -> [String] {
         // Like `tokenizers`, the processor is a no-op when special tokens are not requested.
+        // `trim_offsets` only moves offset boundaries (see `PostProcessor.processOffsets`);
+        // upstream never rewrites token content, so neither does this.
         guard addSpecialTokens else { return tokens + (tokensPair ?? []) }
-        var outTokens = tokens
-        var tokensPair = tokensPair
-        if trimOffset {
-            if addPrefixSpace {
-                outTokens = outTokens.map { Self.trimExtraSpaces($0) }
-                tokensPair = tokensPair?.map { Self.trimExtraSpaces($0) }
-            } else {
-                outTokens = outTokens.map { $0.trimmingCharacters(in: .whitespaces) }
-                tokensPair = tokensPair?.map { $0.trimmingCharacters(in: .whitespaces) }
-            }
-        }
-
-        outTokens = [cls.1] + outTokens + [sep.1]
+        var outTokens = [cls.1] + tokens + [sep.1]
         if let tokensPair, !tokensPair.isEmpty {
             // RoBERTa pairs carry a second `sep`:
             // https://github.com/facebookresearch/fairseq/blob/main/fairseq/models/roberta/hub_interface.py#L58-L65
@@ -195,31 +227,10 @@ final class RobertaProcessing: PostProcessor, FastPostProcessor {
     }
 
     func postProcess(ids: inout [Int], addSpecialTokens: Bool, resolve: (String) -> Int?) {
-        // Offset trimming only affects tokens containing literal whitespace, which cannot occur
-        // in byte-level vocabularies.
         guard addSpecialTokens else { return }
-        if let c = resolve(cls.1) { ids.insert(c, at: 0) }
-        if let s = resolve(sep.1) { ids.append(s) }
-    }
-
-    /// Some tokens need one space around them.
-    /// https://github.com/huggingface/tokenizers/blob/main/tokenizers/src/pre_tokenizers/byte_level.rs#L203-L235
-    private static func trimExtraSpaces(_ token: String) -> String {
-        let prefixOffset = findPrefixIndex(token)
-        let suffixOffset = findSuffixIndex(token)
-        let prefixIndex = token.index(token.startIndex, offsetBy: prefixOffset)
-        let suffixIndex = token.index(token.startIndex, offsetBy: token.count - suffixOffset)
-        return String(token[prefixIndex..<suffixIndex])
-    }
-
-    private static func findPrefixIndex(_ text: String) -> Int {
-        guard let first = text.first, first.isWhitespace else { return 0 }
-        return text.prefix(while: { $0.isWhitespace }).count - 1
-    }
-
-    private static func findSuffixIndex(_ text: String) -> Int {
-        guard let last = text.last, last.isWhitespace else { return 0 }
-        return text.reversed().prefix(while: { $0.isWhitespace }).count - 1
+        // The ids declared next to each token are authoritative, as in `tokenizers`.
+        ids.insert(Int(cls.0), at: 0)
+        ids.append(Int(sep.0))
     }
 }
 
@@ -243,8 +254,8 @@ final class BertProcessing: PostProcessor, FastPostProcessor {
 
     func postProcess(ids: inout [Int], addSpecialTokens: Bool, resolve: (String) -> Int?) {
         guard addSpecialTokens else { return }
-        if let c = resolve(cls.1) { ids.insert(c, at: 0) }
-        if let s = resolve(sep.1) { ids.append(s) }
+        ids.insert(Int(cls.0), at: 0)
+        ids.append(Int(sep.0))
     }
 }
 

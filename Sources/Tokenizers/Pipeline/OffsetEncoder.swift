@@ -103,6 +103,13 @@ final class OffsetModelEncoder {
                     }
                 }
             }
+        } else if let wordLevel = model as? WordLevelTokenizer {
+            // One token per chunk, covering all of it.
+            let text = byteLevel ? text.byteLevel() : text
+            text.bytes.withUnsafeBufferPointer { bytes in
+                guard let id = wordLevel.id(of: bytes) ?? wordLevel.unknownTokenId else { return }
+                output.append(AlignedToken(id: id, offset: text.sourceRange(0..<bytes.count)))
+            }
         } else if let bert = model as? BertTokenizer {
             let text = byteLevel ? text.byteLevel() : text
             if bert.serializedWordPiece {
