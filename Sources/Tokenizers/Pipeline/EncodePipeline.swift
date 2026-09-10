@@ -12,6 +12,8 @@ struct PreTokenizationRunner: Sendable {
     /// materialises the alphabet form (the following stages then see plain text, as in
     /// `tokenizers`).
     let stages: [PreTokenizationStage]
+    let needsOriginalStart: Bool
+    let rewritesBeforeFirst: Bool
 
     init(stages: [PreTokenizationStage]) {
         var compiled: [PreTokenizationStage] = []
@@ -23,6 +25,23 @@ struct PreTokenizationRunner: Sendable {
             }
         }
         self.stages = compiled
+        needsOriginalStart = compiled.contains {
+            if case let .rewrite(rewriter) = $0, let metaspace = rewriter as? MetaspacePreTokenizer {
+                return metaspace.prependScheme == .first
+            }
+            return false
+        }
+        var rewritten = false
+        var needsMapping = false
+        for stage in compiled {
+            if case let .rewrite(rewriter) = stage {
+                if let metaspace = rewriter as? MetaspacePreTokenizer, metaspace.prependScheme == .first {
+                    needsMapping = needsMapping || rewritten
+                }
+                rewritten = true
+            }
+        }
+        rewritesBeforeFirst = needsMapping
     }
 
     /// Calls `body(piece, byteLevel)` for every piece of `bytes`, in order.
@@ -33,6 +52,15 @@ struct PreTokenizationRunner: Sendable {
         _ bytes: UnsafeBufferPointer<UInt8>, options: PreTokenizerOptions, scratch: ScratchBuffers,
         _ body: (UnsafeBufferPointer<UInt8>, Bool) -> Void
     ) {
+        if rewritesBeforeFirst {
+            let source = AlignedText(
+                bytes: Array(bytes)[...], origins: nil,
+                sourceStart: options.contains(.firstSection) ? 0 : 1)
+            if let pieces = try? alignedPieces(source, options: options) {
+                for (piece, byteLevel) in pieces { piece.bytes.withUnsafeBufferPointer { body($0, byteLevel) } }
+                return
+            }
+        }
         var current = scratch.takeRanges()
         var next = scratch.takeRanges()
         // After a rewrite stage the ranges index `text` instead of the input.
@@ -207,6 +235,22 @@ struct EncodePipeline: Sendable {
         _ bytes: UnsafeBufferPointer<UInt8>, scratch: EncodeScratch,
         onToken: (Int) -> Void, onPiece: (UnsafeBufferPointer<UInt8>, Bool) -> Void
     ) {
+        if preTokenizer?.needsOriginalStart == true, let normalizer, !normalizer.isIdentity(on: bytes) {
+            // Only `first` needs provenance in the IDs-only path. Prepare before
+            // calling consumers so a failed optional trace cannot emit partial IDs.
+            var sections: [(Int?, AlignedText, Bool)] = []
+            if (try? runAligned(
+                AlignedText(String(decoding: bytes, as: UTF8.self)),
+                onToken: {
+                    sections.append(($0, $1, false))
+                }, onPiece: { sections.append((nil, $0, $1)) })) != nil
+            {
+                for (id, piece, byteLevel) in sections {
+                    if let id { onToken(id) } else { piece.bytes.withUnsafeBufferPointer { onPiece($0, byteLevel) } }
+                }
+                return
+            }
+        }
         scratch.reusable = bytes.count <= EncodeScratch.maximumReusableInputBytes
         scratch.sections.removeAll(keepingCapacity: true)
         if let splitter {

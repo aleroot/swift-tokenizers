@@ -156,11 +156,11 @@ final class BertPreTokenizer: ByteSplitter {
                     i += ByteKernels.width
                     continue
                 }
-                let (_, width, flags) = ByteLevelScanner.decodeClassified(bytes, i, table)
+                let (value, width, flags) = ByteLevelScanner.decodeClassified(bytes, i, table)
                 if flags & ScalarFlags.whitespace != 0 {
                     if start < i { pieces.append(start..<i) }
                     start = i + width
-                } else if flags & ScalarFlags.punctuation != 0 {
+                } else if TokenizerUnicode.isPunctuation(value) {
                     if start < i { pieces.append(start..<i) }
                     pieces.append(i..<i + width)
                     start = i + width
@@ -524,31 +524,29 @@ final class PunctuationPreTokenizer: ByteSplitter {
 
     /// Appends the byte ranges of the chunks `bytes` splits into.
     static func splitRanges(_ bytes: UnsafeBufferPointer<UInt8>, behavior: Behavior, into ranges: inout [Range<Int>]) {
-        ScalarClassifier.bmp.withUnsafeBufferPointer { table in
-            let end = bytes.count
-            // Punctuation matches: single scalars, or runs when contiguous. Emitted per behaviour
-            // as they are found so no intermediate array is needed.
-            var cursor = 0
-            var i = 0
-            while i < end {
-                let (_, w, f) = ByteLevelScanner.decodeClassified(bytes, i, table)
-                guard f & ScalarFlags.punctuation != 0 else {
-                    i += w
-                    continue
-                }
-                var j = i + w
-                if behavior == .contiguous {
-                    while j < end {
-                        let (_, w2, g) = ByteLevelScanner.decodeClassified(bytes, j, table)
-                        if g & ScalarFlags.punctuation == 0 { break }
-                        j += w2
-                    }
-                }
-                Self.emit(match: i..<j, behavior: behavior, cursor: &cursor, into: &ranges)
-                i = j
+        let end = bytes.count
+        // Punctuation matches: single scalars, or runs when contiguous. Emitted per behaviour
+        // as they are found so no intermediate array is needed.
+        var cursor = 0
+        var i = 0
+        while i < end {
+            let (value, w) = UTF8Cursor.decode(bytes, at: i)
+            guard TokenizerUnicode.isPunctuation(value) else {
+                i += w
+                continue
             }
-            if cursor < end { ranges.append(cursor..<end) }
+            var j = i + w
+            if behavior == .contiguous {
+                while j < end {
+                    let (next, w2) = UTF8Cursor.decode(bytes, at: j)
+                    if !TokenizerUnicode.isPunctuation(next) { break }
+                    j += w2
+                }
+            }
+            Self.emit(match: i..<j, behavior: behavior, cursor: &cursor, into: &ranges)
+            i = j
         }
+        if cursor < end { ranges.append(cursor..<end) }
     }
 
     /// Emits the pieces implied by a delimiter match at `match` for `behavior`, advancing `cursor`.
@@ -612,7 +610,11 @@ final class DigitsPreTokenizer: ByteSplitter {
     /// Rust `char::is_numeric` (general categories Nd, Nl, No).
     @inline(__always)
     private static func isDigit(_ value: UInt32) -> Bool {
-        ScalarClassifier.flags(value: value) & ScalarFlags.number != 0
+        if value < 0x80 { return value >= 0x30 && value <= 0x39 }
+        switch Unicode.Scalar(value)?.properties.generalCategory {
+        case .decimalNumber, .letterNumber, .otherNumber: return true
+        default: return false
+        }
     }
 }
 

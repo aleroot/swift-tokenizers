@@ -34,10 +34,8 @@ let prompt = try tokenizer.applyChatTemplate(messages: [
 
 ## Highlights
 
-- **Differentially tested.** Encode and decode tests cover 24 tokenizer families and roughly
-  300 adversarial inputs per family. Focused boundary and offset regressions, plus 814 component
-  cases, use Rust-backed `tokenizers` 0.23.2 reference outputs with byte-exact string comparisons.
-  Exhaustive Unicode testing still finds unresolved normalization differences.
+- **Differentially tested.** Token IDs, decoded text, and source offsets are checked against
+  Hugging Face `tokenizers` 0.23.2, with Unicode conformance and regression tests.
 - **Fast inference.** SIMD scans, packed vocabulary storage, reusable buffers, and bounded
   pretoken caches. Published performance comparisons specify their workloads and reference versions.
 - **Inference components.** Added and special tokens, common normalization and pre-tokenization
@@ -82,6 +80,9 @@ let tokenizer = try await AutoTokenizer.from(modelFolder: modelFolder) // async
 Unknown `tokenizer_class` names resolve through the `model.type` of `tokenizer.json`, so new
 Hub classes load without a library update.
 
+For in-memory tokenizer JSON, use `Config(tokenizerJSON:)`. It preserves byte-distinct vocabulary
+keys that Foundation's `JSONDecoder` can merge through Unicode canonical equivalence.
+
 ### Encoding and decoding
 
 ```swift
@@ -103,7 +104,17 @@ let ranges = encoding.utf16Ranges(expandingToGraphemeClusters: true)
 
 `encoding.offsets` contains UTF-8 byte ranges in the original input, before normalization.
 Inserted special tokens have nil ranges; multiple tokens can overlap the same source text.
-The existing IDs-only overload avoids alignment work.
+Use the ordinary `encode` overload when you only need token IDs.
+
+### Unicode compatibility
+
+Normalization follows Hugging Face's Unicode 9 rules; BERT accent/control rules and punctuation
+use Unicode 8, and optimized regex scanners and word classes use Unicode 16.
+SentencePiece normalization uses the character map embedded in the model.
+
+Case mapping, numeric classification, grapheme segmentation, and arbitrary regex fallback use
+Swift/Foundation Unicode data, so behavior for newer characters can differ across OS versions.
+Source offsets preserve original positions even when unrecognized symbols are dropped.
 
 ### Chat templates and tools
 

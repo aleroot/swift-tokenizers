@@ -7,6 +7,16 @@ import Testing
 struct TokenizerRegressionTests {
     private let configuration: Config = ["tokenizer_class": "GPT2Tokenizer"]
 
+    @Test("SentencePiece Prepend graphemes cross the ASCII fast-path boundary")
+    func t5PrependGrapheme() async throws {
+        let tokenizer = try await HubFixtures.tokenizer(for: "google-t5/t5-small")
+        let text = "\u{890}e\u{301}"
+        #expect(tokenizer.encode(text: text, addSpecialTokens: false) == [3, 2, 15, 2])
+        let encoding = try tokenizer.encode(text: text, addSpecialTokens: false, withOffsets: true)
+        #expect(encoding.ids == [3, 2, 15, 2])
+        #expect(encoding.offsets == [0..<3, 0..<3, 3..<4, 4..<6])
+    }
+
     @Test("Folder loading rebuilds Llama post-processor like transformers")
     func folderPostProcessorPolicy() async throws {
         // Python `LlamaTokenizerFast.__init__` always calls `update_post_processor()`, even when
@@ -29,7 +39,7 @@ struct TokenizerRegressionTests {
         for strict in [true, false] {
             let tokenizer = try await AutoTokenizer.from(modelFolder: folder, strict: strict)
             #expect(tokenizer.encode(text: "a") == pythonIds)
-            #expect(tokenizer.decode(tokens: [1, 1]) == "<s><s>")
+            #expect(tokenizer.decode(tokens: [1, 1]) == "<s> <s>")
             let synchronous = try AutoTokenizer.load(from: folder, strict: strict)
             #expect(synchronous.encode(text: "a") == pythonIds)
             let reconstructed = try AutoTokenizer.from(

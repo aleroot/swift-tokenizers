@@ -116,6 +116,39 @@ final class OffsetModelEncoder {
 }
 
 extension EncodePipeline {
+    /// Original positions are required by Metaspace's `first` rule even for IDs-only encoding.
+    func runAligned(
+        _ source: AlignedText, onToken: (Int, AlignedText) -> Void,
+        onPiece: (AlignedText, Bool) throws -> Void
+    ) throws {
+        // Split callbacks cannot throw; collect only the inexpensive section descriptors.
+        func sections(_ text: AlignedText, _ splitter: AddedTokenSplitter?) -> [(Range<Int>, Int?)] {
+            guard let splitter else { return text.bytes.isEmpty ? [] : [(0..<text.bytes.count, nil)] }
+            var result: [(Range<Int>, Int?)] = []
+            text.bytes.withUnsafeBufferPointer { bytes in
+                splitter.scan(bytes: bytes, onText: { result.append(($0, nil)) }, onToken: { result.append(($1, $0)) })
+            }
+            return result
+        }
+        for (range, token) in sections(source, splitter) {
+            if let token { onToken(token, source.slice(range)); continue }
+            var part = source.slice(range)
+            if let normalizer { part = try part.normalized(by: normalizer) }
+            for (subrange, token) in sections(part, normalizedSplitter) {
+                if let token { onToken(token, part.slice(subrange)); continue }
+                let options: PreTokenizerOptions = part.sourceRange(subrange).lowerBound == 0 ? [.firstSection] : []
+                let piece = part.slice(subrange)
+                if let preTokenizer {
+                    try preTokenizer.runAligned(piece, options: options) { piece, byteLevel in
+                        try onPiece(piece, byteLevel)
+                    }
+                } else {
+                    try onPiece(piece, false)
+                }
+            }
+        }
+    }
+
     func encode(_ text: String, model: any TokenizingModel) throws -> [AlignedToken] {
         let source = AlignedText(text)
         let encoder = OffsetModelEncoder(model: model)
@@ -134,35 +167,17 @@ extension EncodePipeline {
             }
             output.removeSubrange(write...)
         }
-        // Split callbacks cannot throw; collect only the inexpensive section descriptors.
-        func sections(_ text: AlignedText, _ splitter: AddedTokenSplitter?) -> [(Range<Int>, Int?)] {
-            guard let splitter else { return text.bytes.isEmpty ? [] : [(0..<text.bytes.count, nil)] }
-            var result: [(Range<Int>, Int?)] = []
-            text.bytes.withUnsafeBufferPointer { bytes in
-                splitter.scan(bytes: bytes, onText: { result.append(($0, nil)) }, onToken: { result.append(($1, $0)) })
-            }
-            return result
-        }
-        func appendAdded(_ id: Int, _ range: Range<Int>) {
-            fuse()
-            output.append(AlignedToken(id: id, offset: range))
-            sectionStart = output.count
-        }
-        for (range, token) in sections(source, splitter) {
-            if let token { appendAdded(token, source.sourceRange(range)); continue }
-            var part = source.slice(range)
-            if let normalizer { part = try part.normalized(by: normalizer) }
-            for (subrange, token) in sections(part, normalizedSplitter) {
-                if let token { appendAdded(token, part.sourceRange(subrange)); continue }
-                let options: PreTokenizerOptions = range.lowerBound == 0 && subrange.lowerBound == 0 ? [.firstSection] : []
-                let piece = part.slice(subrange)
-                if let preTokenizer {
-                    try preTokenizer.runAligned(piece, options: options) { piece, byteLevel in
-                        try encoder.encode(piece, byteLevel: byteLevel, into: &output)
-                    }
-                } else { try encoder.encode(piece, byteLevel: false, into: &output) }
-            }
-        }
+        try runAligned(
+            source,
+            onToken: { id, piece in
+                fuse()
+                output.append(
+                    AlignedToken(id: id, offset: piece.sourceRange(0..<piece.bytes.count), spelling: piece.text))
+                sectionStart = output.count
+            },
+            onPiece: { piece, byteLevel in
+                try encoder.encode(piece, byteLevel: byteLevel, into: &output)
+            })
         fuse()
         // Byte tokens can end inside a UTF-8 scalar. Expose the complete original scalar
         // for each of them, matching HF's character offsets and producing safe UI ranges.
@@ -224,7 +239,12 @@ extension PreTokenizationRunner {
                 pieces = pieces.flatMap { text, options in
                     var ranges: [Range<Int>] = []
                     text.bytes.withUnsafeBufferPointer { splitter.split($0, options: options, into: &ranges) }
-                    return ranges.filter { !$0.isEmpty }.map { (text.slice($0), $0.lowerBound == 0 ? options : []) }
+                    return ranges.filter { !$0.isEmpty }.map {
+                        (
+                            text.slice($0),
+                            text.sourceRange($0).lowerBound == 0 ? PreTokenizerOptions([.firstSection]) : []
+                        )
+                    }
                 }
             case let .rewrite(rewriter):
                 var next: [(AlignedText, PreTokenizerOptions)] = []
@@ -276,8 +296,11 @@ extension PreTokenizationRunner {
                     }
                     let rewritten = AlignedText(bytes: bytes[...], origins: origins[...], sourceStart: text.sourceStart)
                     next.append(contentsOf: ranges.filter { !$0.isEmpty }.map {
-                        (rewritten.slice($0), $0.lowerBound == 0 ? options : [])
-                    })
+                            (
+                                rewritten.slice($0),
+                                rewritten.sourceRange($0).lowerBound == 0 ? PreTokenizerOptions([.firstSection]) : []
+                            )
+                        })
                 }
                 pieces = next
             }

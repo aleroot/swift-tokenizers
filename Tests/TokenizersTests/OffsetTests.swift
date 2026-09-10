@@ -6,6 +6,24 @@ import Testing
 /// Focused expectations from Hugging Face tokenizers 0.23.2, expressed in source bytes.
 @Suite("Original text offsets")
 struct OffsetTests {
+    @Test("ByteLevel trims Unicode whitespace in original scalar coordinates")
+    func unicodeWhitespaceTrimming() throws {
+        let tokenizer = try PreTrainedTokenizer(
+            tokenizerConfig: [:],
+            tokenizerData: [
+                "model": ["type": "BPE", "vocab": ["?": 0, "\u{2029}": 1, "[X]": 2], "merges": []],
+                "added_tokens": [
+                    [
+                        "id": 2, "content": "[X]", "normalized": false, "special": false, "lstrip": true,
+                        "rstrip": true,
+                    ]
+                ],
+                "post_processor": ["type": "ByteLevel", "trim_offsets": true, "add_prefix_space": false],
+            ])
+        try check(tokenizer, text: "?\u{2029}", ids: [0, 1], offsets: [0..<1, 4..<4], utf16: [0..<1, 2..<2])
+        try check(tokenizer, text: "\t\u{85}[X]\u{2029}", ids: [2], offsets: [3..<6], utf16: [2..<5])
+    }
+
     private func check(
         _ tokenizer: any Tokenizer, text: String, special: Bool = false,
         ids: [Int], offsets: [Range<Int>?], utf16: [Range<Int>?]

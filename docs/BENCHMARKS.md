@@ -2,7 +2,8 @@
 
 The main comparison tables were measured on one machine, in one sitting, against the same inputs,
 including the other implementations. The [JSON parser follow-up](#json-parser-follow-up) separately
-records a later before/after experiment on an M2. All figures are measurements, not projections.
+records a later before/after experiment on an M2. The [source-offset measurements](#source-offset-encoding)
+also use an M2. All figures are measurements, not projections.
 
 | | |
 |---|---|
@@ -23,6 +24,7 @@ tables quote a single representative run.
 - [Encode throughput by tokenizer family](#encode-throughput-by-tokenizer-family)
 - [Cold cache and non-repetitive text](#cold-cache-and-non-repetitive-text)
 - [Decode and vocabulary reflection](#decode-and-vocabulary-reflection)
+- [Source-offset encoding](#source-offset-encoding)
 - [Load time](#load-time)
 - [Memory footprint](#memory-footprint)
 - [Embedding models and rerankers](#embedding-models-and-rerankers)
@@ -127,6 +129,30 @@ Unigram 1,108,547 = 1,108,547; WordPiece 1,108,377 = 1,108,377.
 
 The vocabulary walk is the pattern MLX guided generation uses to discover the token space: it must
 be O(1) per id and dense, so 150k lookups cost as much as one 11.5 KB encode.
+
+## Source-offset encoding
+
+Measured September 10, 2026 on Apple M2, 16 GB, macOS 26.6.2, Apple Swift 6.3.3,
+release builds, on one thread.
+
+Each input is a paragraph repeated 100 times. Each cell is microseconds per call: median of
+six batches of five calls after discarding the first batch. These are warm-cache measurements.
+
+| Tokenizer | English IDs | Multilingual IDs | Multilingual IDs + offsets |
+|---|---:|---:|---:|
+| GPT-2 | 58.4 | 104.3 | 603 |
+| Qwen3 | 64.1 | 104.9 | 426 |
+| BERT uncased | 38.6 | 187.4 | 1,800 |
+| T5 small | 81.0 | 191.4 | 1,504 |
+| Llama 7B | 92.4 | 51.0 | 1,208 |
+| Mistral v0.3 | 61.1 | 44.8 | 713 |
+
+Offset tracking costs more than IDs-only encoding. These measurements exclude UTF-16 range
+conversion and grapheme expansion.
+
+The English paragraph is “Maya checked the timetable, bought a ticket, and walked to platform
+seven. Rain tapped against the glass roof. ” The multilingual paragraph is
+“Café naïve — Ελληνικά 中文 العربية हिन्दी 한국어 👩🏽‍💻. ”, including its trailing space.
 
 ## Load time
 

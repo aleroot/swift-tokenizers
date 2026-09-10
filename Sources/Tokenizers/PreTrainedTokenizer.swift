@@ -104,8 +104,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         self.preTokenizer = preTokenizer
         self.normalizer = normalizer
         postProcessor = try PostProcessorFactory.fromConfig(config: tokenizerData["postProcessor"])
-        decoder = try DecoderFactory.fromConfig(
-            config: tokenizerData["decoder"], addedTokens: self.addedTokens.union(normalizedSpellings.values))
+        decoder = try DecoderFactory.fromConfig(config: tokenizerData["decoder"])
         // `transformers` >= 4.45 defaults `clean_up_tokenization_spaces` to `False`.
         cleanUpTokenizationSpaces = tokenizerConfig.cleanUpTokenizationSpaces.boolean(or: false)
         self.tokenizerConfig = tokenizerConfig
@@ -133,8 +132,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         }
 
         if decoder is ByteLevelDecoder, normalizedSpellings.isEmpty, let bpe = model as? BPETokenizer {
-            let addedTokenIds = splitterTokens.map(\.id) + normalizedTokens.map(\.id)
-            byteLevelDecodeTable = Lazy { ByteLevelDecodeTable(vocabulary: bpe.vocab, addedTokenIds: addedTokenIds) }
+            byteLevelDecodeTable = Lazy { ByteLevelDecodeTable(vocabulary: bpe.vocab) }
         } else {
             byteLevelDecodeTable = nil
         }
@@ -232,7 +230,8 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         }
         var tokens = try pipeline.encode(text, model: model)
         if let postProcessor {
-            tokens = try postProcessor.processOffsets(tokens, addSpecialTokens: addSpecialTokens,
+            tokens = try postProcessor.processOffsets(
+                tokens, text: text, addSpecialTokens: addSpecialTokens,
                 resolve: model.convertTokenToId, spelling: convertIdToToken)
         }
         return TokenEncoding(text: text, tokens: tokens)
@@ -293,8 +292,8 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
                 tokenStrings.append(token)
             }
         }
-        let decoded = decodeTokens(tokenStrings)
-        return cleanUp(text: decoded.joined())
+        guard let decoder else { return cleanUp(text: tokenStrings.joined(separator: " ")) }
+        return cleanUp(text: decoder.decode(tokens: tokenStrings).joined())
     }
 
     public func convertTokenToId(_ token: String) -> Int? {
@@ -476,31 +475,27 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 final class ByteLevelDecodeTable: Sendable {
     private let storage: [UInt8]
     private let offsets: [UInt32]
-    private let isAddedToken: [Bool]
     private let count: Int
 
-    init(vocabulary: Vocabulary, addedTokenIds: [Int]) {
+    init(vocabulary: Vocabulary) {
         count = vocabulary.count
         var storage: [UInt8] = []
         var offsets = [UInt32](repeating: 0, count: count + 1)
-        var isAdded = [Bool](repeating: false, count: count)
-        for id in addedTokenIds where id >= 0 && id < count { isAdded[id] = true }
         for id in 0..<count {
             offsets[id] = UInt32(storage.count)
             guard vocabulary.contains(id: id) else { continue }
             vocabulary.withBytes(of: id) { bytes in
-                // Added tokens are stored verbatim; everything else is alphabet-encoded.
-                if isAdded[id] {
-                    storage.append(contentsOf: bytes)
-                    return
-                }
+                let start = storage.count
                 var i = 0
                 while i < bytes.count {
                     let (value, width) = UTF8Cursor.decode(bytes, at: i)
                     if value <= ByteLevelAlphabet.maxScalar, ByteLevelAlphabet.scalarToByte[Int(value)] >= 0 {
                         storage.append(UInt8(ByteLevelAlphabet.scalarToByte[Int(value)]))
                     } else {
-                        storage.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<(i + width)]))
+                        // One scalar outside the alphabet makes the entire token literal.
+                        storage.removeSubrange(start...)
+                        storage.append(contentsOf: bytes)
+                        return
                     }
                     i += width
                 }
@@ -509,20 +504,11 @@ final class ByteLevelDecodeTable: Sendable {
         offsets[count] = UInt32(storage.count)
         self.storage = storage.trimmed()
         self.offsets = offsets
-        isAddedToken = isAdded
     }
 
     func decode(_ ids: [Int], skipping skipped: Set<Int>) -> String {
-        var output = ""
         var bytes: [UInt8] = []
         bytes.reserveCapacity(ids.count * 4)
-
-        func flush() {
-            if !bytes.isEmpty {
-                output.append(String(decoding: bytes, as: UTF8.self))
-                bytes.removeAll(keepingCapacity: true)
-            }
-        }
 
         storage.withUnsafeBufferPointer { buffer in
             for id in ids {
@@ -530,16 +516,10 @@ final class ByteLevelDecodeTable: Sendable {
                 if !skipped.isEmpty, skipped.contains(id) { continue }
                 let lo = Int(offsets[id])
                 let hi = Int(offsets[id + 1])
-                if isAddedToken[id] {
-                    flush()
-                    output.append(String(decoding: UnsafeBufferPointer(rebasing: buffer[lo..<hi]), as: UTF8.self))
-                } else {
-                    bytes.append(contentsOf: UnsafeBufferPointer(rebasing: buffer[lo..<hi]))
-                }
+                bytes.append(contentsOf: UnsafeBufferPointer(rebasing: buffer[lo..<hi]))
             }
         }
-        flush()
-        return output
+        return String(decoding: bytes, as: UTF8.self)
     }
 }
 

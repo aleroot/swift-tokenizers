@@ -129,7 +129,7 @@ enum ScalarFlags {
 
 @usableFromInline
 enum ScalarClassifier {
-    /// Runtime-derived flags for the Basic Multilingual Plane (64 KiB), built on first use.
+    /// Unicode 16 regex flags for the Basic Multilingual Plane (64 KiB), built on first use.
     @usableFromInline
     static let bmp: [UInt8] = makeBMPFlags()
 
@@ -175,24 +175,29 @@ enum ScalarClassifier {
             default: return ScalarFlags.other
             }
         }
+        // U+0295 changed from Ll to Lo in Unicode 17.
+        if v == 0x0295 { return ScalarFlags.letter | ScalarFlags.lower }
         let props = scalar.properties
-        switch props.generalCategory {
+        let flags: UInt8 = switch props.generalCategory {
         case .uppercaseLetter, .titlecaseLetter:
-            return ScalarFlags.letter | ScalarFlags.upper
+            ScalarFlags.letter | ScalarFlags.upper
         case .lowercaseLetter:
-            return ScalarFlags.letter | ScalarFlags.lower
+            ScalarFlags.letter | ScalarFlags.lower
         case .modifierLetter, .otherLetter:
-            return ScalarFlags.letter
+            ScalarFlags.letter
         case .nonspacingMark, .spacingMark, .enclosingMark:
-            return ScalarFlags.mark
+            ScalarFlags.mark
         case .decimalNumber, .letterNumber, .otherNumber:
-            return ScalarFlags.number
+            ScalarFlags.number
         case .connectorPunctuation, .dashPunctuation, .openPunctuation, .closePunctuation,
             .initialPunctuation, .finalPunctuation, .otherPunctuation:
-            return ScalarFlags.other | ScalarFlags.punctuation
+            ScalarFlags.other | ScalarFlags.punctuation
         default:
-            return props.isWhitespace ? ScalarFlags.whitespace : ScalarFlags.other
+            props.isWhitespace ? ScalarFlags.whitespace : ScalarFlags.other
         }
+        if flags & (ScalarFlags.letter | ScalarFlags.number | ScalarFlags.mark) != 0,
+            !TokenizerUnicode.assigned(scalar, through: 16) { return ScalarFlags.other }
+        return flags
     }
 
     @inlinable
@@ -239,8 +244,16 @@ enum ScalarClassifier {
             // Every letter and Nl is Alphabetic. Reuse the category already fetched,
             // avoiding another Unicode-property lookup for the majority of the BMP.
             flags |= ScalarExtraFlags.word
+        case .privateUse:
+            // Apple's Unicode data assigns Alphabetic to some private-use characters.
+            // These are not members of the reference regex engine's Unicode word set.
+            break
         default:
             if properties.isAlphabetic || value == 0x200C || value == 0x200D { flags |= ScalarExtraFlags.word }
+        }
+        if flags & (ScalarExtraFlags.word | ScalarExtraFlags.decimalDigit) != 0,
+            !TokenizerUnicode.assigned(scalar, through: 16) {
+            flags &= ~(ScalarExtraFlags.word | ScalarExtraFlags.decimalDigit)
         }
         // UAX #29 GB9/GB9a: Extend (Grapheme_Extend ∪ Emoji_Modifier), ZWJ, SpacingMark (Mc plus
         // U+0E33 / U+0EB3). Over-approximating is safe for callers; under-approximating is not.

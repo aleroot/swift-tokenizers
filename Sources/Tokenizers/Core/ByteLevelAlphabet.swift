@@ -72,15 +72,17 @@ enum ByteLevelAlphabet {
         }
     }
 
-    /// Decodes an alphabet string back into raw bytes. Scalars outside the alphabet are
-    /// passed through as their own UTF-8 encoding (matching the tolerant behaviour needed
-    /// for added tokens that are stored verbatim in byte-level vocabularies).
+    /// Decodes an alphabet token. If any scalar is outside the alphabet, the entire token
+    /// passes through as UTF-8, matching the reference decoder's per-token fallback.
     static func decode(_ string: String, into output: inout [UInt8]) {
+        let start = output.count
         for scalar in string.unicodeScalars {
             if let b = byte(for: scalar) {
                 output.append(b)
             } else {
-                output.append(contentsOf: Array(String(scalar).utf8))
+                output.removeSubrange(start...)
+                output.append(contentsOf: string.utf8)
+                return
             }
         }
     }

@@ -105,7 +105,7 @@ struct MemoryBreakdownTests {
         }
         try report("Normalizer") { try NormalizerFactory.fromConfig(config: config.normalizer)! as AnyObject }
         try report("PreTokenizer") { try PreTokenizerFactory.fromConfig(config: config.preTokenizer)! as AnyObject }
-        try report("Decoder") { try DecoderFactory.fromConfig(config: config.decoder, addedTokens: [])! as AnyObject }
+        try report("Decoder") { try DecoderFactory.fromConfig(config: config.decoder)! as AnyObject }
         try report("PostProcessor") { try PostProcessorFactory.fromConfig(config: config.postProcessor)! as AnyObject }
         try report("PreTrainedTokenizer") {
             try PreTrainedTokenizer(

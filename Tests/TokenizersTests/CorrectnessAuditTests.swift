@@ -7,6 +7,87 @@ import Testing
 /// Strings are compared as UTF-8: Swift canonical equivalence is too permissive here.
 @Suite("Hugging Face boundary audit")
 struct CorrectnessAuditTests {
+    @Test("An absent decoder separates tokens; Fuse concatenates explicitly")
+    func defaultDecoder() throws {
+        let model: Config = ["type": "BPE", "vocab": ["a": 0, "b": 1], "merges": []]
+        for (decoder, expected): (Config, String) in [(Config(), "a b"), (["type": "Fuse"], "ab")] {
+            let tokenizer = try PreTrainedTokenizer(
+                tokenizerConfig: [:], tokenizerData: ["model": model, "decoder": decoder])
+            #expect(tokenizer.decode(tokens: [0, 1]) == expected)
+        }
+    }
+
+    @Test("ByteLevel decodes one byte stream with a whole-token literal fallback")
+    func byteLevelDecoderComposition() throws {
+        let byteLevel: Config = ["type": "ByteLevel"]
+        let sequence: Config = ["type": "Sequence", "decoders": [byteLevel, ["type": "WordPiece", "prefix": "##"]]]
+        for decoder in [byteLevel, sequence] {
+            let tokenizer = try PreTrainedTokenizer(
+                tokenizerConfig: [:],
+                tokenizerData: [
+                    "model": ["type": "BPE", "vocab": ["Ã": 0, "©": 1, "Ġ😀": 2, "é": 3], "merges": []],
+                    "added_tokens": [["id": 1, "content": "©", "special": false, "normalized": false]],
+                    "decoder": decoder,
+                ])
+            // The added token completes the preceding UTF-8 sequence.
+            #expect(tokenizer.decode(tokens: [0, 1]) == "é")
+            #expect(tokenizer.decode(tokens: [2]).utf8.elementsEqual("Ġ😀".utf8))
+            #expect(tokenizer.decode(tokens: [3]) == "�")
+        }
+        let decoder = ByteLevelDecoder(config: [:])
+        #expect(decoder.decode(tokens: ["a", "e\u{301}", "b"]) == ["ae\u{301}b"])
+        #expect(decoder.decode(tokens: []) == [""])
+    }
+
+    @Test("Reference components use their own Unicode repertoires")
+    func referenceCharacterClasses() throws {
+        let whitespace = WhitespacePreTokenizer(config: ["type": "Whitespace"])
+        #expect(whitespace.preTokenize(text: "a\u{32796}b") == ["a", "\u{32796}", "b"])
+        #expect(whitespace.preTokenize(text: "a\u{F882}b") == ["a", "\u{F882}", "b"])
+        let byteLevel = ByteLevelPreTokenizer(config: ["add_prefix_space": false])
+        #expect(byteLevel.preTokenize(text: "\u{32796}\u{301}").count == 1)
+        let punctuation = PunctuationPreTokenizer(config: [:])
+        #expect(punctuation.preTokenize(text: "a\u{111C9}b") == ["a", "\u{111C9}", "b"])
+        #expect(punctuation.preTokenize(text: "a\u{166D}b") == ["a", "\u{166D}", "b"])
+        #expect(punctuation.preTokenize(text: "a\u{1E95E}b") == ["a\u{1E95E}b"])
+        #expect(BertPreTokenizer(config: [:]).preTokenize(text: "a\u{111C9}b") == ["a", "\u{111C9}", "b"])
+    }
+
+    @Test("Metaspace first follows original positions through normalization and rewrites")
+    func metaspaceOriginalStart() throws {
+        let first: Config = ["type": "Metaspace", "replacement": "▁", "prepend_scheme": "first", "split": false]
+        let never: Config = ["type": "Metaspace", "replacement": "▁", "prepend_scheme": "never", "split": false]
+        let rewritten = try #require(try PreTokenizerFactory.fromConfig(config: [
+            "type": "Sequence", "pretokenizers": [
+                ["type": "ByteLevel", "add_prefix_space": false], ["type": "Punctuation"], first,
+            ],
+        ]))
+        #expect(rewritten.preTokenize(text: "\u{327}") == ["▁Ì", "▁§"])
+        let cases: [(Config, Config, String, [Int])] = [
+            (["type": "StripAccents"], first, "\u{1734}e", [2]),
+            (
+                ["type": "BertNormalizer", "clean_text": false, "strip_accents": false],
+                [
+                    "type": "Sequence",
+                    "pretokenizers": [
+                        ["type": "Split", "pattern": ["Regex": "\\s+"], "behavior": "MergedWithPrevious"],
+                        never, first,
+                    ],
+                ], "中", [0, 0, 1, 0]
+            ),
+        ]
+        for (normalizer, preTokenizer, text, expected) in cases {
+            let tokenizer = try PreTrainedTokenizer(
+                tokenizerConfig: [:],
+                tokenizerData: [
+                    "model": ["type": "BPE", "vocab": ["▁": 0, "中": 1, "e": 2], "merges": []],
+                    "normalizer": normalizer, "pre_tokenizer": preTokenizer,
+                ])
+            #expect(tokenizer.encode(text: text) == expected)
+            #expect(try tokenizer.encode(text: text, withOffsets: true).ids == expected)
+        }
+    }
+
     @Test("Invalid Metaspace markers throw before reaching the byte scanner")
     func invalidMetaspace() {
         for marker in ["", "ab", "e\u{301}"] {

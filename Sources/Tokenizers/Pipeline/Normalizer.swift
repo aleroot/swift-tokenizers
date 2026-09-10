@@ -217,7 +217,7 @@ extension UnicodeFormNormalizer {
         // NSString's precomposed/decomposed properties use a different implementation
         // with known conformance failures (including Hangul composition). These standard
         // ICU transforms are available through Foundation's public API on every target.
-        text.applyingTransform(transform, reverse: false)!
+        TokenizerUnicode.normalize(text, transform: transform)
     }
 
     func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
@@ -374,7 +374,11 @@ final class BertNormalizer: ByteNormalizer {
         typealias Property = UnicodeNormalization.Property
         if properties & Property.requiresRuntime != 0 { return false }
         if shouldStripAccents {
-            if properties & Property.nonspacingMark != 0 { return true }
+            // Most scalars are known non-marks in the table already loaded by the caller.
+            // Only marks and the two historical Mn exceptions need the version check.
+            if properties & Property.nonspacingMark != 0 || value == 0x1734 || value == 0x1171E {
+                if TokenizerUnicode.isNonspacingMark(value) { return true }
+            }
             if properties & Property.combiningClassMask != 0 { return false }
         }
         var mapped = value
@@ -420,18 +424,18 @@ final class BertNormalizer: ByteNormalizer {
         ASCII.append(text, to: &output)
     }
 
-    /// `\t` `\n` `\r` or `Zs`.
+    /// Rust's White_Space property, including line and paragraph separators.
     @inline(__always)
     static func isWhitespace(_ value: UInt32) -> Bool {
         if value < 0x80 { return value == 0x20 || value == 0x09 || value == 0x0A || value == 0x0D }
-        return ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.spaceSeparator != 0
+        return ScalarClassifier.flags(value: value) & ScalarFlags.whitespace != 0
     }
 
     /// Cc/Cf/Cs/Co except `\t` `\n` `\r` (unassigned code points are left untouched, as in `tokenizers`).
     @inline(__always)
     static func isControl(_ value: UInt32) -> Bool {
         if value < 0x80 { return (value < 0x20 && value != 0x09 && value != 0x0A && value != 0x0D) || value == 0x7F }
-        return ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.control != 0
+        return TokenizerUnicode.isControl(value)
     }
 
     /// https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
@@ -442,7 +446,7 @@ final class BertNormalizer: ByteNormalizer {
             || (value >= 0x20000 && value <= 0x2A6DF)
             || (value >= 0x2A700 && value <= 0x2B73F)
             || (value >= 0x2B740 && value <= 0x2B81F)
-            || (value >= 0x2B820 && value <= 0x2CEAF)
+            || (value >= 0x2B920 && value <= 0x2CEAF)
             || (value >= 0xF900 && value <= 0xFAFF)
             || (value >= 0x2F800 && value <= 0x2FA1F)
     }
@@ -466,7 +470,7 @@ final class BertNormalizer: ByteNormalizer {
                     continue
                 }
                 let (value, width) = UTF8Cursor.decode(decomposed, at: i)
-                if ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.nonspacingMark == 0 {
+                if !TokenizerUnicode.isNonspacingMark(value) {
                     output.append(contentsOf: UnsafeBufferPointer(rebasing: decomposed[i..<i + width]))
                 }
                 i += width
@@ -625,9 +629,12 @@ final class PrecompiledNormalizer: ByteNormalizer {
             let mark = output.count
             if !appendClusters(run, to: &output) {
                 output.removeSubrange(mark...)
-                for grapheme in String(decoding: run, as: UTF8.self) {
+                // Prepend characters can join the following ASCII scalar. Preserve that
+                // boundary when falling back to full grapheme segmentation.
+                for grapheme in String(decoding: bytes[i...], as: UTF8.self) {
                     appendGrapheme(grapheme, to: &output)
                 }
+                return
             }
             i = j
         }
@@ -740,7 +747,7 @@ final class StripAccentsNormalizer: ByteNormalizer {
                 continue
             }
             let (value, width) = UTF8Cursor.decode(bytes, at: i)
-            if ScalarClassifier.flags(value: value) & ScalarFlags.mark == 0 {
+            if !TokenizerUnicode.isMark(value) {
                 output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[i..<i + width]))
             }
             i += width

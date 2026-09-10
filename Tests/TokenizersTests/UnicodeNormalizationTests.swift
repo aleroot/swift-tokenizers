@@ -206,8 +206,8 @@ struct UnicodeNormalizationTests {
         for var text in ["\u{16D67}\u{16D67}", "\u{16D63}\u{16D67}"] {
             #expect(
                 !text.withUTF8 { UnicodeNormalization.isNormalized($0, mask: UnicodeNormalization.Property.notNFC) })
-            let expected = text.applyingTransform(StringTransform("NFC"), reverse: false)!
-            #expect(NFCNormalizer(config: [:]).normalize(text: text).utf8.elementsEqual(expected.utf8))
+            // Kirat Rai was added after the reference normalizer's Unicode 9 data.
+            #expect(NFCNormalizer(config: [:]).normalize(text: text).utf8.elementsEqual(text.utf8))
         }
     }
 
@@ -287,11 +287,42 @@ struct UnicodeNormalizationTests {
                     #expect(lowercase.normalize(text: text).utf8.elementsEqual(text.lowercased().utf8))
                     let expected = BertNormalizer.stripAccents(text).lowercased()
                     #expect(bert.normalize(text: text).utf8.elementsEqual(expected.utf8))
-                    for (normalizer, reference) in forms {
+                    for (normalizer, reference) in forms
+                    where text.unicodeScalars.allSatisfy({
+                        ($0.properties.age?.major ?? Int.max) <= 9
+                    }) {
                         #expect(normalizer.normalize(text: text).utf8.elementsEqual(reference(text).utf8))
                     }
                 }
             }
         }
     }
+    @Test("Tokenizer Unicode versions preserve newer scalars and historical categories")
+    func referenceUnicodeVersions() throws {
+        let bert = BertNormalizer(config: [:])
+        #expect(bert.normalize(text: "\u{2028}\u{2029}") == "  ")
+        #expect(bert.normalize(text: "a\u{2B820}b\u{2B920}c") == "a\u{2B820}b \u{2B920} c")
+        #expect(bert.normalize(text: "\u{890}é\u{1E08F}") == "\u{890}e\u{1E08F}")
+        #expect(bert.normalize(text: "\u{1734}\u{1885}\u{A9BD}\u{1171E}") == "\u{1885}\u{A9BD}")
+        #expect(StripAccentsNormalizer(config: [:]).normalize(text: "\u{1CF2}\u{1CF3}\u{111C9}") == "\u{111C9}")
+        for form: any Normalizer in [
+            NFDNormalizer(config: [:]), NFCNormalizer(config: [:]),
+            NFKDNormalizer(config: [:]), NFKCNormalizer(config: [:]),
+        ] {
+            // New combining marks are inert starters; older marks still reorder after them.
+            #expect(form.normalize(text: "e\u{1ABF}\u{301}\u{323}").utf8.elementsEqual("e\u{1ABF}\u{323}\u{301}".utf8))
+            #expect(form.normalize(text: "㋿\u{16D63}\u{16D67}").utf8.elementsEqual("㋿\u{16D63}\u{16D67}".utf8))
+        }
+        let tokenizer = try PreTrainedTokenizer(
+            tokenizerConfig: [:],
+            tokenizerData: [
+                "normalizer": ["type": "NFC"],
+                "model": ["type": "BPE", "vocab": ["e": 0, "\u{1ABF}": 1, "\u{301}": 2, "\u{323}": 3], "merges": []],
+            ])
+        let result = try tokenizer.encode(text: "e\u{1ABF}\u{301}\u{323}", withOffsets: true)
+        #expect(result.ids == [0, 1, 3, 2])
+        // HF attaches reordered normalization edits to the original scalar positions.
+        #expect(result.offsets == [0..<1, 1..<4, 4..<6, 6..<8])
+    }
+
 }

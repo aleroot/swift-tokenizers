@@ -47,12 +47,12 @@ extension AlignedText {
             if bert.shouldStripAccents {
                 result = try result.unicodeForm(compatible: false, compose: false)
                 result = Self(result.units.filter {
-                    ScalarClassifier.extraFlags(value: $0.scalar.value) & ScalarExtraFlags.nonspacingMark == 0
-                })
+                        !TokenizerUnicode.isNonspacingMark($0.scalar.value)
+                    })
             }
             return bert.shouldLowercase ? result.lowercased() : result
         case is StripAccentsNormalizer:
-            return Self(units.filter { ScalarClassifier.flags(value: $0.scalar.value) & ScalarFlags.mark == 0 })
+            return Self(units.filter { !TokenizerUnicode.isMark($0.scalar.value) })
         case let strip as StripNormalizer:
             var output = units[...]
             func whitespace(_ unit: Unit) -> Bool {
@@ -184,8 +184,8 @@ extension AlignedText {
         // Stable canonical ordering within each non-starter run.
         var start = 0
         for i in 0...edits.count {
-            if i == edits.count || edits[i].0.properties.canonicalCombiningClass.rawValue == 0 {
-                edits[start..<i].sort { $0.0.properties.canonicalCombiningClass.rawValue < $1.0.properties.canonicalCombiningClass.rawValue }
+            if i == edits.count || TokenizerUnicode.combiningClass(edits[i].0) == 0 {
+                edits[start..<i].sort { TokenizerUnicode.combiningClass($0.0) < TokenizerUnicode.combiningClass($1.0) }
                 start = i + 1
             }
         }
@@ -195,7 +195,7 @@ extension AlignedText {
             var starter: Int?
             var lastClass: UInt8 = 0
             for edit in edits {
-                let cls = edit.0.properties.canonicalCombiningClass.rawValue
+                let cls = TokenizerUnicode.combiningClass(edit.0)
                 if let index = starter, lastClass == 0 || lastClass < cls,
                    UnicodeNormalization.properties(of: edit.0.value) & UnicodeNormalization.Property.notNFC != 0 {
                     let key = UInt64(output[index].0.value) << 32 | UInt64(edit.0.value)

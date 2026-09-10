@@ -1,6 +1,49 @@
 import Foundation
 
 extension PostProcessor {
+    /// HF's character-offset encoding trims in scalar coordinates. Convert around
+    /// processing so a whitespace scalar occupying several UTF-8 bytes trims completely.
+    func processOffsets(
+        _ tokens: [AlignedToken], text: String, addSpecialTokens: Bool,
+        resolve: (String) -> Int?, spelling: (Int) -> String?
+    ) throws -> [AlignedToken] {
+        var copy = text
+        guard trimsOffsets, !copy.withUTF8({ ASCII.isASCII($0) }) else {
+            return try processOffsets(tokens, addSpecialTokens: addSpecialTokens, resolve: resolve, spelling: spelling)
+        }
+        var boundaries = [0]
+        for scalar in text.unicodeScalars { boundaries.append(boundaries.last! + scalar.utf8.count) }
+        func scalarIndex(_ byte: Int) -> Int {
+            var low = 0
+            var high = boundaries.count
+            while low < high {
+                let mid = (low + high) / 2
+                if boundaries[mid] < byte { low = mid + 1 } else { high = mid }
+            }
+            return low
+        }
+        let scalars = tokens.map { token in
+            var token = token
+            token.offset = token.offset.map { scalarIndex($0.lowerBound)..<scalarIndex($0.upperBound) }
+            return token
+        }
+        return try processOffsets(scalars, addSpecialTokens: addSpecialTokens, resolve: resolve, spelling: spelling).map
+        { token in
+            var token = token
+            token.offset = token.offset.map { boundaries[$0.lowerBound]..<boundaries[$0.upperBound] }
+            return token
+        }
+    }
+
+    private var trimsOffsets: Bool {
+        switch self {
+        case let processor as ByteLevelPostProcessor: return processor.trimOffsets
+        case let processor as RobertaProcessing: return processor.trimOffset
+        case let processor as SequenceProcessing: return processor.processors.contains { $0.trimsOffsets }
+        default: return false
+        }
+    }
+
     func processOffsets(_ tokens: [AlignedToken], addSpecialTokens: Bool,
                         resolve: (String) -> Int?, spelling: (Int) -> String?) throws -> [AlignedToken] {
         switch self {

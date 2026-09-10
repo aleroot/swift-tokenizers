@@ -28,11 +28,11 @@ enum DecoderType: String {
 }
 
 struct DecoderFactory {
-    static func fromConfig(config: Config?, addedTokens: Set<String>? = nil) throws -> (any Decoder)? {
+    static func fromConfig(config: Config?) throws -> (any Decoder)? {
         guard let config, let typeName = config.type.string() else { return nil }
         switch DecoderType(rawValue: typeName) {
-        case .Sequence: return try DecoderSequence(config: config, addedTokens: addedTokens)
-        case .ByteLevel: return ByteLevelDecoder(config: config, addedTokens: addedTokens)
+        case .Sequence: return try DecoderSequence(config: config)
+        case .ByteLevel: return ByteLevelDecoder(config: config)
         case .Replace: return try ReplaceDecoder(config: config)
         case .ByteFallback: return ByteFallbackDecoder(config: config)
         case .Fuse: return FuseDecoder(config: config)
@@ -79,13 +79,9 @@ final class WordPieceDecoder: Decoder {
 final class DecoderSequence: Decoder {
     let decoders: [any Decoder]
 
-    required convenience init(config: Config) throws {
-        try self.init(config: config, addedTokens: nil)
-    }
-
-    init(config: Config, addedTokens: Set<String>?) throws {
+    required init(config: Config) throws {
         let configs = try require(config.decoders.array(), "Sequence decoder", field: "decoders")
-        decoders = try configs.compactMap { try DecoderFactory.fromConfig(config: $0, addedTokens: addedTokens) }
+        decoders = try configs.compactMap { try DecoderFactory.fromConfig(config: $0) }
     }
 
     func decode(tokens: [String]) -> [String] {
@@ -98,37 +94,12 @@ final class DecoderSequence: Decoder {
 }
 
 final class ByteLevelDecoder: Decoder {
-    let addedTokens: Set<String>
-
-    required init(config: Config) {
-        addedTokens = []
-    }
-
-    init(config: Config, addedTokens: Set<String>?) {
-        self.addedTokens = addedTokens ?? []
-    }
+    required init(config: Config) {}
 
     func decode(tokens: [String]) -> [String] {
-        var subTexts: [String] = []
         var bytes: [UInt8] = []
-
-        func flush() {
-            if !bytes.isEmpty {
-                subTexts.append(String(decoding: bytes, as: UTF8.self))
-                bytes.removeAll(keepingCapacity: true)
-            }
-        }
-
-        for token in tokens {
-            if addedTokens.contains(token) {
-                flush()
-                subTexts.append(token)
-            } else {
-                ByteLevelAlphabet.decode(token, into: &bytes)
-            }
-        }
-        flush()
-        return subTexts
+        for token in tokens { ByteLevelAlphabet.decode(token, into: &bytes) }
+        return [String(decoding: bytes, as: UTF8.self)]
     }
 }
 

@@ -6,7 +6,7 @@ import Testing
 
 @Suite("Unicode classification caches")
 struct UnicodeTablesTests {
-    @Test("Category shortcut preserves the runtime Unicode word property")
+    @Test("Word properties use the reference regex engine's Unicode 16 repertoire")
     func wordProperty() {
         let mismatch = (UInt32(0)..<0x110000).first { value in
             guard let scalar = Unicode.Scalar(value) else { return false }
@@ -17,7 +17,9 @@ struct UnicodeTablesTests {
                 categoryIsWord = true
             default: categoryIsWord = false
             }
-            let expected = categoryIsWord || properties.isAlphabetic || value == 0x200C || value == 0x200D
+            let expected =
+                properties.generalCategory != .privateUse && (properties.age.map { $0.major <= 16 } ?? false)
+                && (categoryIsWord || properties.isAlphabetic || value == 0x200C || value == 0x200D)
             return (ScalarClassifier.extraFlags(value: value) & ScalarExtraFlags.word != 0) != expected
         }
         #expect(mismatch == nil, "word property differs at U+\(mismatch.map { String($0, radix: 16) } ?? "-")")
