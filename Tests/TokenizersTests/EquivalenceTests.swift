@@ -321,11 +321,11 @@ struct JSONParserEquivalenceTests {
     @Test("Packed tokenizer.json tables match generic parse encode")
     func packedTablesMatchGenericEncode() throws {
         let json = Data(
-            #"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2,"Ġ":3},"merges":[["a","b"],["Ġ","a"]]}}"#
+            #"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2,"Ġ":3,"Ġa":4},"merges":[["a","b"],["Ġ","a"]]}}"#
                 .utf8)
         let generic = try Config(jsonData: json)
         let packed = try Config(tokenizerJSON: json)
-        #expect(packed.model.vocab.asPackedStringMap()?.count == 4)
+        #expect(packed.model.vocab.asPackedStringMap()?.count == 5)
         #expect(packed.model.merges.asPackedStringPairs()?.count == 2)
         let config: Config = ["tokenizer_class": "GPT2Tokenizer"]
         let fromGeneric = try PreTrainedTokenizer(tokenizerConfig: config, tokenizerData: generic)

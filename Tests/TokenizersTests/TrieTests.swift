@@ -110,14 +110,14 @@ struct DoubleArrayTrieTests {
         #expect(prefixes(trie, "xyz").isEmpty)
     }
 
-    @Test("Duplicate keys keep the lowest index; every id round-trips")
+    @Test("Duplicate keys keep the highest index; every unique id round-trips")
     func duplicatesAndRoundTrip() {
         let keys = ["a", "b", "a", "ab", "b"]
         let trie = makeTrie(keys)
         var a = "a"
         var b = "b"
-        #expect(a.withUTF8 { trie.value(of: $0) } == 0)
-        #expect(b.withUTF8 { trie.value(of: $0) } == 1)
+        #expect(a.withUTF8 { trie.value(of: $0) } == 2)
+        #expect(b.withUTF8 { trie.value(of: $0) } == 4)
         #expect(trie.keyCount == 3)
 
         // A vocabulary-sized random key set with many shared prefixes and long fan-out.

@@ -6,6 +6,7 @@ import Foundation
 public final class WordLevelTokenizer: PreTrainedTokenizerModel, Sendable {
     /// Vocabulary keyed by exact byte sequence (no Unicode canonical folding).
     private let vocabulary: Vocabulary
+    private let modelVocabulary: ModelVocabulary
 
     public let bosToken: String?
     public let bosTokenId: Int?
@@ -21,8 +22,15 @@ public final class WordLevelTokenizer: PreTrainedTokenizerModel, Sendable {
         let vocabulary = try Vocabulary(
             vocab: tokenizerData.model.vocab, addedTokens: addedTokens, addedTokenConfig: tokenizerData.addedTokens)
         self.vocabulary = vocabulary
+        let modelVocabulary = try ModelVocabulary(vocabulary, config: tokenizerData.model.vocab)
+        self.modelVocabulary = modelVocabulary
         unknownToken = tokenizerData.model.unkToken.string() ?? TokenizerModel.unknownToken(from: tokenizerConfig)
-        unknownTokenId = unknownToken.flatMap { vocabulary.id(of: $0) }
+        unknownTokenId = unknownToken.flatMap { modelVocabulary.id(of: $0) }
+        // The public encode API is nonthrowing. Reject here instead of silently losing
+        // unknown chunks; HF reports MissingUnkToken when it encounters one at encode time.
+        guard unknownTokenId != nil else {
+            throw TokenizerError.invalidConfiguration("WordLevel requires an unknown token in the model vocabulary")
+        }
         bosToken = addedTokenAsString(tokenizerConfig.bosToken)
         bosTokenId = bosToken.flatMap { vocabulary.id(of: $0) }
         eosToken = addedTokenAsString(tokenizerConfig.eosToken)
@@ -30,10 +38,8 @@ public final class WordLevelTokenizer: PreTrainedTokenizerModel, Sendable {
     }
 
     public func tokenize(text: String) -> [String] {
-        if vocabulary.id(of: text) != nil { return [text] }
-        // Upstream fails when the chunk is unknown and the unknown token is not in the
-        // vocabulary; the Swift pipeline drops the chunk instead, as elsewhere.
-        return unknownToken.flatMap { vocabulary.id(of: $0) != nil ? [$0] : nil } ?? []
+        if modelVocabulary.id(of: text) != nil { return [text] }
+        return [unknownToken!]  // Validated at construction.
     }
 
     public func convertTokenToId(_ token: String) -> Int? {
@@ -75,7 +81,7 @@ extension WordLevelTokenizer: FastTokenizingModel {
     /// Id of a chunk given as raw UTF-8, without materialising a `String`.
     @inline(__always)
     func id(of bytes: UnsafeBufferPointer<UInt8>) -> Int? {
-        let id = vocabulary.lookup.id(of: bytes)
+        let id = modelVocabulary.id(of: bytes)
         return id < 0 ? nil : Int(id)
     }
 }

@@ -42,7 +42,7 @@ final class DoubleArrayTrie: @unchecked Sendable {
     }
 
     /// Builds a trie whose value for key `i` (`utf8[offsets[i]..<offsets[i + 1]]`) is `i`.
-    /// Duplicate keys keep the lowest index; the empty key is ignored.
+    /// Duplicate keys keep the highest index, like HF's token-to-ID map; the empty key is ignored.
     init(utf8: UnsafeBufferPointer<UInt8>, offsets: UnsafeBufferPointer<UInt32>, count keyTotal: Int) {
         var builder = Builder(utf8: utf8, offsets: offsets, keyTotal: keyTotal)
         builder.build()
@@ -369,10 +369,10 @@ final class DoubleArrayTrie: @unchecked Sendable {
                 let groupCount = partition(lo: lo, hi: hi, depth: depth)
                 var firstChild = 0
                 if groups[0].label == Self.terminal {
-                    // Keys ending at this node: the lowest index is the node's value.
+                    // Keys ending at this node: the last vocabulary entry wins.
                     if depth > 0 {
-                        var value = UInt32.max
-                        for k in groups[0].lo..<groups[0].hi { value = min(value, keyIndex[k]) }
+                        var value: UInt32 = 0
+                        for k in groups[0].lo..<groups[0].hi { value = max(value, keyIndex[k]) }
                         units[Int(node)].value = Int32(value)
                         keyCount += 1
                     }

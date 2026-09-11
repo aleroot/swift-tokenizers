@@ -60,7 +60,7 @@ struct SendableTests {
         func model(id: Int) throws -> WordLevelTokenizer {
             try WordLevelTokenizer(
                 tokenizerConfig: [:],
-                tokenizerData: ["model": ["type": "WordLevel", "vocab": ["a": Config(id)]]],
+                tokenizerData: ["model": ["type": "WordLevel", "unk_token": "<unk>", "vocab": ["<unk>": 0, "a": Config(id)]]],
                 addedTokens: [:])
         }
         let first = try model(id: 1)

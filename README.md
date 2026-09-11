@@ -12,8 +12,8 @@
 
 swift-tokenizers is a native Swift 6 implementation of the tokenizers used by today's language
 models: byte-level and SentencePiece **BPE**, **Unigram**, **WordPiece** and **WordLevel**. It
-loads `tokenizer.json` files published on the Hugging Face Hub and produces the same token ids,
-checked against pinned Hugging Face references. It ships as a drop-in replacement for the
+loads `tokenizer.json` files published on the Hugging Face Hub, with single-sequence inference
+checked against Hugging Face references. It ships as a drop-in replacement for the
 `Tokenizers` product of
 [swift-transformers](https://github.com/huggingface/swift-transformers), plugs seamlessly into
 [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm), and is the tokenizer behind
@@ -32,12 +32,12 @@ let text = tokenizer.decode(tokens: ids)          // "Hello world"
 
 - **Fast.** Faster than Google's SentencePiece C++ on its own benchmark corpus, and several
   times faster than every other implementation measured. See [Performance](#performance).
-- **Exact.** Token ids, decoded text and source offsets are checked against Hugging Face
-  `tokenizers` 0.23.2, whole tokenizers and each pipeline component on its own, with Unicode
-  conformance, regression and randomized differential tests.
-- **Complete.** Every model, normalizer, pre-tokenizer, post-processor and decoder of
-  `tokenizers` 0.23.2, plus added and special tokens, chat templates with tools, source offsets
-  and O(1) vocabulary lookup. Training, padding, truncation and pair encodings are out of scope.
+- **Tested against Hugging Face.** Whole-model ID/decode fixtures, pinned `tokenizers` 0.23.2
+  component references, Unicode conformance, and regression tests. Local differential harnesses
+  also check generated configurations and source offsets.
+- **Broad inference support.** The model and pipeline component families listed below, plus
+  added and special tokens, chat templates with tools, source offsets and O(1) vocabulary lookup.
+  Nonzero BPE dropout, training, padding, truncation and pair encodings are out of scope.
 - **Drop-in.** Same `Tokenizer`, `PreTrainedTokenizer`, `AutoTokenizer`, `Config` and
   `TokenizerError` API as swift-transformers; existing consumers compile unchanged.
 - **Lean.** One dependency, [swift-jinja](https://github.com/huggingface/swift-jinja), for chat

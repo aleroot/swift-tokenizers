@@ -44,8 +44,12 @@ struct JSONFuzzTests {
             // Distinct prefixes also keep canonically equivalent spellings byte-distinct
             // through Foundation's dictionary bridge.
             let words = (0..<Int(rng.next() % 80 + 1)).map { "\($0):" + Fuzz.text(&rng, maxAtoms: 5) }
-            let vocab = Dictionary(uniqueKeysWithValues: words.enumerated().map { ($0.element, $0.offset * 3) })
+            var vocab = Dictionary(uniqueKeysWithValues: words.enumerated().map { ($0.element, $0.offset * 3) })
             let pairs = zip(words, words.dropFirst()).map { [$0, $1] }
+            // Valid BPE models require every merge product in the vocabulary too.
+            for pair in pairs where vocab[pair[0] + pair[1]] == nil {
+                vocab[pair[0] + pair[1]] = vocab.count * 3
+            }
             let objects: [[String: Any]] = [
                 ["model": ["type": "BPE", "vocab": vocab, "merges": pairs]],
                 [

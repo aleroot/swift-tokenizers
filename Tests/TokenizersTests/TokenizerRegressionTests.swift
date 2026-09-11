@@ -291,16 +291,15 @@ struct TokenizerRegressionTests {
 
     @Test("Omitted BPE byte_fallback matches Hugging Face's false default")
     func omittedByteFallbackDefaultsFalse() throws {
-        // `ab` merges to a product that is not in the vocabulary. Hugging Face then emits a
-        // single unknown token; `byte_fallback: true` would emit one unknown per byte.
+        // The byte token exists, but is only used when byte_fallback is explicitly true.
         let data: Config = [
             "model": [
-                "type": "BPE", "vocab": ["<unk>": 0, "a": 1, "b": 2], "merges": ["a b"],
+                "type": "BPE", "vocab": ["<unk>": 0, "a": 1, "<0x62>": 2], "merges": [],
                 "unk_token": "<unk>",
             ]
         ]
         let tokenizer = try PreTrainedTokenizer(tokenizerConfig: configuration, tokenizerData: data)
-        #expect(tokenizer.encode(text: "ab", addSpecialTokens: false) == [0])
+        #expect(tokenizer.encode(text: "b", addSpecialTokens: false) == [0])
     }
 
     @Test("Legacy merge strings split on the first space only")

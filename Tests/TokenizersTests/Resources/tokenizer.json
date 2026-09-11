@@ -5,19 +5,39 @@
   "added_tokens": [
     {
       "id": 0,
-      "content": "<bos>"
+      "content": "<bos>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
     },
     {
       "id": 1,
-      "content": "<pad>"
+      "content": "<pad>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
     },
     {
       "id": 2,
-      "content": "<eos>"
+      "content": "<eos>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
     },
     {
       "id": 3,
-      "content": "<unk>"
+      "content": "<unk>",
+      "single_word": false,
+      "lstrip": false,
+      "rstrip": false,
+      "normalized": false,
+      "special": true
     }
   ],
   "model": {
@@ -29,11 +49,36 @@
       "<unk>": 3,
       "offline": 4,
       "path": 5,
-      "_": 6
+      "_": 6,
+      "o": 7,
+      "f": 8,
+      "l": 9,
+      "i": 10,
+      "n": 11,
+      "e": 12,
+      "p": 13,
+      "a": 14,
+      "t": 15,
+      "h": 16,
+      "of": 17,
+      "off": 18,
+      "li": 19,
+      "ne": 20,
+      "line": 21,
+      "pa": 22,
+      "th": 23,
+      "_of": 24,
+      "_pa": 25
     },
     "merges": [
-      "off line",
+      "o f",
+      "of f",
+      "l i",
+      "n e",
       "li ne",
+      "off line",
+      "p a",
+      "t h",
       "pa th",
       "_ of",
       "_ pa"

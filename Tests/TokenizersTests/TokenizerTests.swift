@@ -198,7 +198,7 @@ struct TokenizerTests {
         )
 
         let encoded = tokenizer.encode(text: "offline path")
-        #expect(!encoded.isEmpty)
+        #expect(encoded == [4, 5])
     }
 
     /// https://github.com/huggingface/swift-transformers/issues/96

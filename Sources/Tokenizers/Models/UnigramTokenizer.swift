@@ -40,7 +40,7 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         }
         scores = packed.scores.elements
 
-        var minScore: Double = 999
+        var minScore = Double.infinity
         for score in scores where score < minScore { minScore = score }
         self.minScore = minScore
 
@@ -110,6 +110,8 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         var start: Int32
         var end: Int32
         var tokenId: Int32
+        /// The final surface has no model vocabulary entry (distinct from matching unk_id).
+        var isUnknown: Bool
     }
 
     /// Reusable dynamic-programming state, sized to the longest piece seen so far.
@@ -193,11 +195,23 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
             if node.token == unkId, let last = pieces.last, last.tokenId == unkId {
                 pieces[pieces.count - 1].start = Int32(start)
             } else {
-                pieces.append(Piece(start: Int32(start), end: Int32(end), tokenId: node.token))
+                pieces.append(Piece(start: Int32(start), end: Int32(end), tokenId: node.token,
+                    isUnknown: node.token == unkId))
             }
             end = start
         }
         pieces.reverse()
+        // HF's lattice yields strings, then tokenize() looks up each fused surface again.
+        // An unknown route can spell a known piece, especially with positive scores. Use
+        // the model trie here so pipeline-added tokens cannot change model segmentation.
+        for i in pieces.indices where pieces[i].isUnknown {
+            let span = UnsafeBufferPointer(rebasing: bytes[Int(pieces[i].start)..<Int(pieces[i].end)])
+            let id = trie.value(of: span)
+            if id >= 0 {
+                pieces[i].tokenId = id
+                pieces[i].isUnknown = false
+            }
+        }
         lattice.pieces = pieces
         return pieces
     }
@@ -242,9 +256,8 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         }
 
         private func encodeSegments(_ bytes: UnsafeBufferPointer<UInt8>, into ids: inout [Int]) {
-            let unk = Int32(model.unknownTokenId ?? -1)
             for piece in model.segment(bytes, lattice: lattice) {
-                if piece.tokenId == unk, model.byteFallback,
+                if piece.isUnknown, model.byteFallback,
                     model.appendByteFallback(bytes[Int(piece.start)..<Int(piece.end)], into: &ids)
                 {
                     continue
@@ -268,10 +281,9 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         let lattice = Lattice()
         return copy.withUTF8 { bytes -> [String] in
             var tokens: [String] = []
-            let unk = Int32(unknownTokenId ?? -1)
             for piece in segment(bytes, lattice: lattice) {
                 let span = bytes[Int(piece.start)..<Int(piece.end)]
-                if piece.tokenId == unk, byteFallback, span.allSatisfy({ byteFallbackIds[Int($0)] >= 0 }) {
+                if piece.isUnknown, byteFallback, span.allSatisfy({ byteFallbackIds[Int($0)] >= 0 }) {
                     for byte in span { tokens.append(BPETokenizer.hexaTokenStrings[Int(byte)]) }
                 } else {
                     tokens.append(String(decoding: UnsafeBufferPointer(rebasing: span), as: UTF8.self))

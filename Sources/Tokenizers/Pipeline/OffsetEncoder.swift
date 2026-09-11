@@ -92,7 +92,7 @@ final class OffsetModelEncoder {
                 }
                 for piece in unigram.segment(bytes, lattice: lattice!) {
                     let range = Int(piece.start)..<Int(piece.end)
-                    if Int(piece.tokenId) == unigram.unknownTokenId, unigram.byteFallback,
+                    if piece.isUnknown, unigram.byteFallback,
                        bytes[range].allSatisfy({ unigram.byteFallbackIds[Int($0)] >= 0 }) {
                         for i in range {
                             output.append(AlignedToken(id: unigram.byteFallbackIds[Int(bytes[i])], offset: text.sourceRange(range)))

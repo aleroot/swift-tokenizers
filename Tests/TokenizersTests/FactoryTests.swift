@@ -157,12 +157,13 @@ struct WordLevelTokenizerTests {
         #expect(tokenizer.decode(tokens: [1, 2]) == "a b")
     }
 
-    @Test("A chunk absent from the vocabulary without an unknown token is dropped")
+    @Test("WordLevel without a usable unknown token is rejected before encoding can lose text")
     func missingUnknownToken() throws {
-        let tokenizer = try Self.tokenizer(vocab: #"{"a": 0, "b": 1}"#, unk: nil)
-        #expect(tokenizer.tokenize(text: "a") == ["a"])
-        #expect(tokenizer.tokenize(text: "c") == [])
-        #expect(tokenizer.encode(text: "a c b", addSpecialTokens: false) == [0, 1])
+        for unk: String? in [nil, "<unk>"] {
+            #expect(throws: TokenizerError.self) {
+                try Self.tokenizer(vocab: #"{"a": 0, "b": 1}"#, unk: unk)
+            }
+        }
     }
 
     @Test("Source offsets cover the whole chunk")
