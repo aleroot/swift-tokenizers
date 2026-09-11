@@ -5,12 +5,19 @@ including the other implementations. The [JSON parser follow-up](#json-parser-fo
 records a later before/after experiment on an M2. The [source-offset measurements](#source-offset-encoding)
 also use an M2. All figures are measurements, not projections.
 
+The [headline](#headline), [SentencePiece](#sentencepiece) and [load time](#load-time) tables were
+re-measured after the pre-tokenization and scratch-ownership work landed, with every engine run
+one at a time on an otherwise idle machine. Short inputs are sensitive to CPU clock ramp: an
+11.5 KB encode varies by about 15% depending on what ran before it, so the headline quotes the
+1.15 MB document, which is stable to 1%.
+
 | | |
 |---|---|
 | Machine | Apple M4 Pro, 24 GB, macOS 26.6.2 |
 | Toolchain | Apple Swift 6.3.3, `-c release`, Swift 6 language mode |
 | Concurrency | single-threaded everywhere except the "SentencePiece" and "Concurrent encoding" sections; `RAYON_NUM_THREADS=1` for the Rust cores |
 | Reference builds | Hugging Face `tokenizers` 0.22.2, `transformers` 4.57.6 (CPython), `tiktoken` 0.14.0, `google/sentencepiece` @ master (C++, CMake Release), swift-transformers @ `c21fdcd` |
+| Memory | `phys_footprint` delta across the load, after `malloc_zone_pressure_relief`, sampled identically in the Swift, C++ and Python harnesses |
 | Correctness first | every swift-tokenizers result below was compared token-for-token with Hugging Face *before* it was timed — 0 mismatches (see [Correctness](#correctness-of-the-measured-outputs)) |
 | Units | `MB/s` is MiB/s (1,048,576 bytes) except in the end-to-end table, which is the harness's decimal MB/s |
 
@@ -42,17 +49,17 @@ English prose, Qwen3 byte-level BPE (`mlx-community/Qwen3-0.6B-Base-DQ5`, 151,66
 10.9 MiB `tokenizer.json`), full pipeline: added tokens → normalization → pre-tokenization →
 merges → post-processing.
 
-| Implementation | Encode 11.5 KB | Encode 1.15 MB | Load `tokenizer.json` | Retained |
-|---|---:|---:|---:|---:|
-| **swift-tokenizers** | **212 MB/s** (4.5 ns/byte) | **214 MB/s** | **26 ms** | **12.7 MB** |
-| `tiktoken` 0.14 (`cl100k_base`) | 34.5 MB/s | 34.4 MB/s | — | — |
-| `tiktoken` 0.14 (`o200k_base`) | 52.2 MB/s | 52.8 MB/s | — | — |
-| Hugging Face `tokenizers` 0.22.2 (Rust) | 6.7 MB/s | 5.4 MB/s | 99 ms | — |
-| swift-transformers @ `c21fdcd` | 0.94 MB/s | 0.94 MB/s | 299 ms | — |
+| Implementation | Encode 1.15 MB | Load `tokenizer.json` | Retained |
+|---|---:|---:|---:|
+| **swift-tokenizers** | **230.9 MB/s** (4.1 ns/byte) | **23.0 ms** | **12.7 MB** |
+| `tiktoken` 0.14 (`o200k_base`) | 55.0 MB/s | n/a | n/a |
+| `tiktoken` 0.14 (`cl100k_base`) | 35.3 MB/s | n/a | n/a |
+| Hugging Face `tokenizers` 0.22.2 (Rust) | 5.4 MB/s | 97.0 ms | n/a |
+| swift-transformers @ `c21fdcd` | 0.92 MB/s | 297.0 ms | n/a |
 
-**32–40× Hugging Face's Rust core, 4–6× tiktoken, 225× swift-transformers** on the same text on
-the same machine — while producing identical token ids. Where two runs of a reference disagreed,
-the table quotes its faster run.
+**43× Hugging Face's Rust core, 4.2× tiktoken `o200k_base`, 251× swift-transformers** on the same
+text on the same machine, while producing identical token ids. All five ran back to back in one
+sitting; where two runs of a reference disagreed, the table quotes its faster run.
 
 `tiktoken` is not an apples-to-apples pipeline (it runs its own regex pre-split plus merges over a
 different vocabulary, with no normalizer, added tokens or post-processor); it is the fastest
@@ -60,40 +67,45 @@ widely used reference, so it is the interesting bar to clear.
 
 ## Encode throughput by input size
 
-Same tokenizer, same corpus shape as `Tests/Benchmarks` (median of 3–200 iterations per case,
-warm-up excluded). `ns/byte` is the swift-tokenizers figure.
+Same tokenizer, byte-identical inputs in every harness (68 B, 489 B, 1,150 B, 11,500 B,
+1,150,000 B), median per case, all five engines run back to back in one sitting. Each engine gets
+a full-clock warm-up first, because a 68-byte encode measured from a cold CPU governor reads about
+20% slow. `ns/byte` is the swift-tokenizers figure.
 
 | Input | swift-tokenizers | HF `tokenizers` | tiktoken `cl100k` | tiktoken `o200k` | swift-transformers |
 |---|---:|---:|---:|---:|---:|
-| short — 68 B | 0.001 ms · 125 MB/s | 0.011 ms · 5.8 MB/s | 0.002 ms · 28.8 MB/s | 0.002 ms · 38.9 MB/s | 0.076 ms · 0.9 MB/s |
-| code — 563 B | 0.004 ms · 125 MB/s | 0.057 ms · 8.1 MB/s | 0.019 ms · 24.8 MB/s | 0.010 ms · 47.6 MB/s | 0.473 ms · 1.0 MB/s |
-| medium — 1.1 KB | 0.005 ms · 202 MB/s | 0.166 ms · 6.6 MB/s | 0.033 ms · 33.0 MB/s | 0.022 ms · 50.8 MB/s | 1.196 ms · 0.9 MB/s |
-| long — 11.5 KB | 0.052 ms · 212 MB/s | 1.639 ms · 6.7 MB/s | 0.318 ms · 34.5 MB/s | 0.210 ms · 52.2 MB/s | 11.712 ms · 0.9 MB/s |
-| huge — 1.15 MB | 5.11 ms · 214 MB/s | 203.6 ms · 5.4 MB/s | 31.9 ms · 34.4 MB/s | 20.8 ms · 52.8 MB/s | 1171.0 ms · 0.9 MB/s |
+| short, 68 B | 0.0003 ms · 194 MB/s | 0.013 ms · 5.1 MB/s | 0.002 ms · 26.4 MB/s | 0.002 ms · 38.9 MB/s | 0.075 ms · 0.87 MB/s |
+| code, 489 B | 0.0033 ms · 142 MB/s | 0.066 ms · 7.1 MB/s | 0.019 ms · 24.2 MB/s | 0.010 ms · 47.6 MB/s | 0.481 ms · 0.97 MB/s |
+| medium, 1.1 KB | 0.0048 ms · 231 MB/s | 0.187 ms · 5.9 MB/s | 0.034 ms · 32.6 MB/s | 0.022 ms · 50.1 MB/s | 1.343 ms · 0.82 MB/s |
+| long, 11.5 KB | 0.0463 ms · 237 MB/s | 1.827 ms · 6.0 MB/s | 0.326 ms · 33.6 MB/s | 0.210 ms · 52.2 MB/s | 13.551 ms · 0.81 MB/s |
+| huge, 1.15 MB | 4.76 ms · 231 MB/s | 204.5 ms · 5.4 MB/s | 31.07 ms · 35.3 MB/s | 19.94 ms · 55.0 MB/s | 1190.4 ms · 0.92 MB/s |
 
-Sub-microsecond calls matter as much as MB/s: a 68-byte query costs **1 µs**, against 11 µs for
-Hugging Face and 76 µs for swift-transformers.
+Sub-microsecond calls matter as much as MB/s: a 68-byte query costs **0.33 µs**, against 13 µs for
+Hugging Face and 75 µs for swift-transformers. The 11.5 KB case is the one to treat with caution:
+it is short enough that CPU clock state moves it between 210 and 244 MB/s across runs.
 
 ## Encode throughput by tokenizer family
 
 The 11.5 KB prose case, one real `tokenizer.json` per family (all outputs verified against
 Hugging Face).
 
+Median of three runs, one model loaded at a time, after a full-clock warm-up.
+
 | Tokenizer | Model | Vocab | Throughput | ns/byte |
 |---|---|---:|---:|---:|
-| `pcuenq/Llama-3.2-1B-Instruct-tokenizer` | byte-level BPE | 128,256 | 215 MB/s | 4.5 |
-| `mlx-community/Qwen3-0.6B-Base-DQ5` | byte-level BPE | 151,669 | 212 MB/s | 4.5 |
-| `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | SentencePiece BPE | 32,768 | 199 MB/s | 4.8 |
-| `google-bert/bert-base-uncased` | WordPiece | 30,522 | 198 MB/s | 4.9 |
-| `coreml-projects/Llama-2-7b-chat-coreml` | SentencePiece BPE | 32,000 | 131 MB/s | 7.3 |
-| `intfloat/multilingual-e5-small` | Unigram (XLM-R) | 250,002 | 272–323 MB/s † | 3.1–3.5 |
-| `t5-base` | Unigram | 32,128 | 95 MB/s | 10.1 |
+| `pcuenq/Llama-3.2-1B-Instruct-tokenizer` | byte-level BPE | 128,256 | 249 MB/s | 3.8 |
+| `mlx-community/Qwen3-0.6B-Base-DQ5` | byte-level BPE | 151,669 | 244 MB/s | 3.9 |
+| `google-bert/bert-base-uncased` | WordPiece | 30,522 | 239 MB/s | 4.0 |
+| `mlx-community/Mistral-7B-Instruct-v0.3-4bit` | SentencePiece BPE | 32,768 | 228 MB/s | 4.2 |
+| `coreml-projects/Llama-2-7b-chat-coreml` | SentencePiece BPE | 32,000 | 173 MB/s | 5.5 |
+| `intfloat/multilingual-e5-small` | Unigram (XLM-R) | 250,002 | 130 MB/s | 7.3 |
+| `t5-base` | Unigram | 32,128 | 113 MB/s | 8.4 |
 
-† Measured by the embedding harness below (620 B passages / 2.4 KB passages) rather than the
-in-repo suite; XLM-R Unigram is the fastest family we ship once its pieces are cached.
-
-T5's Unigram lattice is the slowest path: 32k pieces with heavy `▁`-prefixed segmentation and no
-byte-level alphabet. It is still 15× Hugging Face's Rust implementation of the same tokenizer.
+The two Unigram models are the slowest paths here: a Viterbi lattice over `▁`-prefixed pieces with
+no byte-level alphabet. On short cached passages they invert this ordering and become the fastest
+family we ship (see [embedding models](#embedding-models-and-rerankers)), and against the same
+tokenizer in other implementations they still lead by a wide margin
+(see [SentencePiece](#sentencepiece)).
 
 ## Cold cache and non-repetitive text
 
@@ -125,9 +137,9 @@ Unigram 1,108,547 = 1,108,547; WordPiece 1,108,377 = 1,108,377.
 
 | Operation | swift-tokenizers | swift-transformers |
 |---|---:|---:|
-| Decode 11.5 KB (2,540 tokens) | 0.025 ms · 439 MB/s | 1.374 ms · 8.0 MB/s |
-| Streaming decode, 200 single-token steps | 0.23 ms total (1.2 µs/step) | — |
-| `convertIdToToken` walk of the whole 151,669-entry vocabulary | 3.25 ms (21 ns/token) | — |
+| Decode 11.5 KB (2,540 tokens) | 0.011 ms · 986 MB/s | 1.365 ms · 8.0 MB/s |
+| Streaming decode, 200 single-token steps | 0.125 ms total (0.63 µs/step) | n/a |
+| `convertIdToToken` walk of the whole 151,669-entry vocabulary | 3.06 ms (20 ns/token) | n/a |
 
 The vocabulary walk is the pattern MLX guided generation uses to discover the token space: it must
 be O(1) per id and dense, so 150k lookups cost as much as one 11.5 KB encode.
@@ -162,10 +174,10 @@ Median of 5 loads of the same folder, warm filesystem cache.
 
 | Tokenizer (`tokenizer.json`) | swift-tokenizers | HF `tokenizers` 0.22.2 | `transformers` 4.57.6 | swift-transformers |
 |---|---:|---:|---:|---:|
-| Qwen3-0.6B byte-level BPE (10.9 MiB) | 25.9 ms | 98.9 ms | 97.3 ms | 299.2 ms |
-| Llama-3.2-1B byte-level BPE (16.4 MiB) | 34.6 ms | 128.7 ms | 134.8 ms | 475.6 ms |
-| multilingual-e5-small Unigram, 250k pieces (16.3 MiB) | 49.9 ms | 217.5 ms | 326.7 ms | 273.8 ms |
-| bert-base-uncased WordPiece, 30k (0.4 MiB) | 1.7 ms | 8.7 ms | 14.4 ms | 14.5 ms |
+| Qwen3-0.6B byte-level BPE (10.9 MiB) | 23.0 ms | 97.0 ms | 94.8 ms | 297.0 ms |
+| Llama-3.2-1B byte-level BPE (16.4 MiB) | 35.4 ms | 129.8 ms | 131.4 ms | 469.0 ms |
+| multilingual-e5-small Unigram, 250k pieces (16.3 MiB) | 41.6 ms | 211.9 ms | 321.2 ms | 270.2 ms |
+| bert-base-uncased WordPiece, 30k (0.4 MiB) | 1.8 ms | 8.4 ms | 13.6 ms | 14.4 ms |
 
 Stage breakdown for the two interesting cases:
 
@@ -178,7 +190,7 @@ Stage breakdown for the two interesting cases:
 | Build double-array trie | — | 20.0 ms (785,408 units, 9.2 MB) |
 | Build `Precompiled` charsmap normalizer | — | 0.3 ms |
 | Expand generated Unicode tables (historical implementation) | 0.05 ms | 0.05 ms |
-| **Total `AutoTokenizer.load`** | **25.9 ms** | **49.9 ms** |
+| **Total `AutoTokenizer.load`** | **23.0 ms** | **41.6 ms** |
 
 ### JSON parser follow-up
 
@@ -372,15 +384,22 @@ Both take the best of five runs after a warm-up.
 
 ### Correctness
 
-Checked before timing, on every one of the 4,048 distinct sentences, against both references:
+Checked before timing, on all 60,720 lines, by dumping ids from each engine and comparing the
+files byte for byte:
 
 | Model | vs SentencePiece C++ | vs Hugging Face `tokenizers` |
 |---|---:|---:|
-| T5 (Unigram, 32k) | **4048 / 4048 exact** | 4048 / 4048 exact |
-| Gemma 3 (BPE, 262k) | **4048 / 4048 exact** | 4048 / 4048 exact |
+| T5 (Unigram, 32k) | **60720 / 60720 exact** | 60720 / 60720 exact |
+| Gemma 3 (BPE, 262k) | **60720 / 60720 exact** | 60720 / 60720 exact |
+| Qwen 3 (byte-level BPE, 152k) | n/a, no `.model` | 60720 / 60720 exact |
 
 Identical ids from a `tokenizer.json` and from the original `.model` protobuf, including Thai and
-Japanese without spaces, byte fallback and the SentencePiece charsmap normalizer.
+Japanese without spaces, byte fallback and the SentencePiece charsmap normalizer. Token totals:
+763,275 (T5), 1,989,660 (Gemma 3), 2,464,005 (Qwen 3).
+
+swift-transformers is the one engine that does not reproduce these ids: on Qwen 3 it emits
+2,011,230 tokens against the 2,464,005 that Hugging Face and this library both produce, so its
+Qwen 3 throughput below is not measuring the same work.
 
 ### Throughput
 
@@ -388,14 +407,33 @@ Encoding throughput in MB/s, higher is better:
 
 | Threads | 1 | 2 | 4 | 8 | 14 |
 |---|---:|---:|---:|---:|---:|
-| **T5 Unigram** SentencePiece C++ | 68.5 | 129.2 | 243.7 | **396.1** | **588.2** |
-| **T5 Unigram** swift-tokenizers | **108.1** | **170.6** | **290.6** | 300.6 | 156.7 |
-| **Gemma 3 BPE** SentencePiece C++ | 24.1 | 47.2 | 89.3 | 162.7 | **228.7** |
-| **Gemma 3 BPE** swift-tokenizers | **39.3** | **65.8** | **112.0** | **168.6** | 175.2 |
+| **T5 Unigram** SentencePiece C++ | 70.1 | 130.9 | 239.4 | 392.2 | **574.3** |
+| **T5 Unigram** swift-tokenizers | **124.0** | **195.8** | **324.2** | **446.0** | 508.3 |
+| **Gemma 3 BPE** SentencePiece C++ | 24.2 | 48.1 | 88.0 | 161.0 | 230.5 |
+| **Gemma 3 BPE** swift-tokenizers | **43.2** | **72.2** | **122.2** | **196.6** | **241.1** |
 
-Single-threaded, swift-tokenizers is **1.58× SentencePiece on T5 and 1.63× on Gemma 3**, and it
-keeps the lead through four threads. Beyond that a shared tokenizer stops scaling while
-SentencePiece keeps going: the machine has 10 performance and 4 efficiency cores.
+Single-threaded, swift-tokenizers is **1.77× SentencePiece on T5 and 1.79× on Gemma 3**. It keeps
+the lead at every thread count on Gemma 3, and on T5 through eight threads; at 14 threads the C++
+engine passes it, because a shared Swift tokenizer still contends where a `SentencePieceProcessor`
+does not. The machine has 10 performance and 4 efficiency cores.
+
+Single-thread throughput on the same corpus for the engines that cannot read a `.model` file:
+Hugging Face `tokenizers` 10.9 MB/s (T5), 12.4 MB/s (Gemma 3), 5.8 MB/s (Qwen 3); `tiktoken`
+20.0 MB/s (`cl100k_base`) and 19.4 MB/s (`o200k_base`) over its own vocabulary.
+
+### Memory
+
+`phys_footprint` added by the load, after returning free pages to the OS, sampled the same way in
+all three languages:
+
+| Model | swift-tokenizers | SentencePiece C++ | HF `tokenizers` | swift-transformers |
+|---|---:|---:|---:|---:|
+| T5 (Unigram, 32k) | **7.9 MB** | 10.4 MB | 49.0 MB | 27.4 MB |
+| Gemma 3 (BPE, 262k) | 65.3 MB | **56.4 MB** | 381.9 MB | 140.3 MB |
+| Qwen 3 (byte-level BPE, 152k) | **21.2 MB** | n/a | 122.1 MB | 70.9 MB |
+
+About 6× smaller than the Rust core on all three. SentencePiece is smaller on Gemma 3, where it
+reads a 4.5 MiB protobuf while this library parses the equivalent 31.8 MiB `tokenizer.json`.
 
 For scale, `sentencepiece`'s published table for the same corpus reports 27.41 MB/s (T5) and
 7.44 MB/s (Gemma 3) single-threaded for itself, and 3.78 / 3.66 MB/s for Hugging Face Fast, on a
@@ -407,13 +445,14 @@ Giving each worker its own tokenizer instance, same corpus, same harness (`--iso
 
 | Threads | 1 | 2 | 4 | 8 | 14 |
 |---|---:|---:|---:|---:|---:|
-| T5, one instance per worker | 107.3 | 202.5 | 385.2 | **531.8** | **723.0** |
-| T5, one shared instance | 108.1 | 170.6 | 290.6 | 300.6 | 156.7 |
-| T5, SentencePiece C++ | 68.5 | 129.2 | 243.7 | 396.1 | 588.2 |
+| T5, one instance per worker | 121.4 | **230.5** | **417.5** | **587.4** | **823.6** |
+| T5, one shared instance | **124.0** | 195.8 | 324.2 | 446.0 | 508.3 |
+| T5, SentencePiece C++ | 70.1 | 130.9 | 239.4 | 392.2 | 574.3 |
 
 The algorithms scale: with nothing shared they stay ahead of the C++ implementation at every
-thread count. What does not scale is the reference counting on the objects a shared tokenizer
-hands its threads. `sample` at 14 threads puts `swift_retain` / `swift_release` at the top of
+thread count. A shared instance now scales too, to 4.1× its own single-thread rate at 14 threads
+where it used to fall back to 1.4×, but the gap to the isolated case is what reference counting
+on the objects a shared tokenizer hands its threads still costs. `sample` at 14 threads puts `swift_retain` / `swift_release` at the top of
 every stack, and the pattern is specific: loading a class or existential out of an `Array` on a
 hot path is what collapses (measured in isolation, a three-element stage array falls from ~50 to
 ~1 million calls per second between 1 and 14 threads), while calling through a stored property,

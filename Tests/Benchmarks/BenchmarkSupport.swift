@@ -15,7 +15,7 @@ struct BenchmarkStats {
     let max: Double
 
     var formatted: String {
-        String(format: "%7.3f ms (± %5.3f, p50 %6.3f, p95 %6.3f)", mean, stdDev, p50, p95)
+        String(format: "%8.4f ms (± %6.4f, p50 %7.4f, p95 %7.4f)", mean, stdDev, p50, p95)
     }
 }
 
