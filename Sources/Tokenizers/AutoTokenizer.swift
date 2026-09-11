@@ -42,7 +42,8 @@ public extension AutoTokenizer {
 
     /// Loads a tokenizer from a local model folder containing `tokenizer.json` and,
     /// optionally, `tokenizer_config.json`, `config.json`, `chat_template.json` /
-    /// `chat_template.jinja`.
+    /// `chat_template.jinja`. When `tokenizer.json` is absent, known BERT/MPNet classes
+    /// load `vocab.txt`; GPT2/Qwen2/RoBERTa/CLIP load `vocab.json` and `merges.txt`.
     static func from(modelFolder: URL, strict: Bool = true) async throws -> any Tokenizer {
         try load(from: modelFolder, strict: strict)
     }
@@ -157,11 +158,10 @@ public struct LocalModelConfiguration: Sendable {
         let fm = FileManager.default
 
         let tokenizerDataURL = modelFolder.appendingPathComponent("tokenizer.json")
-        guard fm.fileExists(atPath: tokenizerDataURL.path) else {
-            throw TokenizerError.missingFile(tokenizerDataURL)
-        }
-        tokenizerData = try Config(tokenizerJSONFile: tokenizerDataURL)
-
+        // Preserve the original read/parse order for the common serialized-file path.
+        let serializedData =
+            fm.fileExists(atPath: tokenizerDataURL.path)
+            ? try Config(tokenizerJSONFile: tokenizerDataURL) : nil
         let modelConfigURL = modelFolder.appendingPathComponent("config.json")
         modelConfig = fm.fileExists(atPath: modelConfigURL.path) ? try Config(jsonFile: modelConfigURL) : nil
 
@@ -169,6 +169,15 @@ public struct LocalModelConfiguration: Sendable {
         let tokenizerConfigURL = modelFolder.appendingPathComponent("tokenizer_config.json")
         if fm.fileExists(atPath: tokenizerConfigURL.path) {
             tokenizerConfig = try Config(jsonFile: tokenizerConfigURL)
+        }
+
+        if let serializedData {
+            tokenizerData = serializedData
+        } else {
+            let split = try SplitTokenizerLoader.load(
+                folder: modelFolder, config: tokenizerConfig, modelType: modelConfig?.modelType.string())
+            tokenizerData = split.data
+            tokenizerConfig = split.config
         }
 
         // Prefer a .jinja template over a .json one.

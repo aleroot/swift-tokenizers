@@ -146,6 +146,17 @@ public protocol Tokenizer: Sendable {
     func encode(text: String, addSpecialTokens: Bool, withOffsets: Bool) throws -> TokenEncoding
     func callAsFunction(_ text: String, addSpecialTokens: Bool) -> [Int]
 
+    func encode(
+        text: String, addSpecialTokens: Bool, truncation: TokenTruncation, withOffsets: Bool
+    ) throws -> TokenEncoding
+
+    func encodeChatTemplateWithAssistantMask(
+        messages: [Message], chatTemplate: ChatTemplateArgument?, addGenerationPrompt: Bool,
+        maxLength: Int?, tools: [ToolSpec]?, additionalContext: [String: any Sendable]?
+    ) throws -> ChatTemplateEncoding
+
+    func makeStreamDecoder(skipSpecialTokens: Bool) -> TokenStreamDecoder
+
     /// Renders `tokens` back to text.
     ///
     /// Ids that name no token — out of range, or a hole in a vocabulary with gaps — contribute

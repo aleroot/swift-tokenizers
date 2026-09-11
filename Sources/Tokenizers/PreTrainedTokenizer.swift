@@ -63,7 +63,11 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     private let byteLevelDecodeTable: Lazy<ByteLevelDecodeTable>?
 
     /// Compiled Jinja templates keyed by their source, bounded by ``chatTemplateCacheLimit``.
-    private let compiledChatTemplates = Locked<[String: Template]>([:])
+    private struct CompiledChatTemplate: Sendable {
+        let template: Template
+        var generation: GenerationTemplate?
+    }
+    private let compiledChatTemplates = Locked<[BinaryDistinctString: CompiledChatTemplate]>([:])
 
     /// Number of templates currently cached. Exposed for tests.
     var compiledChatTemplateCount: Int { compiledChatTemplates.withLock(\.count) }
@@ -351,21 +355,34 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     static let chatTemplateCacheLimit = 16
 
     private func compiledTemplate(for source: String) throws -> Template {
-        if let cached = compiledChatTemplates.withLock({ $0[source] }) {
+        let key = BinaryDistinctString(source)
+        if let cached = compiledChatTemplates.withLock({ $0[key]?.template }) {
             return cached
         }
         // Compile outside the lock; a concurrent duplicate compilation is harmless.
         let compiled = try Template(
-            ChatTemplatePreprocessor.preprocess(source),
-            with: .init(lstripBlocks: true, trimBlocks: true)
+            ChatTemplatePreprocessor.preparedSource(source)
         )
         return compiledChatTemplates.withLock { cache in
-            if let cached = cache[source] { return cached }
+            if let cached = cache[key] { return cached.template }
             // Templates are interchangeable once compiled, so dropping the whole cache is as
             // good as evicting one entry and keeps the common single-template path allocation
             // free. Reaching the limit at all means the caller is not reusing templates.
             if cache.count >= Self.chatTemplateCacheLimit { cache.removeAll(keepingCapacity: true) }
-            cache[source] = compiled
+            cache[key] = CompiledChatTemplate(template: compiled)
+            return compiled
+        }
+    }
+
+    private func compiledGenerationTemplate(for source: String) throws -> GenerationTemplate {
+        let key = BinaryDistinctString(source)
+        if let cached = compiledChatTemplates.withLock({ $0[key]?.generation }) { return cached }
+        // Share the same bounded cache and compile only on the opt-in mask path.
+        _ = try compiledTemplate(for: source)
+        let compiled = try GenerationTemplate(source: source)
+        return compiledChatTemplates.withLock { cache in
+            if let cached = cache[key]?.generation { return cached }
+            cache[key]?.generation = compiled
             return compiled
         }
     }
@@ -420,6 +437,16 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     ) throws -> String {
         let template = try compiledTemplate(for: try selectChatTemplate(chatTemplate, tools: tools))
 
+        return try template.render(
+            chatContext(
+                messages: messages, addGenerationPrompt: addGenerationPrompt,
+                tools: tools, additionalContext: additionalContext))
+    }
+
+    private func chatContext(
+        messages: [Message], addGenerationPrompt: Bool, tools: [ToolSpec]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [String: Jinja.Value] {
         var context: [String: Jinja.Value] = try [
             "messages": .array(messages.map { try ChatTemplateValue.make($0) }),
             "add_generation_prompt": .boolean(addGenerationPrompt),
@@ -449,7 +476,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             }
         }
 
-        return try template.render(context)
+        return context
     }
 
     public func applyChatTemplate(
@@ -512,6 +539,79 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     }
 }
 
+// MARK: - Opt-in encoding and streaming
+
+extension PreTrainedTokenizer {
+    /// Truncates the input sequence before inserting the configured special tokens.
+    public func encode(
+        text: String, addSpecialTokens: Bool, truncation: TokenTruncation, withOffsets: Bool
+    ) throws -> TokenEncoding {
+        let maxLength = truncation.maxLength
+        let truncationSide = truncation.side
+        guard maxLength >= 0 else {
+            throw TokenizerError.invalidConfiguration("maxLength must be nonnegative")
+        }
+        // Every supported single-sequence processor has affine output size. Probe only
+        // on this opt-in path; this also handles repeated A and composed processors.
+        func processed(_ tokens: [AlignedToken]) throws -> [AlignedToken] {
+            try postProcessor?.processOffsets(
+                tokens, addSpecialTokens: addSpecialTokens,
+                resolve: model.convertTokenToId, spelling: convertIdToToken) ?? tokens
+        }
+        let overhead = try processed([]).count
+        let copies = try processed([AlignedToken(id: 0, offset: nil)]).count - overhead
+        guard maxLength >= overhead else {
+            throw TokenizerError.invalidConfiguration(
+                "maxLength is smaller than the required special-token count (\(overhead))")
+        }
+        let budget = copies > 0 ? (maxLength - overhead) / copies : 0
+        if withOffsets {
+            var tokens = try pipeline.encode(text, model: model)
+            tokens.truncate(to: budget, side: truncationSide)
+            if let postProcessor {
+                tokens = try postProcessor.processOffsets(
+                    tokens, text: text, addSpecialTokens: addSpecialTokens,
+                    resolve: model.convertTokenToId, spelling: convertIdToToken)
+            }
+            return TokenEncoding(text: text, tokens: tokens)
+        }
+        var ids = encodeWithoutPostProcessing(text: text)
+        ids.truncate(to: budget, side: truncationSide)
+        applyPostProcessor(to: &ids, addSpecialTokens: addSpecialTokens)
+        return TokenEncoding(text: text, ids: ids)
+    }
+
+    public func makeStreamDecoder(skipSpecialTokens: Bool = false) -> TokenStreamDecoder {
+        TokenStreamDecoder(
+            tokenizer: self, skipSpecialTokens: skipSpecialTokens, decoder: decoder,
+            table: byteLevelDecodeTable?.value, cleanup: cleanUpTokenizationSpaces,
+            skipped: specialTokenIds)
+    }
+
+    public func encodeChatTemplateWithAssistantMask(
+        messages: [Message], chatTemplate: ChatTemplateArgument? = nil, addGenerationPrompt: Bool = false,
+        maxLength: Int? = nil, tools: [ToolSpec]? = nil, additionalContext: [String: any Sendable]? = nil
+    ) throws -> ChatTemplateEncoding {
+        if let maxLength, maxLength < 0 {
+            throw TokenizerError.invalidConfiguration("maxLength must be nonnegative")
+        }
+        let source = try selectChatTemplate(chatTemplate, tools: tools)
+        let annotated = try compiledGenerationTemplate(for: source)
+        let context = try chatContext(
+            messages: messages, addGenerationPrompt: addGenerationPrompt,
+            tools: tools, additionalContext: additionalContext)
+        let rendered = try compiledTemplate(for: source).render(context)
+        let ranges = try annotated.ranges(context: context, expected: rendered)
+        var encoding = try encode(text: rendered, addSpecialTokens: false, withOffsets: true)
+        if let maxLength, encoding.ids.count > maxLength {
+            encoding = try TokenEncoding(
+                text: rendered, ids: Array(encoding.ids.prefix(maxLength)),
+                offsets: encoding.offsets.map { Array($0.prefix(maxLength)) })
+        }
+        return ChatTemplateEncoding(encoding: encoding, generationRanges: ranges)
+    }
+}
+
 // MARK: - Byte-level decode table
 
 /// Precomputed raw bytes for every vocabulary id of a byte-level tokenizer, so decoding is a
@@ -548,6 +648,18 @@ final class ByteLevelDecodeTable: Sendable {
         offsets[count] = UInt32(storage.count)
         self.storage = storage.trimmed()
         self.offsets = offsets
+    }
+
+    func withBytes<R>(for id: Int, _ body: (UnsafeBufferPointer<UInt8>) -> R) -> R {
+        storage.withUnsafeBufferPointer { buffer in
+            guard id >= 0, id < count else { return body(UnsafeBufferPointer(start: nil, count: 0)) }
+            return body(UnsafeBufferPointer(rebasing: buffer[Int(offsets[id])..<Int(offsets[id + 1])]))
+        }
+    }
+
+    func appendBytes(for id: Int, into bytes: inout [UInt8]) {
+        guard id >= 0, id < count else { return }
+        bytes.append(contentsOf: storage[Int(offsets[id])..<Int(offsets[id + 1])])
     }
 
     func decode(_ ids: [Int], skipping skipped: Set<Int>) -> String {
@@ -590,7 +702,7 @@ final class ByteLevelDecodeTable: Sendable {
 // MARK: - Cleanup
 
 enum TokenizationCleanup {
-    private static let replacements: [(pattern: [UInt8], replacement: [UInt8])] = [
+    static let replacements: [(pattern: [UInt8], replacement: [UInt8])] = [
         (" .", "."), (" ?", "?"), (" !", "!"), (" ,", ","),
         (" ' ", "'"), (" n't", "n't"), (" 'm", "'m"), (" 's", "'s"), (" 've", "'ve"), (" 're", "'re"),
     ].map { (Array($0.0.utf8), Array($0.1.utf8)) }

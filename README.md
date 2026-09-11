@@ -36,8 +36,9 @@ let text = tokenizer.decode(tokens: ids)          // "Hello world"
   component references, Unicode conformance, and regression tests. Local differential harnesses
   also check generated configurations and source offsets.
 - **Broad inference support.** The model and pipeline component families listed below, plus
-  added and special tokens, chat templates with tools, source offsets and O(1) vocabulary lookup.
-  Nonzero BPE dropout, training, padding, truncation and pair encodings are out of scope.
+  added and special tokens, chat templates with tools and assistant masks, source offsets,
+  streaming decoding, special-token-aware truncation and O(1) vocabulary lookup.
+  Nonzero BPE dropout, tokenizer training, padding and pair encodings are out of scope.
 - **Drop-in.** Same `Tokenizer`, `PreTrainedTokenizer`, `AutoTokenizer`, `Config` and
   `TokenizerError` API as swift-transformers; existing consumers compile unchanged.
 - **Lean.** One dependency, [swift-jinja](https://github.com/huggingface/swift-jinja), for chat
@@ -62,7 +63,12 @@ Requires Swift 6. Supports macOS 13, iOS 16, tvOS 16, watchOS 9 and visionOS 1.
 ## Usage
 
 Point the library at a folder holding `tokenizer.json`, plus `tokenizer_config.json`,
-`config.json` and a chat template file when present.
+`config.json` and a chat template file when present. If `tokenizer.json` is absent, the loader
+also accepts `vocab.txt` for BERT/MPNet or `vocab.json` + `merges.txt` for GPT2/Qwen2/RoBERTa/CLIP.
+These split formats require a supported `tokenizer_class` or `model_type`; vocabulary alone
+cannot identify the correct pipeline. Added-token metadata and standalone chat templates are
+preserved. CLIP conversion follows `CLIPTokenizerFast`, including decoded word-suffix cleanup;
+it does not reproduce the slow tokenizer's optional `ftfy` preprocessing.
 
 ```swift
 import Tokenizers

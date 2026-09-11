@@ -28,6 +28,15 @@ import Foundation
 /// (including quoted strings) are copied verbatim, so `{#` or `{` inside an
 /// expression's string literal is never rewritten.
 enum ChatTemplatePreprocessor {
+    /// Apply the same template options for normal rendering and public-AST generation tracking.
+    static func preparedSource(_ source: String) -> String {
+        let source = preprocess(source)
+        let lines = source.components(separatedBy: .newlines).map { line in
+            line.contains(/^[ \t]*{[#%]/) ? line.replacing(/^[ \t]*/, with: "") : line
+        }
+        return lines.joined(separator: "\n").replacing(/%}\n/, with: "%}").replacing(/#}\n/, with: "#}")
+    }
+
     static func preprocess(_ source: String) -> String {
         // Jinja2's lexer normalizes source line endings and defaults
         // keep_trailing_newline to false. Strip exactly one source newline;
