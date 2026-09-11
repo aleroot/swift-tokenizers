@@ -1,4 +1,9 @@
 // Local harness template: copy into Tests/TokenizersTests only for an audit, then remove.
+// Supply a tokenizers 0.23.2 fixture with MODEL_BOUNDARY_FIXTURE; MODEL_BOUNDARY_REPORT
+// optionally saves the results. This is a strict raw-parity audit: canonicalTokens only
+// explains known spelling differences, it does not turn a raw mismatch into a pass.
+// The external fixtures/generator are not shipped here; this template alone is not a
+// reproducible oracle. Permanent, self-contained boundary regressions live in ModelBoundaryTests.
 import Foundation
 import Testing
 

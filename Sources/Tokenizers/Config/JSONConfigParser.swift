@@ -498,21 +498,23 @@ struct JSONConfigParser {
             pos += 1
             return Config(data: .stringPairs(PackedStringPairs(utf8: utf8, offsets: offsets, count: 0)))
         }
+        let legacy = pos < bytes.count && bytes[pos] == UInt8(ascii: "\"")
         while true {
             skipWhitespace()
             guard pos < bytes.count else { throw JSONConfigError.unexpectedEnd }
-            if bytes[pos] == UInt8(ascii: "\"") {
-                // Legacy `"a b"` form: split on the first space by closing the left piece
-                // there and shifting the right piece down over it.
+            if legacy, bytes[pos] == UInt8(ascii: "\"") {
+                // Legacy text has exactly one space. Fall back to generic parsing for
+                // headers so they can be filtered without consuming a merge rank.
                 let start = utf8.count
                 try appendJSONString(to: utf8)
                 let split: Int? = utf8.withUnsafeBufferPointer { buffer in
-                    var i = start
-                    while i < buffer.count {
-                        if buffer[i] == UInt8(ascii: " ") { return i }
-                        i += 1
+                    if buffer[start...].starts(with: "#version".utf8) { return nil }
+                    var split: Int?
+                    for i in start..<buffer.count where buffer[i] == UInt8(ascii: " ") {
+                        guard split == nil else { return nil }
+                        split = i
                     }
-                    return nil
+                    return split
                 }
                 guard let space = split else { throw PackedShapeError.mismatch }
                 utf8.withUnsafeMutableBufferPointer { buffer in
@@ -524,7 +526,7 @@ struct JSONConfigParser {
                 utf8.removeLast(1)
                 offsets.append(UInt32(space))
                 offsets.append(UInt32(utf8.count))
-            } else if bytes[pos] == UInt8(ascii: "[") {
+            } else if !legacy, bytes[pos] == UInt8(ascii: "[") {
                 pos += 1
                 skipWhitespace()
                 guard pos < bytes.count, bytes[pos] == UInt8(ascii: "\"") else { throw PackedShapeError.mismatch }

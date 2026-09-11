@@ -302,12 +302,6 @@ struct TokenizerRegressionTests {
         #expect(tokenizer.encode(text: "b", addSpecialTokens: false) == [0])
     }
 
-    @Test("Legacy merge strings split on the first space only")
-    func legacyMergesSplitOnce() throws {
-        let merges = BPETokenizer.mergesFromConfig(try Config(jsonString: #"["a  b","foo bar baz"]"#))
-        #expect(merges == [["a", " b"], ["foo", "bar baz"]])
-    }
-
     @Test("List-format and string-format BPE merges intern identically")
     func mergeFormatsAgree() throws {
         let stringData: Config = [

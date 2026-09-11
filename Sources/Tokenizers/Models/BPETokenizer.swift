@@ -1,7 +1,6 @@
 // Byte-Pair Encoding model. Symbols are token ids; merges resolve through ``MergeTable`` keyed on
-// `(leftId, rightId)`. Merge products outside the vocabulary get synthetic ids `>= vocab.count`
-// and take the byte-fallback path at output. Short words use a linear lowest-rank loop, long
-// words a heap with lazy deletion; both pick the lowest rank first, leftmost on ties.
+// `(leftId, rightId)`. Merge operands and products must belong to the model vocabulary.
+// Short words use a linear lowest-rank loop, long words a heap with lazy deletion; both pick the lowest rank first, leftmost on ties.
 
 import Foundation
 
@@ -75,6 +74,8 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
     let eosTokenId: Int?
     let unknownToken: String?
     let unknownTokenId: Int?
+    /// Segmentation fallback from model.unk_token; wrapper special-token metadata is separate.
+    let modelUnknownTokenId: Int?
     let fuseUnknownTokens: Bool
     let byteFallback: Bool
     let continuingPrefix: String
@@ -86,28 +87,6 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
     let cache = PretokenCache()
 
     // MARK: - Construction
-
-    static func mergesFromConfig(_ config: Config?) -> [[String]]? {
-        guard let config, let merges = config.array() else { return nil }
-        var result: [[String]] = []
-        result.reserveCapacity(merges.count)
-        for element in merges {
-            if let pair = element.array() {
-                // tokenizers >= 0.20: each merge is a two-element list.
-                guard pair.count == 2, let a = pair[0].string(), let b = pair[1].string() else { continue }
-                result.append([a, b])
-            } else if let s = element.string() {
-                // Legacy "a b" strings: split on the first space only (a piece may itself
-                // contain spaces) and skip lines without one.
-                if let idx = s.unicodeScalars.firstIndex(of: " ") {
-                    let a = String(s.unicodeScalars[..<idx])
-                    let b = String(s.unicodeScalars[s.unicodeScalars.index(after: idx)...])
-                    result.append([a, b])
-                }
-            }
-        }
-        return result
-    }
 
     /// Interns merge pairs into the integer table. Pieces are looked up by UTF-8 bytes so
     /// merge products never allocate a concatenated `String`.
@@ -188,18 +167,27 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
         var intern = MergeIntern(
             vocab: vocab, continuingPrefix: continuingPrefix, endSuffix: endSuffix, ignoreMerges: ignoreMerges,
             expectedCount: mergeList.count)
-        for (rank, element) in mergeList.enumerated() {
+        // The serialized list uses one format throughout. Headers only belong to the
+        // legacy text format and do not consume a merge rank.
+        let legacy = mergeList.first?.string() != nil
+        var rank = 0
+        for element in mergeList {
             let a: String
             let b: String
-            if let pair = element.array() {
-                guard pair.count == 2, let left = pair[0].string(), let right = pair[1].string() else { continue }
+            if legacy, let line = element.string() {
+                if line.hasBytePrefix("#version") { continue }
+                let parts = line.unicodeScalars.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: false)
+                guard parts.count == 2 else {
+                    throw TokenizerError.invalidConfiguration("BPE legacy merge must contain exactly one space")
+                }
+                a = String(parts[0])
+                b = String(parts[1])
+            } else if !legacy, let pair = element.array(), pair.count == 2,
+                      let left = pair[0].string(), let right = pair[1].string() {
                 a = left
                 b = right
-            } else if let s = element.string(), let idx = s.unicodeScalars.firstIndex(of: " ") {
-                a = String(s.unicodeScalars[..<idx])
-                b = String(s.unicodeScalars[s.unicodeScalars.index(after: idx)...])
             } else {
-                continue
+                throw TokenizerError.invalidConfiguration("BPE merges must be all strings or all pairs of strings")
             }
             var aCopy = a
             var bCopy = b
@@ -208,6 +196,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
                     try intern.add(left: leftBytes, right: rightBytes, rank: rank)
                 }
             }
+            rank += 1
         }
         return intern.finish()
     }
@@ -239,7 +228,19 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
         let vocab = try Vocabulary(
             vocab: tokenizerData.model.vocab, addedTokens: addedTokens, addedTokenConfig: tokenizerData.addedTokens)
         self.vocab = vocab
-        modelVocabulary = try ModelVocabulary(vocab, config: tokenizerData.model.vocab)
+        let modelVocabulary = try ModelVocabulary(vocab, config: tokenizerData.model.vocab)
+        self.modelVocabulary = modelVocabulary
+        // Segmentation is defined by tokenizer.json, including a null/absent fallback.
+        // Validate before allocating the owned symbol buffers: ordinary encode cannot throw.
+        let modelUnknown = tokenizerData.model.unkToken.string()
+        modelUnknownTokenId = modelUnknown.flatMap { modelVocabulary.id(of: $0) }
+        if modelUnknown != nil, modelUnknownTokenId == nil {
+            throw TokenizerError.invalidConfiguration("BPE unknown token is absent from the model vocabulary")
+        }
+        // GPT-2/Whisper expose an unknown special-token ID even when BPE has no fallback.
+        // Keep that wrapper API without letting it alter the serialized segmentation rules.
+        unknownToken = TokenizerModel.unknownToken(from: tokenizerConfig) ?? modelUnknown
+        unknownTokenId = unknownToken.flatMap { vocab.id(of: $0) }
         continuingPrefix = tokenizerData.model.continuingSubwordPrefix.string(or: "")
         endSuffix = tokenizerData.model.endOfWordSuffix.string(or: "")
         ignoreMerges = tokenizerData.model.ignoreMerges.boolean(or: false)
@@ -280,18 +281,11 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
         }
         hexaTokenIds = Self.owned(hexa)
 
-        if let unk = TokenizerModel.unknownToken(from: tokenizerConfig) ?? tokenizerData.model.unkToken.string() {
-            unknownToken = unk
-            unknownTokenId = vocab.id(of: unk)
-        } else {
-            unknownToken = nil
-            unknownTokenId = nil
-        }
         eosToken = addedTokenAsString(tokenizerConfig.eosToken)
         eosTokenId = eosToken.flatMap { vocab.id(of: $0) }
         bosToken = addedTokenAsString(tokenizerConfig.bosToken)
         bosTokenId = bosToken.flatMap { vocab.id(of: $0) }
-        fuseUnknownTokens = tokenizerConfig.fuseUnk.boolean(or: tokenizerData.model.fuseUnk.boolean(or: false))
+        fuseUnknownTokens = tokenizerData.model.fuseUnk.boolean(or: false)
         byteFallback = tokenizerData.model.byteFallback.boolean(or: false)
     }
 
@@ -425,12 +419,12 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
                 for byte in spelling.utf8 {
                     symbols.append(Symbol(id: hexaTokenIds[Int(byte)], start: Int32(i), end: Int32(end)))
                 }
-            } else if let unknownTokenId {
+            } else if let modelUnknownTokenId {
                 if let previous = pendingUnknown, fuseUnknownTokens {
                     pendingUnknown = Symbol(id: previous.id, start: previous.start, end: Int32(end))
                 } else {
                     if let pendingUnknown { symbols.append(pendingUnknown) }
-                    pendingUnknown = Symbol(id: Int32(unknownTokenId), start: Int32(i), end: Int32(end))
+                    pendingUnknown = Symbol(id: Int32(modelUnknownTokenId), start: Int32(i), end: Int32(end))
                 }
             }
             i = end
@@ -731,7 +725,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
             bytes: UnsafeBufferPointer<UInt8>, symbol: Symbol, byteLevel: Bool, into ids: inout [Int]
         ) {
             if !model.byteFallback {
-                if let unknown = model.unknownTokenId { ids.append(unknown) }
+                if let unknown = model.modelUnknownTokenId { ids.append(unknown) }
                 return
             }
             let slice = UnsafeBufferPointer(rebasing: bytes[Int(symbol.start)..<Int(symbol.end)])
@@ -746,7 +740,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
                 let id = model.hexaTokenIds[Int(b)]
                 if id >= 0 {
                     ids.append(Int(id))
-                } else if let unk = model.unknownTokenId {
+                } else if let unk = model.modelUnknownTokenId {
                     ids.append(unk)
                 }
             }

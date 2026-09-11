@@ -68,9 +68,9 @@ final class OffsetModelEncoder {
                         for byte in fallback {
                             let id = bpe.hexaTokenIds[Int(byte)]
                             if id >= 0 { output.append(AlignedToken(id: Int(id), offset: origin)) }
-                            else if let unknown = bpe.unknownTokenId { output.append(AlignedToken(id: unknown, offset: origin)) }
+                            else if let unknown = bpe.modelUnknownTokenId { output.append(AlignedToken(id: unknown, offset: origin)) }
                         }
-                    } else if let unknown = bpe.unknownTokenId {
+                    } else if let unknown = bpe.modelUnknownTokenId {
                         output.append(AlignedToken(id: unknown, offset: origin))
                     }
                 }

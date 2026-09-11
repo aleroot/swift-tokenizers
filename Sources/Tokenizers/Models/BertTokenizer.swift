@@ -46,6 +46,12 @@ public final class BertTokenizer: Sendable {
         let vocabulary = try Vocabulary(
             vocab: tokenizerData.model.vocab, addedTokens: addedTokens, addedTokenConfig: tokenizerData.addedTokens)
 
+        let modelVocabulary = try ModelVocabulary(vocabulary, config: tokenizerData.model.vocab)
+        let unkToken = tokenizerData.model.unkToken.string(or: "[UNK]")
+        // Like WordLevel, validate the fallback at load time because encode cannot throw.
+        guard modelVocabulary.id(of: unkToken) != nil else {
+            throw TokenizerError.invalidConfiguration("WordPiece unknown token is absent from the model vocabulary")
+        }
         let maximum = tokenizerData.model.maxInputCharsPerWord.integer(or: 100)
         guard maximum >= 0 else { throw TokenizerError.invalidConfiguration("Negative WordPiece word limit") }
         self.init(
@@ -55,12 +61,12 @@ public final class BertTokenizer: Sendable {
             eosToken: tokenizerConfig.eosToken.string(),
             fuseUnknownTokens: tokenizerConfig.fuseUnk.boolean(or: false),
             doLowerCase: tokenizerConfig.doLowerCase.boolean(or: true),
-            modelVocabulary: try ModelVocabulary(vocabulary, config: tokenizerData.model.vocab),
+            modelVocabulary: modelVocabulary,
             // A serialized pipeline (normalizer / pre-tokenizer in `tokenizer.json`) already
             // basic-tokenizes; pre-2020 exports omit `model.type` but are WordPiece models too.
             serializedWordPiece: tokenizerData.model.type.string() == "WordPiece"
                 || !tokenizerData.preTokenizer.isNull() || !tokenizerData.normalizer.isNull(),
-            unkToken: tokenizerData.model.unkToken.string(or: "[UNK]"),
+            unkToken: unkToken,
             prefix: tokenizerData.model.continuingSubwordPrefix.string(or: "##"), maximum: maximum
         )
     }
@@ -458,7 +464,7 @@ final class WordpieceTokenizer: Sendable {
         continuationPrefix = Array(prefix.utf8)
         self.vocabulary = vocabulary
         self.modelVocabulary = modelVocabulary ?? ModelVocabulary(vocabulary)
-        unkId = vocabulary.id(of: unkToken)
+        unkId = self.modelVocabulary.id(of: unkToken)
         var longest = 0
         var initialStarts = ScalarBitmap()
         var continuationStarts = ScalarBitmap()
