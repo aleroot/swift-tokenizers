@@ -22,27 +22,29 @@ struct AddedTokenFlags {
         return AddedTokenFlags(byId: byId, maskWithLeadingWhitespace: Self.classMaskToken(tokenizerConfig))
     }
 
-    /// Returns `serialized` with the flags `transformers` would end up with for this token.
-    func apply(to serialized: Config, id: Int, content: String) -> Config {
-        var result = serialized
-        if let override = byId[id], override.content.string() == content {
-            var merged = serialized.dictionary(or: [:])
-            for field in ["lstrip", "rstrip", "normalized", "single_word", "special"] {
-                let key = BinaryDistinctString(field)
-                if let value = override.dictionary()?[key] { merged[key] = value }
-            }
-            result = Config(merged)
+    /// The flags `transformers` ends up with for one serialized added token.
+    struct Resolved {
+        var lstrip: Bool
+        var rstrip: Bool
+        var normalized: Bool
+        var singleWord: Bool
+        var special: Bool
+    }
+
+    /// Resolves the flags of `serialized` (an `added_tokens` entry) without materializing a
+    /// merged configuration per token.
+    func resolve(_ serialized: Config, id: Int, content: String) -> Resolved {
+        let override: Config? = byId[id].flatMap { $0.content.string() == content ? $0 : nil }
+        func flag(_ name: BinaryDistinctString) -> Bool {
+            if let override, !override[name].isNull() { return override[name].boolean(or: false) }
+            return serialized[name].boolean(or: false)
         }
         if content == maskWithLeadingWhitespace {
-            var merged = result.dictionary(or: [:])
-            merged[BinaryDistinctString("lstrip")] = Config(true)
-            merged[BinaryDistinctString("rstrip")] = Config(false)
-            merged[BinaryDistinctString("normalized")] = Config(false)
-            merged[BinaryDistinctString("single_word")] = Config(false)
-            merged[BinaryDistinctString("special")] = Config(true)
-            result = Config(merged)
+            return Resolved(lstrip: true, rstrip: false, normalized: false, singleWord: false, special: true)
         }
-        return result
+        return Resolved(
+            lstrip: flag("lstrip"), rstrip: flag("rstrip"), normalized: flag("normalized"),
+            singleWord: flag("single_word"), special: flag("special"))
     }
 
     /// Fast tokenizer classes whose `__init__` wraps a string `mask_token` in

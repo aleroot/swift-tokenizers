@@ -38,10 +38,10 @@ final class UnigramTokenizer: PreTrainedTokenizerModel, FastTokenizingModel, Sen
         } else {
             throw TokenizerError.missingVocab
         }
-        scores = packed.scores
+        scores = packed.scores.elements
 
         var minScore: Double = 999
-        for score in packed.scores where score < minScore { minScore = score }
+        for score in scores where score < minScore { minScore = score }
         self.minScore = minScore
 
         guard let unknownTokenId = tokenizerData.model["unkId"].integer(), unknownTokenId >= 0,

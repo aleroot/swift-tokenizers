@@ -10,22 +10,27 @@ struct ModelVocabulary: Sendable {
 
     init(_ vocabulary: Vocabulary, config: Config) throws {
         self.vocabulary = vocabulary
-        let ids: [Int32]
+        var maxId: Int32 = -1
+        var bits: [UInt64] = []
+        func mark(_ ids: UnsafeBufferPointer<Int32>) {
+            for id in ids where id > maxId { maxId = id }
+            bits = [UInt64](repeating: 0, count: (Int(maxId) + 64) / 64)
+            for id in ids { bits[Int(id) >> 6] |= 1 << UInt64(id & 63) }
+        }
         if let packed = config.asPackedStringMap() {
-            ids = packed.ids
+            packed.ids.withUnsafeBufferPointer(mark)
         } else if let values = config.dictionary() {
-            ids = try values.values.map {
+            let ids = try values.values.map {
                 guard let id = $0.integer(), id >= 0, id < vocabulary.count else {
                     throw TokenizerError.malformedVocab
                 }
                 return Int32(id)
             }
+            ids.withUnsafeBufferPointer(mark)
         } else {
             throw TokenizerError.missingVocab
         }
-        count = (ids.max() ?? -1) + 1
-        var bits = [UInt64](repeating: 0, count: (Int(count) + 63) / 64)
-        for id in ids { bits[Int(id) >> 6] |= 1 << UInt64(id & 63) }
+        count = maxId + 1
         let populated = bits.reduce(0) { $0 + $1.nonzeroBitCount }
         present = populated == Int(count) ? [] : bits
     }

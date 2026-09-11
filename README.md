@@ -115,9 +115,9 @@ on all 60,720 lines, verified before timing.
 
 | Model | swift-tokenizers | vs SentencePiece C++ | vs HF `tokenizers` |
 |---|---:|---:|---:|
-| T5, Unigram, 32k | 122.5 MiB/s | **1.8x** faster | 11.2x faster |
-| Gemma 3, SentencePiece BPE, 262k | 42.7 MiB/s | **1.8x** faster | 3.4x faster |
-| Qwen 3, byte-level BPE, 152k | 61.0 MiB/s | n/a | 10.5x faster |
+| T5, Unigram, 32k | 120.5 MiB/s | **1.8x** faster | 11.1x faster |
+| Gemma 3, SentencePiece BPE, 262k | 42.8 MiB/s | **1.8x** faster | 3.4x faster |
+| Qwen 3, byte-level BPE, 152k | 61.3 MiB/s | n/a | 10.6x faster |
 
 `tiktoken` cannot load a Hub tokenizer, so it runs its own vocabulary over the same text: it
 reaches 20.0 MiB/s (`cl100k_base`) and 19.4 MiB/s (`o200k_base`), which the chart marks as a
@@ -125,10 +125,11 @@ reference line.
 
 ![Memory retained by a loaded tokenizer](docs/memory.svg)
 
-A loaded tokenizer keeps about 6 times less memory than Hugging Face's Rust core on all three
-models. Against SentencePiece it is close: less on T5 (7.9 MiB against 10.4 MiB), more on
-Gemma 3 (65.3 MiB against 56.4 MiB), where the same 262k vocabulary arrives as a 31.8 MiB
-`tokenizer.json` instead of a 4.5 MiB protobuf.
+A loaded tokenizer keeps 6 to 12 times less memory than Hugging Face's Rust core and less than
+SentencePiece on both models it can load: 7.8 MiB against 10.4 MiB on T5, 35.0 MiB against
+56.4 MiB on Gemma 3, even though the same 262k vocabulary arrives as a 31.8 MiB `tokenizer.json`
+instead of a 4.5 MiB protobuf. The tables parsed out of the JSON live in page-backed buffers that
+go straight back to the OS once the tokenizer is built.
 
 English prose is friendlier to every engine. On a 1.15 MB document the same Qwen 3 tokenizer
 reaches **231 MiB/s** single-threaded, against 55 MiB/s for `tiktoken` (`o200k_base`), 5.4 MiB/s

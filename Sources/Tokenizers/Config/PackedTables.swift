@@ -1,23 +1,37 @@
 // Compact buffers for the two large tables in `tokenizer.json`: BPE/WordPiece
 // `model.vocab` (token → id) and BPE `model.merges` (ranked pairs), plus Unigram
 // `model.vocab` (token, score). Parsed directly from UTF-8 so the generic Config
-// tree never materializes 100k+ dictionary/array nodes.
+// tree never materializes 100k+ dictionary/array nodes. Storage is page-backed
+// (``PageBuffer``) so dropping the parsed `Config` returns the memory to the OS.
 
 import Foundation
 
 /// Compact `token → id` map as serialized in BPE/WordPiece `model.vocab`.
 public struct PackedStringMap: Sendable, Hashable {
-    let utf8: [UInt8]
+    let utf8: PageBuffer<UInt8>
     /// `count + 1` offsets into `utf8`. Token `i` is `utf8[offsets[i]..<offsets[i + 1]]`.
-    let offsets: [UInt32]
-    let ids: [Int32]
+    let offsets: PageBuffer<UInt32>
+    let ids: PageBuffer<Int32>
 
     public var count: Int { ids.count }
 
+    init(utf8: PageBuffer<UInt8>, offsets: PageBuffer<UInt32>, ids: PageBuffer<Int32>) {
+        self.utf8 = utf8
+        self.offsets = offsets
+        self.ids = ids
+    }
+
     init(utf8: [UInt8], offsets: [UInt32], ids: [Int32]) {
-        self.utf8 = utf8.trimmed()
-        self.offsets = offsets.trimmed()
-        self.ids = ids.trimmed()
+        self.init(utf8: PageBuffer(utf8), offsets: PageBuffer(offsets), ids: PageBuffer(ids))
+    }
+
+    public static func == (lhs: PackedStringMap, rhs: PackedStringMap) -> Bool {
+        lhs.ids == rhs.ids && lhs.offsets == rhs.offsets && lhs.utf8 == rhs.utf8
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        ids.hash(into: &hasher)
+        utf8.hash(into: &hasher)
     }
 
     @inline(__always)
@@ -62,16 +76,25 @@ public struct PackedStringMap: Sendable, Hashable {
 
 /// Compact list of string pairs as serialized in BPE `model.merges`.
 public struct PackedStringPairs: Sendable, Hashable {
-    let utf8: [UInt8]
+    let utf8: PageBuffer<UInt8>
     /// Pair `i` is left `utf8[offsets[2i]..<offsets[2i + 1]]` and
     /// right `utf8[offsets[2i + 1]..<offsets[2i + 2]]`.
-    let offsets: [UInt32]
+    let offsets: PageBuffer<UInt32>
     public let count: Int
 
-    init(utf8: [UInt8], offsets: [UInt32], count: Int) {
-        self.utf8 = utf8.trimmed()
-        self.offsets = offsets.trimmed()
+    init(utf8: PageBuffer<UInt8>, offsets: PageBuffer<UInt32>, count: Int) {
+        self.utf8 = utf8
+        self.offsets = offsets
         self.count = count
+    }
+
+    public static func == (lhs: PackedStringPairs, rhs: PackedStringPairs) -> Bool {
+        lhs.count == rhs.count && lhs.offsets == rhs.offsets && lhs.utf8 == rhs.utf8
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(count)
+        utf8.hash(into: &hasher)
     }
 
     @inline(__always)
@@ -109,16 +132,29 @@ public struct PackedStringPairs: Sendable, Hashable {
 
 /// Compact Unigram `model.vocab`: `(token, score)` rows, id = index.
 public struct PackedScoredTokens: Sendable, Hashable {
-    let utf8: [UInt8]
-    let offsets: [UInt32]
-    let scores: [Double]
+    let utf8: PageBuffer<UInt8>
+    let offsets: PageBuffer<UInt32>
+    let scores: PageBuffer<Double>
 
     public var count: Int { scores.count }
 
+    init(utf8: PageBuffer<UInt8>, offsets: PageBuffer<UInt32>, scores: PageBuffer<Double>) {
+        self.utf8 = utf8
+        self.offsets = offsets
+        self.scores = scores
+    }
+
     init(utf8: [UInt8], offsets: [UInt32], scores: [Double]) {
-        self.utf8 = utf8.trimmed()
-        self.offsets = offsets.trimmed()
-        self.scores = scores.trimmed()
+        self.init(utf8: PageBuffer(utf8), offsets: PageBuffer(offsets), scores: PageBuffer(scores))
+    }
+
+    public static func == (lhs: PackedScoredTokens, rhs: PackedScoredTokens) -> Bool {
+        lhs.scores == rhs.scores && lhs.offsets == rhs.offsets && lhs.utf8 == rhs.utf8
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        scores.hash(into: &hasher)
+        utf8.hash(into: &hasher)
     }
 
     func token(at index: Int) -> String {
@@ -140,8 +176,8 @@ public struct PackedScoredTokens: Sendable, Hashable {
 }
 
 extension Array {
-    /// A copy with capacity equal to its count. Tables are built by appending, which leaves up
-    /// to 2× slack; parts of them (Unigram scores) stay alive for the tokenizer's lifetime.
+    /// A copy with capacity equal to its count, for tables built by appending that stay alive
+    /// for the tokenizer's lifetime.
     func trimmed() -> [Element] {
         guard capacity > count + count / 8 else { return self }
         return withUnsafeBufferPointer { Array($0) }

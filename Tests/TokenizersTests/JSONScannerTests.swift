@@ -70,8 +70,8 @@ struct JSONScannerTests {
                 let key = try #require(generic.model.vocab.dictionary()?.keys.first)
                 #expect(key.description.utf8.elementsEqual(text.utf8))
                 let table = try #require(packed.model.vocab.asPackedStringMap())
-                #expect(table.utf8.elementsEqual(text.utf8))
-                #expect(table.ids == [7])
+                #expect(table.utf8.elements.elementsEqual(text.utf8))
+                #expect(table.ids.elements == [7])
             }
         }
     }

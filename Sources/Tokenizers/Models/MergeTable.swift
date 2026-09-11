@@ -2,79 +2,74 @@
 // an open-addressing index of 32-bit entry references resolves lookups. Once built, the tables
 // are read through raw pointers so the merge loop touches no reference counts.
 
-/// Accumulates merges in rank order, then produces the immutable ``MergeTable``.
+/// Accumulates merges in rank order directly into the storage of the ``MergeTable`` it returns,
+/// so building never copies the tables.
 struct MergeTableBuilder {
-    /// `left << 32 | right` per entry.
-    private var pairs: [UInt64] = []
-    private var ranks: [UInt32] = []
-    private var mergedIds: [Int32] = []
-    /// Entry index + 1; `0` marks an empty slot.
-    private var slots: [UInt32]
-    private let mask: Int
+    private let table: MergeTable
+    private let capacity: Int
 
-    var count: Int { pairs.count }
+    var count: Int { table.count }
 
     init(expectedCount: Int) {
-        var capacity = 16
-        while capacity < expectedCount * 2 { capacity <<= 1 }
-        slots = [UInt32](repeating: 0, count: capacity)
-        mask = capacity - 1
-        pairs.reserveCapacity(expectedCount)
-        ranks.reserveCapacity(expectedCount)
-        mergedIds.reserveCapacity(expectedCount)
+        capacity = max(expectedCount, 1)
+        table = MergeTable(capacity: capacity)
     }
 
     /// Inserts or overwrites the merge for `(left, right)`.
     mutating func insert(left: Int32, right: Int32, rank: UInt32, merged: Int32) {
         let key = MergeTable.key(left, right)
+        let mask = table.mask
+        let slots = table.slots
         var slot = Int(truncatingIfNeeded: ByteHash.hash(key: key)) & mask
         while true {
             let reference = slots[slot]
             if reference == 0 {
-                pairs.append(key)
-                ranks.append(rank)
-                mergedIds.append(merged)
-                slots[slot] = UInt32(pairs.count)
+                // `expectedCount` is the number of `insert` calls, so the arrays never fill up.
+                let entry = table.count
+                precondition(entry < capacity, "MergeTableBuilder overflow")
+                table.pairs[entry] = key
+                table.ranks[entry] = rank
+                table.mergedIds[entry] = merged
+                table.count = entry + 1
+                slots[slot] = UInt32(entry + 1)
                 return
             }
             let entry = Int(reference - 1)
-            if pairs[entry] == key {
-                ranks[entry] = rank
-                mergedIds[entry] = merged
+            if table.pairs[entry] == key {
+                table.ranks[entry] = rank
+                table.mergedIds[entry] = merged
                 return
             }
             slot = (slot + 1) & mask
         }
     }
 
-    func build() -> MergeTable {
-        MergeTable(pairs: pairs, ranks: ranks, mergedIds: mergedIds, slots: slots, mask: mask)
-    }
+    func build() -> MergeTable { table }
 }
 
 /// `@unchecked Sendable`: the tables are written during initialization and read-only afterwards.
 final class MergeTable: @unchecked Sendable {
-    private let pairs: UnsafeMutablePointer<UInt64>
-    private let ranks: UnsafeMutablePointer<UInt32>
-    private let mergedIds: UnsafeMutablePointer<Int32>
-    private let slots: UnsafeMutablePointer<UInt32>
+    fileprivate let pairs: UnsafeMutablePointer<UInt64>
+    fileprivate let ranks: UnsafeMutablePointer<UInt32>
+    fileprivate let mergedIds: UnsafeMutablePointer<Int32>
+    fileprivate let slots: UnsafeMutablePointer<UInt32>
     private let slotCount: Int
-    private let mask: Int
+    fileprivate let mask: Int
 
-    let count: Int
+    /// Number of entries; written only by ``MergeTableBuilder``.
+    fileprivate(set) var count = 0
 
-    fileprivate init(pairs: [UInt64], ranks: [UInt32], mergedIds: [Int32], slots: [UInt32], mask: Int) {
-        count = pairs.count
-        self.pairs = .allocate(capacity: max(count, 1))
-        self.ranks = .allocate(capacity: max(count, 1))
-        self.mergedIds = .allocate(capacity: max(count, 1))
-        slotCount = slots.count
-        self.slots = .allocate(capacity: slotCount)
-        self.mask = mask
-        pairs.withUnsafeBufferPointer { self.pairs.initialize(from: $0.baseAddress!, count: count) }
-        ranks.withUnsafeBufferPointer { self.ranks.initialize(from: $0.baseAddress!, count: count) }
-        mergedIds.withUnsafeBufferPointer { self.mergedIds.initialize(from: $0.baseAddress!, count: count) }
-        slots.withUnsafeBufferPointer { self.slots.initialize(from: $0.baseAddress!, count: slotCount) }
+    /// Allocates room for `capacity` entries; the builder fills the tables in.
+    fileprivate init(capacity: Int) {
+        var slotCount = 16
+        while slotCount < capacity * 2 { slotCount <<= 1 }
+        self.slotCount = slotCount
+        mask = slotCount - 1
+        pairs = .allocate(capacity: capacity)
+        ranks = .allocate(capacity: capacity)
+        mergedIds = .allocate(capacity: capacity)
+        slots = .allocate(capacity: slotCount)
+        slots.initialize(repeating: 0, count: slotCount)
     }
 
     deinit {

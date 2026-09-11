@@ -106,6 +106,8 @@ struct JSONConfigParser {
 
     /// Scratch buffer reused while unescaping strings.
     private var scratch: [UInt8] = []
+    /// Members of the objects currently being parsed, innermost last.
+    private var members: [(BinaryDistinctString, Config)] = []
     /// When true, `vocab` / `merges` keys are parsed into packed tables.
     private let packTokenizerTables: Bool
 
@@ -180,12 +182,16 @@ struct JSONConfigParser {
         guard depth <= Self.maxDepth else { throw JSONConfigError.nestingTooDeep }
 
         pos += 1  // '{'
-        var dict = [BinaryDistinctString: Config]()
         skipWhitespace()
         if pos < bytes.count, bytes[pos] == UInt8(ascii: "}") {
             pos += 1
-            return Config(dict)
+            return Config([BinaryDistinctString: Config]())
         }
+        // Members are staged on a shared stack and the dictionary is allocated once at its
+        // final size: `added_tokens` alone holds thousands of small objects, and growing each
+        // one member by member would leave several discarded tables per object behind.
+        let base = members.count
+        defer { members.removeSubrange(base...) }
         while true {
             skipWhitespace()
             guard pos < bytes.count else { throw JSONConfigError.unexpectedEnd }
@@ -201,11 +207,7 @@ struct JSONConfigParser {
             pos += 1
             skipWhitespace()
             let value = try parseValue(key: key)
-            dict[BinaryDistinctString(key)] = value
-            if dict.count == Self.largeCollectionThreshold {
-                dict.reserveCapacity(
-                    Self.largeCollectionThreshold + estimatedRemainingEntries(bytesPerEntry: 24))
-            }
+            members.append((BinaryDistinctString(key), value))
             skipWhitespace()
             guard pos < bytes.count else { throw JSONConfigError.unexpectedEnd }
             let c = bytes[pos]
@@ -214,16 +216,19 @@ struct JSONConfigParser {
                 skipWhitespace()
                 if pos < bytes.count, bytes[pos] == UInt8(ascii: "}") {
                     pos += 1
-                    return Config(dict)
+                    break
                 }
                 continue
             }
             if c == UInt8(ascii: "}") {
                 pos += 1
-                return Config(dict)
+                break
             }
             throw JSONConfigError.unexpectedCharacter(c, offset: pos)
         }
+        var dict = [BinaryDistinctString: Config](minimumCapacity: members.count - base)
+        for (key, value) in members[base...] { dict[key] = value }
+        return Config(dict)
     }
 
     private mutating func parseArray() throws -> Config {
@@ -431,11 +436,12 @@ struct JSONConfigParser {
         guard depth <= Self.maxDepth else { throw JSONConfigError.nestingTooDeep }
         pos += 1  // '{'
         skipWhitespace()
-        var utf8: [UInt8] = []
-        var offsets: [UInt32] = [0]
-        var ids: [Int32] = []
-        utf8.reserveCapacity(min(bytes.count - pos, 8_000_000))
-        ids.reserveCapacity(estimatedRemainingEntries(bytesPerEntry: 24))
+        // Upper bounds from the input: unescaping never lengthens a string and every entry
+        // spends at least `"":0,` on syntax. Untouched pages cost nothing.
+        let utf8 = PageBuffer<UInt8>(capacity: bytes.count - pos)
+        let offsets = PageBuffer<UInt32>(capacity: (bytes.count - pos) / 5 + 2)
+        let ids = PageBuffer<Int32>(capacity: (bytes.count - pos) / 5 + 1)
+        offsets.append(0)
         if pos < bytes.count, bytes[pos] == UInt8(ascii: "}") {
             pos += 1
             return Config(data: .stringMap(PackedStringMap(utf8: utf8, offsets: offsets, ids: ids)))
@@ -446,7 +452,7 @@ struct JSONConfigParser {
             guard bytes[pos] == UInt8(ascii: "\"") else {
                 throw JSONConfigError.unexpectedCharacter(bytes[pos], offset: pos)
             }
-            try appendJSONString(to: &utf8)
+            try appendJSONString(to: utf8)
             offsets.append(UInt32(utf8.count))
             skipWhitespace()
             guard pos < bytes.count, bytes[pos] == UInt8(ascii: ":") else {
@@ -483,11 +489,11 @@ struct JSONConfigParser {
         guard depth <= Self.maxDepth else { throw JSONConfigError.nestingTooDeep }
         pos += 1  // '['
         skipWhitespace()
-        var utf8: [UInt8] = []
-        var offsets: [UInt32] = [0]
+        // Every pair spends at least `" ",` on syntax and adds two offsets.
+        let utf8 = PageBuffer<UInt8>(capacity: bytes.count - pos)
+        let offsets = PageBuffer<UInt32>(capacity: (bytes.count - pos) / 4 * 2 + 3)
         var count = 0
-        utf8.reserveCapacity(min(bytes.count - pos, 8_000_000))
-        offsets.reserveCapacity(estimatedRemainingEntries(bytesPerEntry: 16) * 2)
+        offsets.append(0)
         if pos < bytes.count, bytes[pos] == UInt8(ascii: "]") {
             pos += 1
             return Config(data: .stringPairs(PackedStringPairs(utf8: utf8, offsets: offsets, count: 0)))
@@ -496,24 +502,33 @@ struct JSONConfigParser {
             skipWhitespace()
             guard pos < bytes.count else { throw JSONConfigError.unexpectedEnd }
             if bytes[pos] == UInt8(ascii: "\"") {
+                // Legacy `"a b"` form: split on the first space by closing the left piece
+                // there and shifting the right piece down over it.
                 let start = utf8.count
-                try appendJSONString(to: &utf8)
-                if let space = utf8[start...].firstIndex(of: UInt8(ascii: " ")) {
-                    let leftCount = space - start
-                    let right = Array(utf8[(space + 1)...])
-                    utf8.removeSubrange(space..<utf8.count)
-                    offsets.append(UInt32(utf8.count))
-                    utf8.append(contentsOf: right)
-                    offsets.append(UInt32(utf8.count))
-                    _ = leftCount
-                } else {
-                    throw PackedShapeError.mismatch
+                try appendJSONString(to: utf8)
+                let split: Int? = utf8.withUnsafeBufferPointer { buffer in
+                    var i = start
+                    while i < buffer.count {
+                        if buffer[i] == UInt8(ascii: " ") { return i }
+                        i += 1
+                    }
+                    return nil
                 }
+                guard let space = split else { throw PackedShapeError.mismatch }
+                utf8.withUnsafeMutableBufferPointer { buffer in
+                    let tail = buffer.count - (space + 1)
+                    if tail > 0 {
+                        (buffer.baseAddress! + space).update(from: buffer.baseAddress! + space + 1, count: tail)
+                    }
+                }
+                utf8.removeLast(1)
+                offsets.append(UInt32(space))
+                offsets.append(UInt32(utf8.count))
             } else if bytes[pos] == UInt8(ascii: "[") {
                 pos += 1
                 skipWhitespace()
                 guard pos < bytes.count, bytes[pos] == UInt8(ascii: "\"") else { throw PackedShapeError.mismatch }
-                try appendJSONString(to: &utf8)
+                try appendJSONString(to: utf8)
                 offsets.append(UInt32(utf8.count))
                 skipWhitespace()
                 if pos < bytes.count, bytes[pos] == UInt8(ascii: ",") {
@@ -521,7 +536,7 @@ struct JSONConfigParser {
                     skipWhitespace()
                 }
                 guard pos < bytes.count, bytes[pos] == UInt8(ascii: "\"") else { throw PackedShapeError.mismatch }
-                try appendJSONString(to: &utf8)
+                try appendJSONString(to: utf8)
                 offsets.append(UInt32(utf8.count))
                 skipWhitespace()
                 if pos < bytes.count, bytes[pos] == UInt8(ascii: ",") {
@@ -561,11 +576,11 @@ struct JSONConfigParser {
         guard depth <= Self.maxDepth else { throw JSONConfigError.nestingTooDeep }
         pos += 1  // '['
         skipWhitespace()
-        var utf8: [UInt8] = []
-        var offsets: [UInt32] = [0]
-        var scores: [Double] = []
-        utf8.reserveCapacity(min(bytes.count - pos, 8_000_000))
-        scores.reserveCapacity(estimatedRemainingEntries(bytesPerEntry: 24))
+        // Every row spends at least `["",0],` on syntax.
+        let utf8 = PageBuffer<UInt8>(capacity: bytes.count - pos)
+        let offsets = PageBuffer<UInt32>(capacity: (bytes.count - pos) / 7 + 2)
+        let scores = PageBuffer<Double>(capacity: (bytes.count - pos) / 7 + 1)
+        offsets.append(0)
         if pos < bytes.count, bytes[pos] == UInt8(ascii: "]") {
             pos += 1
             return Config(data: .scoredTokens(PackedScoredTokens(utf8: utf8, offsets: offsets, scores: scores)))
@@ -576,7 +591,7 @@ struct JSONConfigParser {
             pos += 1
             skipWhitespace()
             guard pos < bytes.count, bytes[pos] == UInt8(ascii: "\"") else { throw PackedShapeError.mismatch }
-            try appendJSONString(to: &utf8)
+            try appendJSONString(to: utf8)
             offsets.append(UInt32(utf8.count))
             skipWhitespace()
             if pos < bytes.count, bytes[pos] == UInt8(ascii: ",") {
@@ -629,7 +644,7 @@ struct JSONConfigParser {
         return nil
     }
 
-    private mutating func appendJSONString(to buffer: inout [UInt8]) throws {
+    private mutating func appendJSONString(to buffer: PageBuffer<UInt8>) throws {
         pos += 1  // opening quote
         let start = pos
         let (i, isASCII) = ByteKernels.jsonStringEnd(bytes, from: pos)

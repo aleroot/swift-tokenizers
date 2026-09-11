@@ -83,13 +83,13 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         for serialized in tokenizerData["addedTokens"].array(or: []) {
             guard let id = serialized["id"].integer() else { continue }  // malformed: token with no id
             guard let content = serialized.content.string() else { continue }  // malformed: token with no content
-            let addedToken = flagOverrides.apply(to: serialized, id: id, content: content)
+            let flags = flagOverrides.resolve(serialized, id: id, content: content)
             addedTokens[content] = id
-            if addedToken["special"].boolean(or: false) {
+            if flags.special {
                 specialTokens[content] = id
                 specialTokenIds.insert(id)
             }
-            let normalized = addedToken["normalized"].boolean(or: false) && normalizer != nil
+            let normalized = flags.normalized && normalizer != nil
             let match = normalized ? normalizer!.normalize(text: content) : content
             if Self.decodesNormalizedAddedTokens, normalized, !match.utf8.elementsEqual(content.utf8) {
                 normalizedSpellings[id] = match
@@ -97,10 +97,10 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             let token = AddedTokenSplitter.Token(
                 content: match,
                 id: id,
-                lstrip: addedToken["lstrip"].boolean(or: false),
-                rstrip: addedToken["rstrip"].boolean(or: false),
+                lstrip: flags.lstrip,
+                rstrip: flags.rstrip,
                 scalarCount: match.unicodeScalars.count,
-                singleWord: addedToken["single_word"].boolean(or: false)
+                singleWord: flags.singleWord
             )
             if normalized { normalizedTokens.append(token) } else { splitterTokens.append(token) }
         }
@@ -119,7 +119,14 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         decoder = try DecoderFactory.fromConfig(config: tokenizerData["decoder"])
         // `transformers` >= 4.45 defaults `clean_up_tokenization_spaces` to `False`.
         cleanUpTokenizationSpaces = tokenizerConfig.cleanUpTokenizationSpaces.boolean(or: false)
-        self.tokenizerConfig = tokenizerConfig
+        // `added_tokens_decoder` has been folded into the tokens above and is not consulted
+        // again; it is by far the largest part of the configuration (one object per added token).
+        if var retained = tokenizerConfig.dictionary(), retained["added_tokens_decoder"] != nil {
+            retained["added_tokens_decoder"] = nil
+            self.tokenizerConfig = Config(retained)
+        } else {
+            self.tokenizerConfig = tokenizerConfig
+        }
 
         let model = try TokenizerModel.from(
             tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData, addedTokens: addedTokens, strict: strict)

@@ -124,8 +124,8 @@ final class Vocabulary: @unchecked Sendable {
     /// Builds from a packed Unigram vocabulary (`id == index`) plus added tokens.
     convenience init(scored: PackedScoredTokens, addedTokens: [String: Int], addedTokenConfig: Config = Config()) throws
     {
-        var ids = [Int32](repeating: 0, count: scored.count)
-        for i in 0..<scored.count { ids[i] = Int32(i) }
+        let ids = PageBuffer<Int32>(capacity: scored.count)
+        for i in 0..<scored.count { ids.append(Int32(i)) }
         try self.init(
             packed: PackedStringMap(utf8: scored.utf8, offsets: scored.offsets, ids: ids),
             extra: Self.addedTokenEntries(addedTokens, config: addedTokenConfig))
@@ -144,10 +144,12 @@ final class Vocabulary: @unchecked Sendable {
 
     private init(packed: PackedStringMap, extra: [(String, Int)]) throws {
         var maxId = -1
-        for id in packed.ids {
-            let i = Int(id)
-            guard i >= 0 else { throw TokenizerError.malformedVocab }
-            if i > maxId { maxId = i }
+        try packed.ids.withUnsafeBufferPointer { ids in
+            for id in ids {
+                let i = Int(id)
+                guard i >= 0 else { throw TokenizerError.malformedVocab }
+                if i > maxId { maxId = i }
+            }
         }
         for (_, id) in extra {
             guard id >= 0 else { throw TokenizerError.malformedVocab }

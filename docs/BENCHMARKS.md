@@ -282,14 +282,14 @@ warm process (several tokenizers loaded in sequence, as in an app).
 
 | Tokenizer | `tokenizer.json` | Live heap | `phys_footprint` |
 |---|---:|---:|---:|
-| Qwen3-Embedding-0.6B (byte-level BPE) | 10.9 MiB | +12.7 MB | +16.6 MB |
-| Qwen3-Reranker-0.6B (byte-level BPE) | 10.9 MiB | +11.0 MB | +8.5 MB |
-| Llama-3.2-1B-Instruct (byte-level BPE) | 16.4 MiB | +16.5 MB | +19.8 MB |
-| multilingual-e5-small (Unigram, 250k) | 16.3 MiB | +19.1 MB | +55.8 MB † |
-| bge-m3 / bge-reranker-v2-m3 (Unigram, 250k) | 16.3 MiB | +19.2 MB | +19.5 MB |
-| jina-reranker-v2-base-multilingual (Unigram, 250k) | 16.3 MiB | +19.1 MB | +19.6 MB |
-| bert-base-uncased (WordPiece, 30k) | 0.4 MiB | +1.1 MB | +0.6 MB |
-| nomic-embed-text-v1.5 (WordPiece, 30k) | 0.7 MiB | +1.0 MB | +0.2 MB |
+| Qwen3-Embedding-0.6B (byte-level BPE) | 10.9 MiB | +11.1 MB | +10.1 MB |
+| Qwen3-Reranker-0.6B (byte-level BPE) | 10.9 MiB | +10.9 MB | +9.0 MB |
+| Llama-3.2-1B-Instruct (byte-level BPE) | 16.4 MiB | +13.5 MB | +13.4 MB |
+| multilingual-e5-small (Unigram, 250k) | 16.3 MiB | +19.1 MB | +50.3 MB † |
+| bge-m3 / bge-reranker-v2-m3 (Unigram, 250k) | 16.3 MiB | +19.1 MB | +19.7 MB |
+| jina-reranker-v2-base-multilingual (Unigram, 250k) | 16.3 MiB | +19.1 MB | +19.5 MB |
+| bert-base-uncased (WordPiece, 30k) | 0.4 MiB | +1.1 MB | +0.7 MB |
+| nomic-embed-text-v1.5 (WordPiece, 30k) | 0.7 MiB | +1.0 MB | +0.1 MB |
 
 † The first Unigram loaded in a process keeps dirty pages from the trie builder's peak
 allocations; every later one settles at ~19.5 MB.
@@ -428,12 +428,27 @@ all three languages:
 
 | Model | swift-tokenizers | SentencePiece C++ | HF `tokenizers` | swift-transformers |
 |---|---:|---:|---:|---:|
-| T5 (Unigram, 32k) | **7.9 MB** | 10.4 MB | 49.0 MB | 27.4 MB |
-| Gemma 3 (BPE, 262k) | 65.3 MB | **56.4 MB** | 381.9 MB | 140.3 MB |
-| Qwen 3 (byte-level BPE, 152k) | **21.2 MB** | n/a | 122.1 MB | 70.9 MB |
+| T5 (Unigram, 32k) | **7.8 MB** | 10.4 MB | 49.0 MB | 27.4 MB |
+| Gemma 3 (BPE, 262k) | **35.0 MB** | 56.4 MB | 381.9 MB | 140.3 MB |
+| Qwen 3 (byte-level BPE, 152k) | **10.1 MB** | n/a | 122.1 MB | 70.9 MB |
 
-About 6× smaller than the Rust core on all three. SentencePiece is smaller on Gemma 3, where it
-reads a 4.5 MiB protobuf while this library parses the equivalent 31.8 MiB `tokenizer.json`.
+Smaller than SentencePiece on both models it can read, and 6 to 12× smaller than the Rust core,
+although the library parses a 31.8 MiB `tokenizer.json` where SentencePiece reads a 4.5 MiB
+protobuf for the same Gemma 3 vocabulary.
+
+What this counter measures deserves a note. On macOS 26 the system allocator keeps freed blocks
+of every size resident, and `malloc_zone_pressure_relief` does not release them (a 64 MiB block
+that is `malloc`ed, touched and `free`d still counts in full), so the footprint added by a load is
+close to the *peak* volume allocated during it, for every engine here. A Gemma 3 load used to
+peak at 65.3 MB for 27 MB of tables that survive it. The load path now avoids that garbage instead
+of hoping the allocator returns it: the vocabulary and merge tables parsed out of the JSON live in
+page-backed buffers (`mmap`) that are unmapped, and so leave the footprint immediately, once the
+tokenizer is built; the merge table is filled in place instead of being built in arrays and copied;
+JSON objects are allocated once at their final size; added-token flags are resolved without a
+merged configuration per token; and the retained `tokenizer_config` drops `added_tokens_decoder`
+after it has been applied. Live memory after the load is 22.6 MB for Gemma 3. Token ids on all
+60,720 lines and encode throughput at 1 and 8 threads are unchanged (A/B of preserved binaries,
+8 alternating pairs: Qwen 3 62.2 → 62.0 MB/s median, T5 120.3 → 119.6, within run-to-run noise).
 
 For scale, `sentencepiece`'s published table for the same corpus reports 27.41 MB/s (T5) and
 7.44 MB/s (Gemma 3) single-threaded for itself, and 3.78 / 3.66 MB/s for Hugging Face Fast, on a
@@ -464,10 +479,11 @@ steps, because an adapter object in between costs more per call than the retain 
 
 | Model | swift-tokenizers (`tokenizer.json`) | SentencePiece (`.model`) |
 |---|---:|---:|
-| T5 (32k) | **7.6 ms** (1.4 MB JSON) | 15.5 ms (0.8 MB protobuf) |
-| Gemma 3 (262k) | 90 ms (33 MB JSON) | **27 ms** (4.7 MB protobuf) |
+| T5 (32k) | **6.1 ms** (1.4 MB JSON) | 15.5 ms (0.8 MB protobuf) |
+| Gemma 3 (262k) | 80 ms (33 MB JSON) | **27 ms** (4.7 MB protobuf) |
 
-Warm file cache, median of three loads after discarding the first.
+Warm file cache, median of seven loads after discarding the first. The page-backed parse
+tables also took Gemma 3 from 87 to 80 ms and Qwen 3 from 25.3 to 22.8 ms.
 
 Gemma 3 is where the file format shows: 33 MB of JSON against 4.7 MB of protobuf. Reading the
 `.model` protobuf directly would close that gap and is the one input format the library does not
@@ -677,7 +693,10 @@ compiled once against swift-tokenizers and once against swift-transformers and d
 * **Memory.** `task_info(TASK_VM_INFO).phys_footprint` and `malloc_zone_statistics.size_in_use`
   deltas around a full load, with the parsed configuration released first (as it is after
   `AutoTokenizer.load`). Per-component heap deltas printed by the in-repo memory suite are noisy —
-  the allocator returns pages lazily — so this page quotes whole-tokenizer figures.
+  the allocator returns pages lazily — so this page quotes whole-tokenizer figures. On macOS 26
+  the footprint delta includes freed blocks the allocator keeps resident (see the SentencePiece
+  [Memory](#memory) section), which is why the load path is written to allocate little it does
+  not keep.
 * **Correctness gates.** Timing runs only after outputs match: the differential suite (24
   tokenizers × 301 adversarial texts against Hugging Face goldens), the embedding harness
   (12 models × 68 texts, 0 mismatches) and the end-to-end harness (6 model folders × 301 texts,
