@@ -3,121 +3,185 @@ import Foundation
 /// Per-call state. Reuses the model's merge/lattice algorithms and, where token lengths
 /// are exact, its existing ID cache. Nothing is retained by an IDs-only tokenizer call.
 final class OffsetModelEncoder {
-    let model: any TokenizingModel
+    /// Resolved once: no piece pays for a dynamic cast, and a model the alignment pipeline
+    /// cannot segment is rejected before any work is done.
+    private enum Model {
+        case bpe(BPETokenizer)
+        case unigram(UnigramTokenizer)
+        case wordLevel(WordLevelTokenizer)
+        case bert(BertTokenizer)
+    }
+
+    private let resolved: Model
     private var symbols: [BPETokenizer.Symbol] = []
     private var mergeScratch = BPETokenizer.MergeScratch()
     private var lattice: UnigramTokenizer.Lattice?
     private var cachedEncoder: PieceEncoder?
     private var ids: [Int] = []
+    private var lengths: [Int] = []
+    /// Whether a byte-level model's vocabulary spellings give exact source lengths.
     private let cachedByteLengths: Bool
 
-    init(model: any TokenizingModel) {
-        self.model = model
-        if let bpe = model as? BPETokenizer {
-            cachedByteLengths = !bpe.hasAffixes && bpe.symbolCount == bpe.vocab.count
+    init(model: any TokenizingModel) throws {
+        switch model {
+        case let bpe as BPETokenizer:
+            resolved = .bpe(bpe)
+            cachedByteLengths =
+                !bpe.hasAffixes && bpe.symbolCount == bpe.vocab.count
                 && bpe.byteSymbolIds.allSatisfy { $0 >= 0 }
-        } else { cachedByteLengths = false }
+        case let unigram as UnigramTokenizer:
+            resolved = .unigram(unigram)
+            cachedByteLengths = false
+        case let wordLevel as WordLevelTokenizer:
+            resolved = .wordLevel(wordLevel)
+            cachedByteLengths = false
+        case let bert as BertTokenizer:
+            resolved = .bert(bert)
+            cachedByteLengths = false
+        default:
+            throw TokenizerError.unsupportedComponent("offsets for model \(type(of: model))")
+        }
     }
 
     deinit { cachedEncoder?.finish() }
 
-    private func encodeIDs(_ bytes: UnsafeBufferPointer<UInt8>, using model: any FastTokenizingModel) {
+    private func encodeIDs(
+        _ bytes: UnsafeBufferPointer<UInt8>, byteLevel: Bool = false, using model: any FastTokenizingModel
+    ) {
         if cachedEncoder == nil { cachedEncoder = model.makeEncoder(); cachedEncoder?.begin() }
         ids.removeAll(keepingCapacity: true)
-        cachedEncoder?.encode(bytes: bytes, byteLevel: false, into: &ids)
+        cachedEncoder?.encode(bytes: bytes, byteLevel: byteLevel, into: &ids)
+    }
+
+    /// Emits one token per ID in `ids`, sized by `sourceLength`.
+    ///
+    /// The IDs come from the shared encoder, so this path is served by the pre-token cache.
+    /// It applies only when every token's source length is known and the lengths cover the
+    /// input exactly; otherwise nothing is emitted and the caller segments the piece itself.
+    private func appendDerivedTokens(
+        covering count: Int, of text: AlignedText, into output: inout [AlignedToken],
+        sourceLength: (Int) -> Int?
+    ) -> Bool {
+        lengths.removeAll(keepingCapacity: true)
+        lengths.reserveCapacity(ids.count)
+        var total = 0
+        for id in ids {
+            guard let length = sourceLength(id) else { return false }
+            lengths.append(length)
+            total += length
+        }
+        guard total == count else { return false }
+        var start = 0
+        for (id, length) in zip(ids, lengths) {
+            output.append(AlignedToken(id: id, offset: text.sourceRange(start..<start + length)))
+            start += length
+        }
+        return true
     }
 
     func encode(_ text: AlignedText, byteLevel: Bool, into output: inout [AlignedToken]) throws {
         guard !text.bytes.isEmpty else { return }
-        if let bpe = model as? BPETokenizer {
-            text.bytes.withUnsafeBufferPointer { bytes in
-                if byteLevel, cachedByteLengths {
-                    if cachedEncoder == nil { cachedEncoder = bpe.makeEncoder(); cachedEncoder?.begin() }
-                    ids.removeAll(keepingCapacity: true)
-                    cachedEncoder?.encode(bytes: bytes, byteLevel: true, into: &ids)
-                    var start = 0
-                    for id in ids {
-                        let length = bpe.vocab.withBytes(of: id) { $0.reduce(0) { $0 + ($1 & 0xC0 == 0x80 ? 0 : 1) } }
-                        let end = start + length
-                        output.append(AlignedToken(id: id, offset: text.sourceRange(start..<end)))
-                        start = end
-                    }
-                    return
-                }
-                if bpe.ignoreMerges {
-                    let spelling = byteLevel ? ByteLevelAlphabet.encode(bytes) : String(decoding: bytes, as: UTF8.self)
-                    if let id = bpe.modelVocabulary.id(of: spelling) {
-                        output.append(AlignedToken(id: id, offset: text.sourceRange(0..<bytes.count)))
-                        return
-                    }
-                }
-                if byteLevel { bpe.byteLevelSymbols(bytes, into: &symbols) }
-                else { bpe.scalarSymbols(bytes, into: &symbols) }
-                if bpe.hasAffixes || symbols.contains(where: { $0.id < 0 }) {
-                    bpe.referenceSymbols(bytes, byteLevel: byteLevel, into: &symbols)
-                }
-                bpe.merge(&symbols, scratch: &mergeScratch)
-                for symbol in symbols {
-                    let range = Int(symbol.start)..<Int(symbol.end)
-                    let origin = text.sourceRange(range)
-                    if bpe.isVocabularyId(symbol.id) {
-                        output.append(AlignedToken(id: Int(symbol.id), offset: origin))
-                    } else if bpe.byteFallback {
-                        let part = UnsafeBufferPointer(rebasing: bytes[range])
-                        let fallback = byteLevel ? Array(ByteLevelAlphabet.encode(part).utf8) : Array(part)
-                        for byte in fallback {
-                            let id = bpe.hexaTokenIds[Int(byte)]
-                            if id >= 0 { output.append(AlignedToken(id: Int(id), offset: origin)) }
-                            else if let unknown = bpe.modelUnknownTokenId { output.append(AlignedToken(id: unknown, offset: origin)) }
-                        }
-                    } else if let unknown = bpe.modelUnknownTokenId {
-                        output.append(AlignedToken(id: unknown, offset: origin))
-                    }
-                }
-            }
-        } else if let unigram = model as? UnigramTokenizer {
-            let text = byteLevel ? text.byteLevel() : text
-            if lattice == nil { lattice = UnigramTokenizer.Lattice() }
-            text.bytes.withUnsafeBufferPointer { bytes in
-                encodeIDs(bytes, using: unigram)
-                if !ids.contains(where: { $0 == unigram.unknownTokenId }),
-                   ids.reduce(0, { $0 + unigram.vocabulary.byteCount(of: $1) }) == bytes.count {
-                    var start = 0
-                    for id in ids {
-                        let end = start + unigram.vocabulary.byteCount(of: id)
-                        output.append(AlignedToken(id: id, offset: text.sourceRange(start..<end)))
-                        start = end
-                    }
-                    return
-                }
-                for piece in unigram.segment(bytes, lattice: lattice!) {
-                    let range = Int(piece.start)..<Int(piece.end)
-                    if piece.isUnknown, unigram.byteFallback,
-                       bytes[range].allSatisfy({ unigram.byteFallbackIds[Int($0)] >= 0 }) {
-                        for i in range {
-                            output.append(AlignedToken(id: unigram.byteFallbackIds[Int(bytes[i])], offset: text.sourceRange(range)))
-                        }
-                    } else {
-                        output.append(AlignedToken(id: Int(piece.tokenId), offset: text.sourceRange(range),
-                            spelling: Int(piece.tokenId) == unigram.unknownTokenId ? String(decoding: bytes[range], as: UTF8.self) : nil))
-                    }
-                }
-            }
-        } else if let wordLevel = model as? WordLevelTokenizer {
+        switch resolved {
+        case let .bpe(bpe): encode(text, byteLevel: byteLevel, with: bpe, into: &output)
+        case let .unigram(unigram): encode(text, byteLevel: byteLevel, with: unigram, into: &output)
+        case let .wordLevel(wordLevel):
             // One token per chunk, covering all of it.
             let text = byteLevel ? text.byteLevel() : text
             text.bytes.withUnsafeBufferPointer { bytes in
                 guard let id = wordLevel.id(of: bytes) ?? wordLevel.unknownTokenId else { return }
                 output.append(AlignedToken(id: id, offset: text.sourceRange(0..<bytes.count)))
             }
-        } else if let bert = model as? BertTokenizer {
+        case let .bert(bert):
             let text = byteLevel ? text.byteLevel() : text
             if bert.serializedWordPiece {
                 text.bytes.withUnsafeBufferPointer { encodeIDs($0, using: bert) }
                 bert.appendOffsets(text, ids: ids, into: &output)
-            } else { try bert.encode(text, into: &output) }
-        } else {
-            throw TokenizerError.unsupportedComponent("offsets for model \(type(of: model))")
+            } else {
+                try bert.encode(text, into: &output)
+            }
+        }
+    }
+
+    private func encode(
+        _ text: AlignedText, byteLevel: Bool, with bpe: BPETokenizer, into output: inout [AlignedToken]
+    ) {
+        text.bytes.withUnsafeBufferPointer { bytes in
+            // The vocabulary spellings give exact source lengths, so the IDs carry the
+            // segmentation and the merges do not have to be replayed here.
+            if byteLevel ? cachedByteLengths : !bpe.hasAffixes && !bpe.ignoreMerges {
+                encodeIDs(bytes, byteLevel: byteLevel, using: bpe)
+                let derived = appendDerivedTokens(covering: bytes.count, of: text, into: &output) {
+                    byteLevel ? bpe.byteLevelSourceLength(of: $0) : bpe.sourceLength(of: $0)
+                }
+                if derived { return }
+            }
+            if bpe.ignoreMerges {
+                let spelling = byteLevel ? ByteLevelAlphabet.encode(bytes) : String(decoding: bytes, as: UTF8.self)
+                if let id = bpe.modelVocabulary.id(of: spelling) {
+                    output.append(AlignedToken(id: id, offset: text.sourceRange(0..<bytes.count)))
+                    return
+                }
+            }
+            if byteLevel {
+                bpe.byteLevelSymbols(bytes, into: &symbols)
+            } else {
+                bpe.scalarSymbols(bytes, into: &symbols)
+            }
+            if bpe.hasAffixes || symbols.contains(where: { $0.id < 0 }) {
+                bpe.referenceSymbols(bytes, byteLevel: byteLevel, into: &symbols)
+            }
+            bpe.merge(&symbols, scratch: &mergeScratch)
+            for symbol in symbols {
+                let range = Int(symbol.start)..<Int(symbol.end)
+                let origin = text.sourceRange(range)
+                if bpe.isVocabularyId(symbol.id) {
+                    output.append(AlignedToken(id: Int(symbol.id), offset: origin))
+                } else if bpe.byteFallback {
+                    let part = UnsafeBufferPointer(rebasing: bytes[range])
+                    let fallback = byteLevel ? Array(ByteLevelAlphabet.encode(part).utf8) : Array(part)
+                    for byte in fallback {
+                        let id = bpe.hexaTokenIds[Int(byte)]
+                        if id >= 0 {
+                            output.append(AlignedToken(id: Int(id), offset: origin))
+                        } else if let unknown = bpe.modelUnknownTokenId {
+                            output.append(AlignedToken(id: unknown, offset: origin))
+                        }
+                    }
+                } else if let unknown = bpe.modelUnknownTokenId {
+                    output.append(AlignedToken(id: unknown, offset: origin))
+                }
+            }
+        }
+    }
+
+    private func encode(
+        _ text: AlignedText, byteLevel: Bool, with unigram: UnigramTokenizer, into output: inout [AlignedToken]
+    ) {
+        let text = byteLevel ? text.byteLevel() : text
+        if lattice == nil { lattice = UnigramTokenizer.Lattice() }
+        text.bytes.withUnsafeBufferPointer { bytes in
+            encodeIDs(bytes, using: unigram)
+            let derived = appendDerivedTokens(covering: bytes.count, of: text, into: &output) {
+                $0 == unigram.unknownTokenId ? nil : unigram.vocabulary.byteCount(of: $0)
+            }
+            if derived { return }
+            for piece in unigram.segment(bytes, lattice: lattice!) {
+                let range = Int(piece.start)..<Int(piece.end)
+                if piece.isUnknown, unigram.byteFallback,
+                    bytes[range].allSatisfy({ unigram.byteFallbackIds[Int($0)] >= 0 })
+                {
+                    for i in range {
+                        output.append(
+                            AlignedToken(id: unigram.byteFallbackIds[Int(bytes[i])], offset: text.sourceRange(range)))
+                    }
+                } else {
+                    output.append(
+                        AlignedToken(
+                            id: Int(piece.tokenId), offset: text.sourceRange(range),
+                            spelling: Int(piece.tokenId) == unigram.unknownTokenId
+                                ? String(decoding: bytes[range], as: UTF8.self) : nil))
+                }
+            }
         }
     }
 }
@@ -154,7 +218,7 @@ extension EncodePipeline {
 
     func encode(_ text: String, model: any TokenizingModel) throws -> [AlignedToken] {
         let source = AlignedText(text)
-        let encoder = OffsetModelEncoder(model: model)
+        let encoder = try OffsetModelEncoder(model: model)
         var output: [AlignedToken] = []
         output.reserveCapacity(source.bytes.count / 3 + 4)
         var sectionStart = 0
@@ -164,9 +228,12 @@ extension EncodePipeline {
             for read in sectionStart..<output.count {
                 let token = output[read]
                 if write > sectionStart, token.id == unknown, output[write - 1].id == unknown,
-                   let previous = output[write - 1].offset, let current = token.offset {
+                    let previous = output[write - 1].offset, let current = token.offset
+                {
                     output[write - 1].offset = previous.lowerBound..<max(previous.upperBound, current.upperBound)
-                } else { output[write] = token; write += 1 }
+                } else {
+                    output[write] = token; write += 1
+                }
             }
             output.removeSubrange(write...)
         }
@@ -199,8 +266,10 @@ extension EncodePipeline {
 }
 
 extension PreTokenizationRunner {
-    func runAligned(_ text: AlignedText, flags: PreTokenizerFlags,
-                    _ body: (AlignedText, Bool) throws -> Void) throws {
+    func runAligned(
+        _ text: AlignedText, flags: PreTokenizerFlags,
+        _ body: (AlignedText, Bool) throws -> Void
+    ) throws {
         // No stages: the text is its own single piece, empty or not, exactly as for a tokenizer
         // that declares no pre-tokenizer.
         guard !stages.isEmpty else { return try body(text, false) }
@@ -215,7 +284,8 @@ extension PreTokenizationRunner {
                     next.removeAll(keepingCapacity: true)
                     for range in current {
                         let mark = next.count
-                        stage.split(UnsafeBufferPointer(rebasing: bytes[range]),
+                        stage.split(
+                            UnsafeBufferPointer(rebasing: bytes[range]),
                             flags: range.lowerBound == 0 ? flags : [], into: &next)
                         if range.lowerBound != 0 {
                             for i in mark..<next.count {
@@ -250,55 +320,25 @@ extension PreTokenizationRunner {
                 guard let rewriter = stage.source as? any ByteRewriter else {
                     throw TokenizerError.unsupportedComponent("offsets for pre-tokenizer \(type(of: stage))")
                 }
+                // Resolved once per stage, so no piece pays for a dynamic cast or rebuilds the
+                // replacement bytes.
+                let alignment = try RewriteAlignment(rewriter)
                 var next: [(AlignedText, PreTokenizerFlags)] = []
                 for (text, flags) in pieces {
                     var bytes: [UInt8] = []
                     var ranges: [Range<Int>] = []
-                    text.bytes.withUnsafeBufferPointer { rewriter.rewrite($0, flags: flags, into: &bytes, pieces: &ranges) }
+                    text.bytes.withUnsafeBufferPointer {
+                        rewriter.rewrite($0, flags: flags, into: &bytes, pieces: &ranges)
+                    }
                     var origins: [Range<Int>] = []
                     origins.reserveCapacity(bytes.count)
-                    switch rewriter {
-                    case is ByteLevelMaterializer:
-                        text.bytes.withUnsafeBufferPointer { input in
-                            var i = 0
-                            while i < input.count {
-                                let width = UTF8Cursor.width(input[i])
-                                let origin = text.sourceRange(i..<i + width)
-                                for byte in input[i..<i + width] {
-                                    let scalar = Unicode.Scalar(ByteLevelAlphabet.byteToScalar[Int(byte)])!
-                                    origins.append(contentsOf: repeatElement(origin, count: scalar.utf8.count))
-                                }
-                                i += width
-                            }
-                        }
-                    default:
-                        let replacement: [UInt8]
-                        let prefix: Bool
-                        if let metaspace = rewriter as? MetaspacePreTokenizer {
-                            replacement = Array(metaspace.stringReplacement.utf8)
-                            let marker = Array(metaspace.replacement.utf8)
-                            let needsPrefix = metaspace.prependScheme == .always
-                                || metaspace.prependScheme == .first && flags.contains(.firstSection)
-                            prefix = !text.bytes.isEmpty && needsPrefix && !text.bytes.starts(with: marker)
-                                && !(text.bytes.first == 0x20 && replacement.starts(with: marker))
-                        } else if rewriter is ByteLevelPreTokenizer.PrefixSpaceRewriter {
-                            replacement = [0x20]
-                            prefix = !text.bytes.isEmpty && text.bytes.first != 0x20
-                        } else { throw TokenizerError.unsupportedComponent("offsets for pre-tokenizer \(type(of: rewriter))") }
-                        if prefix, let first = text.bytes.first {
-                            let origin = text.sourceRange(0..<UTF8Cursor.width(first))
-                            origins.append(contentsOf: repeatElement(origin, count: replacement.count))
-                        }
-                        for (i, byte) in text.bytes.enumerated() {
-                            let count = byte == 0x20 ? replacement.count : 1
-                            origins.append(contentsOf: repeatElement(text.sourceRange(i..<i + 1), count: count))
-                        }
-                    }
+                    alignment.appendOrigins(of: text, flags: flags, to: &origins)
                     guard bytes.count == origins.count else {
                         throw TokenizerError.invalidConfiguration("Pre-tokenizer produced an invalid alignment")
                     }
                     let rewritten = AlignedText(bytes: bytes[...], origins: origins[...], sourceStart: text.sourceStart)
-                    next.append(contentsOf: ranges.filter { !$0.isEmpty }.map {
+                    next.append(
+                        contentsOf: ranges.filter { !$0.isEmpty }.map {
                             (
                                 rewritten.slice($0),
                                 rewritten.sourceRange($0).lowerBound == 0 ? PreTokenizerFlags.firstSection : []
@@ -309,5 +349,73 @@ extension PreTokenizationRunner {
             }
         }
         return pieces.map { ($0.0, byteLevel) }
+    }
+}
+
+/// How a rewriting pre-tokenizer maps the bytes it produces back to the bytes it consumed.
+///
+/// Resolved once per stage: the alignment pipeline then walks pieces without inspecting types
+/// and without rebuilding the replacement bytes for every piece.
+private enum RewriteAlignment {
+    /// Every consumed byte becomes one scalar of the byte-level alphabet.
+    case byteLevel
+    /// Every `0x20` becomes `replacement`, and a piece may gain a leading one.
+    case substitution(replacement: [UInt8], marker: [UInt8]?, scheme: MetaspacePreTokenizer.PrependScheme?)
+
+    init(_ rewriter: any ByteRewriter) throws {
+        switch rewriter {
+        case is PreTokenizationRunner.ByteLevelMaterializer:
+            self = .byteLevel
+        case let metaspace as MetaspacePreTokenizer:
+            self = .substitution(
+                replacement: Array(metaspace.stringReplacement.utf8),
+                marker: Array(metaspace.replacement.utf8), scheme: metaspace.prependScheme)
+        case is ByteLevelPreTokenizer.PrefixSpaceRewriter:
+            self = .substitution(replacement: [0x20], marker: nil, scheme: nil)
+        default:
+            throw TokenizerError.unsupportedComponent("offsets for pre-tokenizer \(type(of: rewriter))")
+        }
+    }
+
+    /// Appends the source range of every byte the rewriter produces for `text`.
+    func appendOrigins(of text: AlignedText, flags: PreTokenizerFlags, to origins: inout [Range<Int>]) {
+        switch self {
+        case .byteLevel:
+            text.bytes.withUnsafeBufferPointer { input in
+                var i = 0
+                while i < input.count {
+                    let width = UTF8Cursor.width(input[i])
+                    let origin = text.sourceRange(i..<i + width)
+                    for byte in input[i..<i + width] {
+                        let scalar = Unicode.Scalar(ByteLevelAlphabet.byteToScalar[Int(byte)])!
+                        origins.append(contentsOf: repeatElement(origin, count: scalar.utf8.count))
+                    }
+                    i += width
+                }
+            }
+        case let .substitution(replacement, marker, scheme):
+            if prefixes(text, flags: flags, replacement: replacement, marker: marker, scheme: scheme),
+                let first = text.bytes.first
+            {
+                let origin = text.sourceRange(0..<UTF8Cursor.width(first))
+                origins.append(contentsOf: repeatElement(origin, count: replacement.count))
+            }
+            for (i, byte) in text.bytes.enumerated() {
+                let count = byte == 0x20 ? replacement.count : 1
+                origins.append(contentsOf: repeatElement(text.sourceRange(i..<i + 1), count: count))
+            }
+        }
+    }
+
+    /// Whether the rewriter prepends a replacement to this piece.
+    private func prefixes(
+        _ text: AlignedText, flags: PreTokenizerFlags, replacement: [UInt8], marker: [UInt8]?,
+        scheme: MetaspacePreTokenizer.PrependScheme?
+    ) -> Bool {
+        guard !text.bytes.isEmpty else { return false }
+        guard let marker, let scheme else { return text.bytes.first != 0x20 }
+        let needed = scheme == .always || scheme == .first && flags.contains(.firstSection)
+        return needed && !text.bytes.starts(with: marker)
+            && !(text.bytes.first == 0x20 && replacement.starts(with: marker))
     }
 }

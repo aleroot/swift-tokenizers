@@ -4,7 +4,8 @@ extension AlignedText {
     func normalized(by normalizer: any ByteNormalizer) throws -> Self {
         if bytes.withUnsafeBufferPointer({ normalizer.isIdentity(on: $0) }) { return self }
         if (normalizer is BertNormalizer || normalizer is LowercaseNormalizer),
-           bytes.withUnsafeBufferPointer({ ASCII.isASCII($0) }) {
+            bytes.withUnsafeBufferPointer({ ASCII.isASCII($0) })
+        {
             var output: [UInt8] = []
             bytes.withUnsafeBufferPointer { normalizer.normalize($0, into: &output, scratch: ScratchBuffers()) }
             // ASCII case/whitespace substitutions preserve positions. Cleaning a
@@ -46,7 +47,8 @@ extension AlignedText {
             var result = Self(output)
             if bert.shouldStripAccents {
                 result = try result.unicodeForm(compatible: false, compose: false)
-                result = Self(result.units.filter {
+                result = Self(
+                    result.units.filter {
                         !TokenizerUnicode.isNonspacingMark($0.scalar.value)
                     })
             }
@@ -71,7 +73,9 @@ extension AlignedText {
                 edits.append(contentsOf: new.unicodeScalars.map { ($0, 0) })
                 if diff > 0 {
                     for i in edits.count - diff..<edits.count { edits[i].1 = 1 }
-                } else if diff < 0, !edits.isEmpty { edits[edits.count - 1].1 += diff }
+                } else if diff < 0, !edits.isEmpty {
+                    edits[edits.count - 1].1 += diff
+                }
             }
             for grapheme in text {
                 let part = String(grapheme)
@@ -80,8 +84,11 @@ extension AlignedText {
                 } else {
                     for scalar in part.unicodeScalars {
                         let part = String(scalar)
-                        if let mapped = precompiled.offsetReplacement(part) { replace(part, mapped) }
-                        else { edits.append((scalar, 0)) }
+                        if let mapped = precompiled.offsetReplacement(part) {
+                            replace(part, mapped)
+                        } else {
+                            edits.append((scalar, 0))
+                        }
                     }
                 }
             }
@@ -97,11 +104,13 @@ extension AlignedText {
         for unit in units {
             let value = unit.scalar.value
             if value < 0x80 {
-                output.append(Unit(scalar: Unicode.Scalar(value >= 65 && value <= 90 ? value + 32 : value)!, origin: unit.origin))
+                output.append(
+                    Unit(scalar: Unicode.Scalar(value >= 65 && value <= 90 ? value + 32 : value)!, origin: unit.origin))
             } else {
                 let mapped: [Unicode.Scalar]
-                if let cached = mappings[unit.scalar] { mapped = cached }
-                else {
+                if let cached = mappings[unit.scalar] {
+                    mapped = cached
+                } else {
                     mapped = Array(String(unit.scalar).lowercased().unicodeScalars)
                     mappings[unit.scalar] = mapped
                 }
@@ -112,15 +121,26 @@ extension AlignedText {
     }
 
     private func replacing(_ pattern: StringReplacePattern) throws -> Self {
+        // A literal pattern is located on the bytes: UTF-8 is self-synchronizing, so it can only
+        // match at scalar boundaries, exactly where the regex engine matches it.
+        switch pattern {
+        case let .string(_, content) where pattern.isLiteral: return replacingLiteral(pattern, with: content)
+        case let .run(_, _, content): return replacingLiteral(pattern, with: content)
+        default: break
+        }
+
         let regex: NSRegularExpression
         let replacement: String
         switch pattern {
         case let .regexp(value, content): regex = value; replacement = content
         case let .string(value, content):
-            regex = try NSRegularExpression(pattern: value.isEmpty ? "(?:)" : NSRegularExpression.escapedPattern(for: String(decoding: value, as: UTF8.self)))
+            regex = try NSRegularExpression(
+                pattern: value.isEmpty
+                    ? "(?:)" : NSRegularExpression.escapedPattern(for: String(decoding: value, as: UTF8.self)))
             replacement = String(decoding: content, as: UTF8.self)
         case let .run(byte, minimum, content):
-            regex = try NSRegularExpression(pattern: NSRegularExpression.escapedPattern(for: String(Unicode.Scalar(byte))) + "{\(minimum),}")
+            regex = try NSRegularExpression(
+                pattern: NSRegularExpression.escapedPattern(for: String(Unicode.Scalar(byte))) + "{\(minimum),}")
             replacement = String(decoding: content, as: UTF8.self)
         }
         let source = text
@@ -151,6 +171,47 @@ extension AlignedText {
         return Self(bytes: output[...], origins: origins[...], sourceStart: sourceStart)
     }
 
+    /// Replaces every match of a literal `pattern`, giving the replacement the source range of
+    /// the match's last scalar and every other byte the range of the scalar it belongs to,
+    /// which is what the regex path above produces.
+    private func replacingLiteral(_ pattern: StringReplacePattern, with content: [UInt8]) -> Self {
+        var output: [UInt8] = []
+        var origins: [Range<Int>] = []
+        output.reserveCapacity(bytes.count)
+        origins.reserveCapacity(bytes.count)
+        bytes.withUnsafeBufferPointer { input in
+            var end = 0
+            while let match = pattern.nextMatch(in: input, from: end) {
+                appendVerbatim(input, end..<match.lowerBound, into: &output, origins: &origins)
+                var previous = match.upperBound - 1
+                while previous > 0, input[previous] & 0xC0 == 0x80 { previous -= 1 }
+                let origin =
+                    match.upperBound == 0
+                    ? sourceStart..<sourceStart : sourceRange(previous..<match.upperBound)
+                output.append(contentsOf: content)
+                origins.append(contentsOf: repeatElement(origin, count: content.count))
+                end = match.upperBound
+            }
+            appendVerbatim(input, end..<input.count, into: &output, origins: &origins)
+        }
+        return Self(bytes: output[...], origins: origins[...], sourceStart: sourceStart)
+    }
+
+    /// Copies `range` unchanged, every byte of a scalar carrying that scalar's source range.
+    private func appendVerbatim(
+        _ input: UnsafeBufferPointer<UInt8>, _ range: Range<Int>,
+        into output: inout [UInt8], origins: inout [Range<Int>]
+    ) {
+        var i = range.lowerBound
+        while i < range.upperBound {
+            let end = min(i + UTF8Cursor.width(input[i]), range.upperBound)
+            let origin = sourceRange(i..<end)
+            output.append(contentsOf: UnsafeBufferPointer(rebasing: input[i..<end]))
+            origins.append(contentsOf: repeatElement(origin, count: end - i))
+            i = end
+        }
+    }
+
     private static func utf16ToByte(_ text: String) -> [Int] {
         var output = [0]
         var byte = 0
@@ -169,12 +230,15 @@ extension AlignedText {
         var decompositions: [Unicode.Scalar: [Unicode.Scalar]] = [:]
         for scalar in text.unicodeScalars {
             let properties = UnicodeNormalization.properties(of: scalar.value)
-            if properties & (compatible ? UnicodeNormalization.Property.notNFKD : UnicodeNormalization.Property.notNFD) == 0 {
+            if properties & (compatible ? UnicodeNormalization.Property.notNFKD : UnicodeNormalization.Property.notNFD)
+                == 0
+            {
                 edits.append((scalar, 0)); continue
             }
             let decomposition: [Unicode.Scalar]
-            if let cached = decompositions[scalar] { decomposition = cached }
-            else {
+            if let cached = decompositions[scalar] {
+                decomposition = cached
+            } else {
                 let value = compatible ? NFKDNormalizer.apply(String(scalar)) : NFDNormalizer.apply(String(scalar))
                 decomposition = Array(value.unicodeScalars)
                 decompositions[scalar] = decomposition
@@ -197,11 +261,13 @@ extension AlignedText {
             for edit in edits {
                 let cls = TokenizerUnicode.combiningClass(edit.0)
                 if let index = starter, lastClass == 0 || lastClass < cls,
-                   UnicodeNormalization.properties(of: edit.0.value) & UnicodeNormalization.Property.notNFC != 0 {
+                    UnicodeNormalization.properties(of: edit.0.value) & UnicodeNormalization.Property.notNFC != 0
+                {
                     let key = UInt64(output[index].0.value) << 32 | UInt64(edit.0.value)
                     let value: UInt32
-                    if let cached = compositions[key] { value = cached }
-                    else {
+                    if let cached = compositions[key] {
+                        value = cached
+                    } else {
                         let pair = NFCNormalizer.apply(String(output[index].0) + String(edit.0))
                         value = pair.unicodeScalars.count == 1 ? pair.unicodeScalars.first!.value : UInt32.max
                         compositions[key] = value

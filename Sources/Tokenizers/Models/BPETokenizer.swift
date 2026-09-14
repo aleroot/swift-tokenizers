@@ -415,7 +415,49 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
         byteFallback = tokenizerData.model.byteFallback.boolean(or: false)
     }
 
+    /// Source bytes the token with `id` stands for, or `nil` when the ID alone does not
+    /// determine it. A token normally stands for its own spelling; a `<0xNN>` byte-fallback
+    /// token stands for the single byte `NN`, which is what it was looked up for.
+    func sourceLength(of id: Int) -> Int? {
+        guard id != modelUnknownTokenId else { return nil }
+        let count = vocab.byteCount(of: id)
+        guard count > 0 else { return nil }
+        guard count == Self.hexaTokenLength, byteFallback, isHexaToken(id) else { return count }
+        return 1
+    }
+
+    /// Source bytes the token with `id` stands for in a byte-level model, where every source
+    /// byte is spelled as exactly one scalar of the byte-level alphabet.
+    func byteLevelSourceLength(of id: Int) -> Int? {
+        let scalars = vocab.withBytes(of: id) { spelling in
+            spelling.reduce(0) { $0 + ($1 & 0xC0 == 0x80 ? 0 : 1) }
+        }
+        return scalars > 0 ? scalars : nil
+    }
+
+    /// Whether `id` is the `<0xNN>` token standing for a single byte.
+    private func isHexaToken(_ id: Int) -> Bool {
+        func digit(_ byte: UInt8) -> Int? {
+            switch byte {
+            case UInt8(ascii: "0")...UInt8(ascii: "9"): Int(byte - UInt8(ascii: "0"))
+            case UInt8(ascii: "A")...UInt8(ascii: "F"): Int(byte - UInt8(ascii: "A")) + 10
+            default: nil
+            }
+        }
+        let byte = vocab.withBytes(of: id) { spelling -> UInt8? in
+            guard spelling[0] == UInt8(ascii: "<"), spelling[1] == UInt8(ascii: "0"),
+                spelling[2] == UInt8(ascii: "x"), spelling[5] == UInt8(ascii: ">"),
+                let high = digit(spelling[3]), let low = digit(spelling[4])
+            else { return nil }
+            return UInt8(high << 4 | low)
+        }
+        // The vocabulary can spell a token like a byte token without it being one.
+        guard let byte else { return false }
+        return hexaTokenIds[Int(byte)] == Int32(id)
+    }
+
     /// `<0x00>` … `<0xFF>`
+    static let hexaTokenLength = 6
     static let hexaTokenStrings: [String] = {
         let digits = Array("0123456789ABCDEF".utf8)
         let angleOpen = UInt8(ascii: "<"), angleClose = UInt8(ascii: ">")

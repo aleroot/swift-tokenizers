@@ -912,10 +912,47 @@ enum StringReplacePattern: Sendable {
                 to: &output)
         case let .string(pattern, replacement):
             Self.replaceLiteral(bytes, pattern: pattern, with: replacement, into: &output)
-        case let .run(byte, minimum, replacement):
-            var i = 0
+        case let .run(_, _, replacement):
             var cursor = 0
+            while let match = nextMatch(in: bytes, from: cursor) {
+                output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[cursor..<match.lowerBound]))
+                output.append(contentsOf: replacement)
+                cursor = match.upperBound
+            }
+            output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[cursor..<bytes.count]))
+        }
+    }
+
+    /// Whether matches can be located on the bytes. `.regexp` needs the engine, and an empty
+    /// literal matches at every position, which only the engine reproduces.
+    var isLiteral: Bool {
+        switch self {
+        case .regexp: false
+        case let .string(pattern, _): !pattern.isEmpty
+        case .run: true
+        }
+    }
+
+    /// The first match at or after `from`, for a pattern that ``isLiteral``.
+    func nextMatch(in bytes: UnsafeBufferPointer<UInt8>, from: Int) -> Range<Int>? {
+        switch self {
+        case .regexp:
+            return nil
+        case let .string(pattern, _):
+            guard let first = pattern.first, let base = bytes.baseAddress else { return nil }
             let n = bytes.count
+            let m = pattern.count
+            var i = from
+            while i + m <= n {
+                guard let hit = memchr(base + i, Int32(first), n - m + 1 - i) else { return nil }
+                let start = UnsafePointer<UInt8>(hit.assumingMemoryBound(to: UInt8.self)) - base
+                if m == 1 || memcmp(base + start, pattern, m) == 0 { return start..<start + m }
+                i = start + 1
+            }
+            return nil
+        case let .run(byte, minimum, _):
+            let n = bytes.count
+            var i = from
             while i < n {
                 guard bytes[i] == byte else {
                     i += 1
@@ -923,14 +960,10 @@ enum StringReplacePattern: Sendable {
                 }
                 var j = i + 1
                 while j < n, bytes[j] == byte { j += 1 }
-                if j - i >= minimum {
-                    output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[cursor..<i]))
-                    output.append(contentsOf: replacement)
-                    cursor = j
-                }
+                if j - i >= minimum { return i..<j }
                 i = j
             }
-            output.append(contentsOf: UnsafeBufferPointer(rebasing: bytes[cursor..<n]))
+            return nil
         }
     }
 
@@ -941,37 +974,13 @@ enum StringReplacePattern: Sendable {
             return true  // unknown without running the engine; treat as a potential match
         case let .string(pattern, _):
             if pattern.isEmpty { return !bytes.isEmpty }
-            guard let first = pattern.first, pattern.count <= bytes.count, let base = bytes.baseAddress else {
-                return false
-            }
-            var i = 0
-            let n = bytes.count
-            let m = pattern.count
-            while i + m <= n {
-                guard let hit = memchr(base + i, Int32(first), n - m + 1 - i) else { return false }
-                let p = UnsafePointer<UInt8>(hit.assumingMemoryBound(to: UInt8.self)) - base
-                if m == 1 || memcmp(base + p, pattern, m) == 0 { return true }
-                i = p + 1
-            }
-            return false
+            return nextMatch(in: bytes, from: 0) != nil
         case let .run(byte, minimum, _):
-            let n = bytes.count
-            if minimum <= 1 { return ByteKernels.firstIndex(of: byte, in: bytes, from: 0) < n }
+            if minimum <= 1 { return ByteKernels.firstIndex(of: byte, in: bytes, from: 0) < bytes.count }
             // A run of `minimum` needs two adjacent occurrences; that check is one SIMD pass.
             guard ByteKernels.containsRepeat(of: byte, in: bytes) else { return false }
             if minimum == 2 { return true }
-            var i = 0
-            while i < n {
-                guard bytes[i] == byte else {
-                    i += 1
-                    continue
-                }
-                var j = i + 1
-                while j < n, bytes[j] == byte { j += 1 }
-                if j - i >= minimum { return true }
-                i = j
-            }
-            return false
+            return nextMatch(in: bytes, from: 0) != nil
         }
     }
 
