@@ -1,14 +1,15 @@
 import Foundation
 
-/// jinja2 whitespace-control semantics that swift-jinja (≤ 2.5.0) does not implement.
+/// Preserve jinja2 whitespace-control semantics around comments and literal braces.
 ///
 /// swift-jinja applies whitespace control (`{{-`, `{%-`, `-}}`, `-%}`) with a
-/// source-level regex pass before lexing. That pass has two gaps, both exercised by
-/// the Gemma 4 chat template:
+/// source-level regex pass before lexing. Two cases exercised by the Gemma 4 chat
+/// template motivated this pre-pass:
 ///
-/// 1. **Comments are invisible to it.** `{#-` must strip all whitespace before the
+/// 1. **Comment strip markers were ignored before 2.5.1.** `{#-` strips whitespace before the
 ///    comment and `-#}` all whitespace after it (comments themselves never produce
-///    output). swift-jinja leaves the adjacent whitespace in place.
+///    output). Version 2.5.1 handles these markers, but comment rewriting remains
+///    necessary for the literal-brace interaction described below.
 /// 2. **A literal `{` before a stripped tag keeps one space.** To avoid merging the
 ///    literal brace with the tag delimiter, swift-jinja rewrites `{\s+{{-` as `{ {{`,
 ///    emitting a spurious space. jinja2 strips the whitespace entirely: `{ {{- x -}}`
@@ -24,9 +25,9 @@ import Foundation
 ///   the expression `{{ '{' }}`, which renders the same character but cannot merge
 ///   with the following delimiter.
 ///
-/// The scanner is template-structure aware: contents of `{{ … }}` / `{% … %}` tags
-/// (including quoted strings) are copied verbatim, so `{#` or `{` inside an
-/// expression's string literal is never rewritten.
+/// The scanner respects quoted strings inside `{{ … }}` / `{% … %}` tags. Hashes
+/// inside those strings are escaped for swift-jinja's lexer so its source-level
+/// whitespace pass cannot interpret literal comment markers as template syntax.
 enum ChatTemplatePreprocessor {
     /// Apply the same template options for normal rendering and public-AST generation tracking.
     static func preparedSource(_ source: String) -> String {
@@ -44,7 +45,10 @@ enum ChatTemplatePreprocessor {
         var source = source.replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
         if source.hasSuffix("\n") { source.removeLast() }
-        guard source.contains("{#") || source.contains("{ ") || source.contains("{\n") || source.contains("{\t") else {
+        guard
+            source.contains("{#") || source.contains("-#}") || source.contains("{ ") || source.contains("{\n")
+                || source.contains("{\t")
+        else {
             return source
         }
         var scalars = Substring(source)
@@ -85,7 +89,7 @@ enum ChatTemplatePreprocessor {
         return nil
     }
 
-    /// Copies a `{{ … }}` / `{% … %}` tag verbatim, respecting quoted strings.
+    /// Copies a tag while shielding quoted hashes from swift-jinja's regex pass.
     private static func copyTag(_ scalars: inout Substring, into out: inout String) {
         let close: String = scalars.hasPrefix("{{") ? "}}" : "%}"
         out.append(scalars.removeFirst())
@@ -94,6 +98,11 @@ enum ChatTemplatePreprocessor {
         var escaped = false
         while !scalars.isEmpty {
             let c = scalars.removeFirst()
+            if quote != nil, !escaped, c == "#" {
+                // swift-jinja 2.5.1 strips literal `{#-` / `-#}` before lexing.
+                // Its string lexer decodes `\#` back to `#`, preserving the value.
+                out.append("\\")
+            }
             out.append(c)
             if let q = quote {
                 if escaped {

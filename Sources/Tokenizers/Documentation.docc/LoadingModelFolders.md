@@ -16,6 +16,7 @@ A folder downloaded from the Hugging Face Hub usually contains everything needed
 | `tokenizer.json` | The complete tokenizer: vocabulary, merges, and the whole pipeline |
 | `tokenizer_config.json` | Special tokens, the `tokenizer_class`, the chat template |
 | `config.json` | Model metadata, used only to infer a missing `tokenizer_class` |
+| `special_tokens_map.json` | Legacy special-token names and attributes missing from the tokenizer configuration |
 | `chat_template.jinja` or `chat_template.json` | A chat template kept in its own file |
 
 ``AutoTokenizer/load(from:strict:)`` reads them and returns a ready ``Tokenizer``. Nothing
@@ -24,6 +25,30 @@ else in the folder is touched, so weights can sit next to the tokenizer without 
 If a chat template file is present it wins over the `chat_template` field inside
 `tokenizer_config.json`, and `chat_template.jinja` wins over `chat_template.json`. This is the
 same precedence the Python `AutoProcessor` applies.
+
+A valid `tokenizer.json` can also be loaded on its own. Without companion configuration,
+the serialized pipeline is authoritative; class-specific metadata and chat templates are not
+guessed from vocabulary spelling.
+
+### Special-token metadata
+
+Explicit values in `tokenizer_config.json`, including null, take precedence. Missing fields
+are filled from `special_tokens_map.json`, then supported class defaults. RoBERTa/XLM-R use
+`<s>`, `</s>` and `<unk>`; GPT-2 uses `<|endoftext|>` for BOS, EOS and UNK. Phi-4 declares
+GPT-2 as its tokenizer class, so it inherits the UNK default while keeping its explicit EOS.
+Defaults expose existing vocabulary IDs; they never invent or append vocabulary entries.
+
+These defaults follow the [RoBERTa](https://huggingface.co/docs/transformers/model_doc/roberta),
+[XLM-RoBERTa](https://huggingface.co/docs/transformers/model_doc/xlm-roberta) and
+[GPT-2 tokenizer definitions](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/gpt2/tokenization_gpt2.py).
+The precedence is this library's consistent folder-loading contract; older Transformers
+versions treat legacy maps differently depending on whether `added_tokens_decoder` exists.
+
+`config.json` and `generation_config.json` stop IDs belong to model generation. They do not
+replace tokenizer token names or collapse multiple stop IDs into ``Tokenizer/eosTokenId``.
+MLX handles those generation settings separately. Likewise, exposing BOS metadata does not
+insert BOS into the encoded sequence: the serialized post-processor and supported wrapper
+settings govern insertion.
 
 ### When `tokenizer.json` is absent
 
@@ -49,10 +74,10 @@ hit that, export a `tokenizer.json` from `transformers` and ship it.
 let tokenizer = try AutoTokenizer.load(from: folder, strict: true)   // the default
 ```
 
-With `strict: true` an unrecognized `tokenizer_class` is an error. With `strict: false` the
-loader falls back to the generic pipeline, which is useful for a new model family whose class
-name this library has not seen but whose `tokenizer.json` is ordinary. Prefer the default and
-find out early.
+A supported `model.type` in `tokenizer.json` is authoritative, even with an unfamiliar
+`tokenizer_class`. If `model.type` is missing, strict mode requires a recognized class;
+`strict: false` permits the legacy BPE fallback. An explicitly unsupported model type or
+pipeline component still throws in either mode. Keep strict mode enabled for normal loading.
 
 ### Configuration you already hold
 

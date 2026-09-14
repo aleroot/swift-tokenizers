@@ -34,7 +34,7 @@ public extension AutoTokenizer {
     /// - Parameters:
     ///   - tokenizerConfig: The contents of `tokenizer_config.json`.
     ///   - tokenizerData: The contents of `tokenizer.json`.
-    ///   - strict: When `true`, unknown `tokenizer_class` values throw instead of falling back to BPE.
+    ///   - strict: When `true`, a missing model type requires a recognized `tokenizer_class`.
     static func from(tokenizerConfig: Config, tokenizerData: Config, strict: Bool = true) throws -> any Tokenizer {
         let tokenizerClass = tokenizerClass(for: tokenizerConfig)
         return try tokenizerClass.init(tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData, strict: strict)
@@ -51,9 +51,7 @@ public extension AutoTokenizer {
     /// Synchronous variant of ``from(modelFolder:strict:)``.
     static func load(from modelFolder: URL, strict: Bool = true) throws -> any Tokenizer {
         let configuration = try LocalModelConfiguration(modelFolder: modelFolder)
-        guard let tokenizerConfig = configuration.tokenizerConfig else {
-            throw TokenizerError.missingFile(modelFolder.appendingPathComponent("tokenizer_config.json"))
-        }
+        let tokenizerConfig = configuration.tokenizerConfig ?? Config()
         // Same construction as `from(tokenizerConfig:tokenizerData:)`: LlamaTokenizerFast and
         // GemmaTokenizerFast always call `update_post_processor()` in Python, including when
         // `from_pretrained` loads a folder whose `tokenizer.json` only serializes ByteLevel.
@@ -171,6 +169,15 @@ public struct LocalModelConfiguration: Sendable {
             tokenizerConfig = try Config(jsonFile: tokenizerConfigURL)
         }
 
+        let specialMapURL = modelFolder.appendingPathComponent("special_tokens_map.json")
+        if fm.fileExists(atPath: specialMapURL.path) {
+            var values = tokenizerConfig?.dictionary(or: [:]) ?? [:]
+            for (key, value) in try Config(jsonFile: specialMapURL).dictionary(or: [:]) where values[key] == nil {
+                values[key] = value
+            }
+            tokenizerConfig = Config(values)
+        }
+
         if let serializedData {
             tokenizerData = serializedData
         } else {
@@ -208,25 +215,24 @@ public struct LocalModelConfiguration: Sendable {
 
     /// The tokenizer configuration with class inference and fallbacks applied.
     public var tokenizerConfig: Config? {
-        if let hubConfig = rawTokenizerConfig {
-            if hubConfig.tokenizerClass.string() != nil { return hubConfig }
-            guard let modelType else { return hubConfig }
+        SpecialTokenDefaults.applying(to: inferredTokenizerConfig)
+    }
 
-            if let fallback = Self.fallbackTokenizerConfig(for: modelType) {
-                // Values present in the repository's config take precedence over the fallback.
-                let merged = fallback.dictionary(or: [:]).merging(hubConfig.dictionary(or: [:])) { _, fromRepo in
-                    fromRepo
-                }
-                return Config(merged)
+    private var inferredTokenizerConfig: Config {
+        let supplied = rawTokenizerConfig ?? Config()
+        if supplied.tokenizerClass.string() != nil { return supplied }
+        guard let modelType else { return supplied }
+
+        if let fallback = Self.fallbackTokenizerConfig(for: modelType) {
+            let merged = fallback.dictionary(or: [:]).merging(supplied.dictionary(or: [:])) { _, fromRepo in
+                fromRepo
             }
-
-            var configuration = hubConfig.dictionary(or: [:])
-            configuration["tokenizer_class"] = Config("\(modelType.capitalized)Tokenizer")
-            return Config(configuration)
+            return Config(merged)
         }
 
-        guard let modelType else { return nil }
-        return Self.fallbackTokenizerConfig(for: modelType)
+        var configuration = supplied.dictionary(or: [:])
+        configuration["tokenizer_class"] = Config("\(modelType.capitalized)Tokenizer")
+        return Config(configuration)
     }
 
     /// Bundled fallback configuration for a `model_type`, if any (`gpt2`, `t5`).

@@ -389,9 +389,9 @@ final class EncodeScratch {
     ///
     /// - Parameters:
     ///   - identity: the model's identity, which the tokenizer resolves once so the check costs
-    ///     no reference counting. It is what makes reuse safe: a scratch outlives the tokenizer
-    ///     it was lent to, so it can be handed to a different tokenizer whose model needs a
-    ///     different encoder. Comparing identities is sound because the encoder holds its model,
+    ///     no model reference counting. Cached encoders are specific to a model; the identity
+    ///     check prevents reuse with another model. Comparing identities is sound because
+    ///     the encoder holds its model,
     ///     so an equal identity is necessarily the same live object.
     ///   - make: builds the encoder, or answers `nil` when the model has no byte-level path. It
     ///     runs at most once per model per scratch, which is where the caller can afford to read
@@ -422,60 +422,75 @@ final class EncodeScratch {
     }
 }
 
-/// Lends each encoding thread its own ``EncodeScratch``, so concurrent callers never share
-/// buffers and a repeat caller reuses the same allocations. Ownership is genuinely
-/// thread-local: the hot path is one thread-specific load and no atomic. A pool carries no
-/// state of its own; it is the identity under which its tokenizer's scratches are filed.
-///
-/// Striping a free list by the thread handle is not an option on Darwin, where handles are
-/// evenly spaced stack addresses: hashing them collapses many threads onto a few stripes, and
-/// a starved stripe reallocates the scratch (and with it the model's ``PieceEncoder``, its
-/// lattice or merge buffers and its pretoken cache) on nearly every call.
+/// Owns the reusable buffers for this tokenizer. TLS only keeps weak handles, so
+/// releasing the tokenizer releases its models and scratch on every encoding thread.
 final class EncodeScratchPool: Sendable {
-    /// Per-thread storage for every pool in the process, so the library holds one
-    /// thread-specific key however many tokenizers are alive.
     private static let store = ThreadScratchStore()
+    private let slots = Locked<[ObjectIdentifier: Slot]>([:])
+
+    /// The registry only retains slots; it never reads their scratch. Scratch is accessed
+    /// exclusively by the thread that registered the slot, with active calls retaining it.
+    fileprivate final class Slot: @unchecked Sendable {
+        var scratch: EncodeScratch?
+    }
+
+    fileprivate func register() -> Slot {
+        let slot = Slot()
+        slots.withLock { $0[ObjectIdentifier(slot)] = slot }
+        return slot
+    }
+
+    fileprivate func unregister(_ identity: ObjectIdentifier) {
+        // Release buffers outside the registry lock.
+        let removed = slots.withLock { $0.removeValue(forKey: identity) }
+        withExtendedLifetime(removed) {}
+    }
 
     @inline(__always)
     func take() -> EncodeScratch {
-        Self.store.take(owner: ObjectIdentifier(self))
+        guard let slot = Self.store.slot(for: self) else { return EncodeScratch() }
+        let scratch = slot.scratch
+        slot.scratch = nil  // Nested encodes must use separate buffers.
+        return scratch ?? EncodeScratch()
     }
 
     @inline(__always)
     func recycle(_ scratch: EncodeScratch) {
         guard scratch.reusable else { return }
-        Self.store.put(scratch, owner: ObjectIdentifier(self))
+        Self.store.slot(for: self)?.scratch = scratch
     }
 }
 
-/// The thread-specific side of ``EncodeScratchPool``: one cache per thread, holding the
-/// scratch most recently lent to each of a few pools. Entries are keyed by pool because a
-/// scratch caches a ``PieceEncoder`` built for one model and a thread may encode with several
-/// tokenizers. A cache is released when its thread exits, so buffers never outlive their user
-/// and the number of live scratch objects stays bounded by the number of encoding threads.
-/// The only stored property is the immutable, sendable pthread key. The non-sendable cache
-/// lives in pthread TLS, is accessed synchronously, and is never shared between threads.
+/// A bounded weak index into tokenizer-owned storage. Registration and eviction take
+/// the owning pool's lock; the warm encode path only accesses its thread's slot.
 private final class ThreadScratchStore: Sendable {
-    /// How many tokenizers one thread can alternate between before evicting a scratch. Kept
-    /// small because an entry holds a model's encoder, so a stale entry keeps that model alive
-    /// until the thread encodes with enough other tokenizers to evict it, or exits.
     private static let entriesPerThread = 2
 
-    /// A thread's scratches. Only ever touched by that thread, so it needs no synchronisation.
     private final class Cache {
-        struct Entry {
+        final class Entry {
             let owner: ObjectIdentifier
-            let scratch: EncodeScratch
+            let identity: ObjectIdentifier
+            weak var pool: EncodeScratchPool?
+            weak var slot: EncodeScratchPool.Slot?
+
+            init(pool: EncodeScratchPool, slot: EncodeScratchPool.Slot) {
+                owner = ObjectIdentifier(pool)
+                identity = ObjectIdentifier(slot)
+                self.pool = pool
+                self.slot = slot
+            }
+
+            deinit { pool?.unregister(identity) }
         }
 
         var entries = [Entry?](repeating: nil, count: ThreadScratchStore.entriesPerThread)
+        var nextEviction = 0
     }
 
     private let key: pthread_key_t
 
     init() {
         var key = pthread_key_t()
-        // Darwin declares the destructor's argument non-optional, other platforms optional.
         #if canImport(Darwin)
             let result = pthread_key_create(&key) { Unmanaged<Cache>.fromOpaque($0).release() }
         #else
@@ -484,41 +499,27 @@ private final class ThreadScratchStore: Sendable {
                 Unmanaged<Cache>.fromOpaque(pointer).release()
             }
         #endif
-        // Never interpret another TLS slot as a Cache if the process has exhausted its keys.
         precondition(result == 0, "Unable to allocate tokenizer scratch TLS key")
         self.key = key
     }
 
-    /// Hands over the calling thread's scratch for `owner`, taking it out of the cache so that
-    /// a nested encode on the same thread gets its own buffers rather than sharing these.
     @inline(__always)
-    func take(owner: ObjectIdentifier) -> EncodeScratch {
-        guard let cache = cache(creating: false) else { return EncodeScratch() }
-        for index in 0..<Self.entriesPerThread {
-            guard let entry = cache.entries[index], entry.owner == owner else { continue }
-            cache.entries[index] = nil
-            return entry.scratch
+    func slot(for pool: EncodeScratchPool) -> EncodeScratchPool.Slot? {
+        guard let cache = cache(creating: true) else { return nil }
+        let owner = ObjectIdentifier(pool)
+        for entry in cache.entries {
+            if let entry, entry.owner == owner, let slot = entry.slot { return slot }
         }
-        return EncodeScratch()
+        return register(pool, in: cache)
     }
 
-    /// Returns `scratch` to the calling thread's cache, replacing this pool's entry if it has
-    /// one, filling a free slot if there is one, and otherwise evicting the last entry.
-    @inline(__always)
-    func put(_ scratch: EncodeScratch, owner: ObjectIdentifier) {
-        guard let cache = cache(creating: true) else { return }
-        var slot = Self.entriesPerThread - 1
-        for index in 0..<Self.entriesPerThread {
-            guard let entry = cache.entries[index] else {
-                slot = index
-                break
-            }
-            if entry.owner == owner {
-                slot = index
-                break
-            }
-        }
-        cache.entries[slot] = Cache.Entry(owner: owner, scratch: scratch)
+    @inline(never)
+    private func register(_ pool: EncodeScratchPool, in cache: Cache) -> EncodeScratchPool.Slot {
+        let slot = pool.register()
+        let index = cache.entries.firstIndex { $0?.slot == nil } ?? cache.nextEviction
+        cache.nextEviction = (index + 1) % Self.entriesPerThread
+        cache.entries[index] = Cache.Entry(pool: pool, slot: slot)
+        return slot
     }
 
     /// The calling thread's cache, created on demand when `creating`.

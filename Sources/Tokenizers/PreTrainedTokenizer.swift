@@ -78,6 +78,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     // MARK: - Initialization
 
     public required init(tokenizerConfig: Config, tokenizerData: Config, strict: Bool = true) throws {
+        let tokenizerConfig = SpecialTokenDefaults.applying(to: tokenizerConfig)
         var addedTokens: [String: Int] = [:]
         var specialTokens: [String: Int] = [:]
         var specialTokenIds: Set<Int> = []

@@ -1,5 +1,5 @@
-// A JSON-like configuration tree with dynamic member lookup, source-compatible with
-// swift-transformers' `Config`.
+// A JSON-like configuration tree with the construction and lookup conventions used by
+// swift-transformers. Packed storage remains an implementation detail.
 
 import Foundation
 import Jinja

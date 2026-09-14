@@ -57,6 +57,15 @@ struct ChatTemplatePreprocessorTests {
         #expect(try render("{{ '{ x' }}") == "{ x")
     }
 
+    @Test("Quoted comment markers retain their dashes, whitespace, and escapes")
+    func commentMarkersInStringLiterals() throws {
+        #expect(try render("{{ 'A {#- c -#} B' }}") == "A {#- c -#} B")
+        #expect(try render("{{ \"-#}  tail\" }}") == "-#}  tail")
+        #expect(try render("{% set marker = '{#-' %}{{ marker }}") == "{#-")
+        #expect(try render(#"{{ 'it\'s {#-' }}"#) == "it's {#-")
+        #expect(try render(#"{{ '\\{#-' }}"#) == #"\{#-"#)
+    }
+
     @Test("Plain comment keeps segmentation; trim_blocks removes one newline after")
     func commentSegmentation() throws {
         // jinja2 (trim_blocks/lstrip_blocks): 'A\nB' — the comment blocks the

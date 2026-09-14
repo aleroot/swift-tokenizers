@@ -13,9 +13,9 @@
 swift-tokenizers is a native Swift 6 implementation of the tokenizers used by today's language
 models: byte-level and SentencePiece **BPE**, **Unigram**, **WordPiece** and **WordLevel**. It
 loads `tokenizer.json` files published on the Hugging Face Hub, with inference checked against
-Hugging Face references. It ships as a drop-in replacement for the
-`Tokenizers` product of
-[swift-transformers](https://github.com/huggingface/swift-transformers), plugs seamlessly into
+Hugging Face references. It replaces the local inference APIs of the
+`Tokenizers` product in
+[swift-transformers](https://github.com/huggingface/swift-transformers), integrates with
 [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm), and is the tokenizer behind
 [Lampo](https://apps.apple.com/app/lampo/id6760648195).
 
@@ -39,11 +39,12 @@ let text = tokenizer.decode(tokens: ids)          // "Hello world"
   added and special tokens, chat templates with tools and assistant masks, source offsets,
   sequence pairs with segment ids, streaming decoding, special-token-aware truncation and O(1)
   vocabulary lookup. Tokenizer training, nonzero BPE dropout and padding are out of scope.
-- **Drop-in.** Same `Tokenizer`, `PreTrainedTokenizer`, `AutoTokenizer`, `Config` and
-  `TokenizerError` API as swift-transformers; existing consumers compile unchanged.
+- **Familiar inference API.** Keep `import Tokenizers` and ordinary encode, decode, chat and
+  vocabulary calls. Folder loading and MLX adapters are supported; Hub services and every
+  historical public helper are not part of the compatibility contract. See [migration](#migrating-from-swift-transformers).
 - **Lean.** One dependency, [swift-jinja](https://github.com/huggingface/swift-jinja), for chat
-  templates. No Hub client, no downloader. Every tokenizer is `Sendable`, and concurrent encodes
-  on a single instance scale across cores without blocking.
+  templates. No Hub client, no downloader. Every tokenizer is `Sendable`; concurrent encodes
+  share immutable model tables and use separate scratch buffers.
 
 ## Installation
 
@@ -152,12 +153,12 @@ for Hugging Face's Rust core and 1.0 MiB/s for swift-transformers, and it loads 
 `tokenizer.json` in **15.7 ms** against 89.9 ms.
 
 Every tokenizer family, embedding and reranker models, end-to-end figures through mlx-swift-lm,
-cold-cache runs, concurrency scaling, methodology and how to reproduce all of it:
+cold-cache runs, concurrency scaling and measurement methodology:
 **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 
 ## Migrating from swift-transformers
 
-The `Tokenizers` module is source-compatible; swap the package dependency:
+For local inference, keep the `Tokenizers` module name and swap the package dependency:
 
 ```swift
 // before
@@ -171,11 +172,16 @@ The `Tokenizers` module is source-compatible; swap the package dependency:
 
 - mlx-swift-lm's `#huggingFaceTokenizerLoader()` and `#adaptHuggingFaceTokenizer` macros work
   unchanged.
-- `Config` now lives in `Tokenizers`; drop `import Hub` where that was all you needed.
+- `Config` now lives in `Tokenizers`; drop `import Hub` when you only use its value-building
+  and lookup APIs. `Config.Data` is internal and `ConfigError` is not provided; use `Config`
+  accessors and handle `JSONConfigError` or `TokenizerError` at the operation that throws.
 - `AutoTokenizer.from(pretrained:)` becomes a download step followed by
   `AutoTokenizer.from(modelFolder:)`; `LanguageModelConfigurationFromHub(modelFolder:)` becomes
   `LocalModelConfiguration(modelFolder:)`.
 - Pipeline component initializers are `init(config:) throws`.
+
+For an app using mlx-swift-lm, start with the [MLX integration guide](Sources/Tokenizers/Documentation.docc/UsingWithMLX.md).
+It covers local model loading, chat, embeddings and the ownership boundary with your downloader.
 
 ## License
 

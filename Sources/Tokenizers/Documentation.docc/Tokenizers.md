@@ -45,6 +45,7 @@ tasks at once. Load it once, share it, never copy it per request.
 ### Essentials
 
 - <doc:GettingStarted>
+- <doc:UsingWithMLX>
 - <doc:LoadingModelFolders>
 - ``AutoTokenizer``
 - ``Tokenizer``

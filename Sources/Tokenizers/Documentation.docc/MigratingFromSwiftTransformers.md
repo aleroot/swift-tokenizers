@@ -1,11 +1,12 @@
 # Migrating from swift-transformers
 
-Swap one package line. Most code does not change at all.
+Keep familiar inference calls while moving local tokenizer loading to this package.
 
 ## Overview
 
-The module name, the types and the call sites stay the same. This is the short list of what
-does not.
+The supported compatibility surface is local loading, ordinary encoding and decoding, chat
+templates, special-token metadata and vocabulary lookup. This does not promise source or
+behavioral identity for every public swift-transformers or Hub helper.
 
 ### The swap
 
@@ -19,15 +20,17 @@ does not.
 .product(name: "Tokenizers", package: "swift-tokenizers"),
 ```
 
-The module keeps the name `Tokenizers`, and ``Tokenizer``, ``PreTrainedTokenizer``,
-``AutoTokenizer``, ``Config`` and ``TokenizerError`` keep their shapes. mlx-swift-lm's
-`#huggingFaceTokenizerLoader()` and `#adaptHuggingFaceTokenizer` macros expand unchanged.
+The module keeps the name `Tokenizers`. Common calls on ``Tokenizer``,
+``PreTrainedTokenizer`` and ``AutoTokenizer`` retain their labels. mlx-swift-lm's
+`#huggingFaceTokenizerLoader()` and `#adaptHuggingFaceTokenizer` macros use this interface;
+see <doc:UsingWithMLX> for a complete local-loading example.
 
 ### What does change
 
 | swift-transformers | here |
 |---|---|
-| `import Hub` for `Config` | `Config` lives in `Tokenizers` |
+| `import Hub` for `Config` | `Config` construction and lookup live in `Tokenizers` |
+| `Config.Data` and `ConfigError` | Internal storage is not public; use `Config` accessors and the errors documented by each operation |
 | `AutoTokenizer.from(pretrained:)` | download with your own client, then ``AutoTokenizer/from(modelFolder:strict:)`` |
 | `LanguageModelConfigurationFromHub(modelFolder:)` | ``LocalModelConfiguration`` |
 | `init(config:)` on pipeline components | `init(config:) throws` |
@@ -53,9 +56,13 @@ corpus by corpus, not against swift-transformers. Where the two disagree, the re
 the evidence for each case are recorded in
 [BENCHMARKS.md](https://github.com/aleroot/swift-tokenizers/blob/main/docs/BENCHMARKS.md).
 
-The differences found in end to end testing were all cases where swift-transformers diverged
-from Hugging Face: a missing BOS token on one model family, decode errors on unusual byte
-sequences, and chat template keys rendered in a different order.
+Validated improvements include honoring exported BOS settings and preserving serialized
+normalization pipelines. Baseline agreement is not a correctness oracle: both Swift libraries
+also inherit Jinja differences when templates stringify dictionaries or null values. Standard
+JSON serialization with `tojson` avoids those particular representation differences. Check the
+actual templates and prompts your app uses, especially tools and structured message content.
+
+For loading behavior, strictness and metadata precedence, see <doc:LoadingModelFolders>.
 
 ### What you gain besides speed
 
