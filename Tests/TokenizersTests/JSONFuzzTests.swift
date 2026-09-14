@@ -110,4 +110,52 @@ struct JSONFuzzTests {
             }
         }
     }
+
+    /// A corrupt `tokenizer.json` must fail to load, not trap. Parsing is only the first
+    /// half: a mutation can leave valid JSON whose vocabulary, merge list or Unigram scores
+    /// are inconsistent, and the vocabulary, merge table and trie builders have to reject
+    /// that rather than index out of range.
+    @Test("Mutated configurations build a working tokenizer or throw")
+    func mutatedTokenizerConstruction() throws {
+        var rng = SeededGenerator(seed: 20260914)
+        let seeds = [
+            #"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2,"c":3,"abc":4},"merges":[["a","b"],["ab","c"]]}}"#,
+            #"{"model":{"type":"Unigram","vocab":[["<unk>",0.0],["a",-1.25],["ab",-2.5],["b",-3.0]],"unk_id":0}}"#,
+            ###"{"model":{"type":"WordPiece","vocab":{"[UNK]":0,"a":1,"##b":2},"unk_token":"[UNK]"}}"###,
+            #"{"added_tokens":[{"id":2,"content":"[X]","lstrip":true,"special":true}],"model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[["a","b"]]},"normalizer":{"type":"NFC"},"pre_tokenizer":{"type":"Whitespace"}}"#,
+        ]
+        var built = 0
+        var rejected = 0
+        for seed in seeds {
+            let bytes = Array(seed.utf8)
+            for _ in 0..<600 {
+                var mutated = bytes
+                for _ in 0..<Int(rng.next() % 4 + 1) {
+                    mutated[Int(rng.next() % UInt64(mutated.count))] = UInt8(truncatingIfNeeded: rng.next())
+                }
+                guard let data = try? Config(tokenizerJSON: Data(mutated)) else {
+                    rejected += 1
+                    continue
+                }
+                do {
+                    let tokenizer = try AutoTokenizer.from(tokenizerConfig: [:], tokenizerData: data, strict: false)
+                    built += 1
+                    // Exercise the built tables: a malformed vocabulary must not survive as
+                    // one that indexes out of range on the first encode.
+                    for text in ["", "a", "abc b", "é😀 \u{301}", String(repeating: "ab", count: 200)] {
+                        let ids = tokenizer.encode(text: text)
+                        _ = tokenizer.decode(tokens: ids)
+                        for id in ids { _ = tokenizer.convertIdToToken(id) }
+                    }
+                } catch is TokenizerError {
+                    rejected += 1
+                } catch is JSONConfigError {
+                    rejected += 1
+                }
+            }
+        }
+        // The corpus has to exercise both outcomes for the test to mean anything.
+        #expect(built > 0)
+        #expect(rejected > 0)
+    }
 }

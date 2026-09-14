@@ -147,4 +147,69 @@ struct SendableTests {
         }
         #expect(tokenizer.compiledChatTemplateCount <= 16)
     }
+
+    /// The merge table's symbols are resolved across cores when `tokenizer.json` supplies a
+    /// packed merge list, and one rank at a time when a configuration supplies an array of
+    /// pairs. Both must produce the same table: loading the same file twice, once through each
+    /// path, is the only way to compare them without reaching into the model.
+    @Test(
+        "Concurrent and serial merge resolution build the same table",
+        arguments: ["Qwen/Qwen3-0.6B", "distilgpt2", "coreml-projects/Llama-2-7b-chat-coreml"])
+    func mergeResolutionPathsAgree(repo: String) async throws {
+        let folder = try await HubFixtures.modelFolder(for: repo)
+        // The same resolved configuration for both, so only the shape of `merges` differs.
+        let tokenizerConfig = try #require(LocalModelConfiguration(modelFolder: folder).tokenizerConfig)
+        let dataURL = folder.appendingPathComponent("tokenizer.json")
+        // Packed tables: `merges` becomes `PackedStringPairs`, which takes the concurrent path.
+        let packed = try AutoTokenizer.from(
+            tokenizerConfig: tokenizerConfig, tokenizerData: try Config(tokenizerJSONFile: dataURL))
+        // A plain parse leaves `merges` an array of `Config` pairs, which takes the serial path.
+        let plain = try AutoTokenizer.from(
+            tokenizerConfig: tokenizerConfig, tokenizerData: try Config(jsonFile: dataURL))
+
+        let texts = [
+            "Hello, world! 123456789", "café a\u{300} 中文 ภาษาไทย 😀", "a a a b b a", "",
+            "   leading and trailing   ", "ΑΒΓ αβγ ЁЖЗ ｦｧｨ", "def f(x):\n\treturn x ** 2  # comment",
+            String(repeating: "the quick brown fox ", count: 64),
+        ]
+        for text in texts {
+            #expect(packed.encode(text: text) == plain.encode(text: text))
+            #expect(packed.tokenize(text: text) == plain.tokenize(text: text))
+        }
+    }
+
+    /// Loading is itself concurrent now, and an app may load several tokenizers at once while
+    /// others are encoding. Every load must produce the same table as a load on its own.
+    @Test("Simultaneous loads and encodes agree with loads made in isolation")
+    func concurrentLoading() async throws {
+        let repos = ["Qwen/Qwen3-0.6B", "distilgpt2", "google-t5/t5-small", "google-bert/bert-base-uncased"]
+        var folders: [URL] = []
+        for repo in repos { folders.append(try await HubFixtures.modelFolder(for: repo)) }
+        let texts = ["Hello, world! 123456789", "café a\u{300} 中文 😀", String(repeating: "ab ", count: 200)]
+        let expected = try folders.map { folder in
+            let tokenizer = try AutoTokenizer.load(from: folder)
+            return texts.map { tokenizer.encode(text: $0) }
+        }
+        let busy = try AutoTokenizer.load(from: folders[0])
+
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for worker in 0..<12 {
+                let folder = folders[worker % folders.count]
+                let reference = expected[worker % folders.count]
+                group.addTask {
+                    for _ in 0..<3 {
+                        let tokenizer = try AutoTokenizer.load(from: folder)
+                        #expect(texts.map { tokenizer.encode(text: $0) } == reference)
+                    }
+                }
+            }
+            // Encoding with an already-loaded tokenizer while the loads run.
+            for _ in 0..<4 {
+                group.addTask {
+                    for _ in 0..<100 { #expect(busy.encode(text: texts[0]) == expected[0][0]) }
+                }
+            }
+            try await group.waitForAll()
+        }
+    }
 }

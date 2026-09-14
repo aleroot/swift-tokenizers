@@ -740,4 +740,20 @@ compiled once against swift-tokenizers and once against swift-transformers and d
 | Embedding harness | 12 embedding/reranker models × 68 texts (queries, passages, long passages, multilingual, code, rerank pairs, edge cases) | 816/816 exact |
 | End-to-end harness | 6 mlx-community folders × 301 texts, `encode`/`decode` × special-token modes, chat templates with and without tools | exact |
 | Cold-corpus cross-check | 4.0 MB of unseen synthetic prose, token counts vs Hugging Face, 3 families | identical counts |
-| SentencePiece cross-check | T5 and Gemma 3, 4,048 FLORES-200 sentences in English, Chinese, Japanese and Thai, ids vs the C++ `.model` engine and vs Hugging Face | 4048/4048 exact, both models |
+| SentencePiece cross-check | T5 and Gemma 3, all 60,720 FLORES-200 lines in English, Chinese, Japanese and Thai, ids vs the C++ `.model` engine and vs Hugging Face | 60720/60720 exact, both models, three ways |
+| Randomised differential | 3 seeds × 400 generated texts × ~50 tokenizer folders, ids, decoded text, source offsets and token strings vs `transformers` | 0 id and 0 decode mismatches; see below |
+| Corrupt-input fuzz | 2,400 byte-mutated configurations driven through parsing, model construction, encode, decode and `convertIdToToken` | builds or throws a typed error, never traps |
+
+### Known divergences, and which side is right
+
+Differing from `transformers` is not the same as being wrong. Every divergence the harnesses
+report has been traced to its source; the categories below are the complete list.
+
+| Divergence | Verified against | Conclusion |
+|---|---|---|
+| Byte-level offsets after a byte that the vocabulary does not contain (Falcon) | Rust `tokenizers` directly | **Upstream bug.** In `tiiuae/falcon-7b`, `'ò'` (byte `0xF2`) is absent from the vocabulary, so the first byte of `U+080D80` produces no token. Rust then shifts the attribution and charges the *next* character's first byte-token to the character that lost a byte. Our offsets stay aligned with the characters that actually produced each token. |
+| Whisper decodes timestamp tokens as text | Rust `tokenizers` directly | **Different layer.** `Tokenizer.decode` in Rust also returns `<\|5.50\|>`, for either value of `skip_special_tokens` (the token is not marked special). `transformers` removes them in `WhisperTokenizerFast._filter_timestamp_ids` unless `decode_with_timestamps=True`. We implement the `tokenizer.json` semantics; Whisper's filter is a model-specific layer above them. |
+| `tokenize(text:)` returns `"<mask>"` where `transformers` returns `" <mask>"` for an `lstrip` added token | Rust `tokenizers` directly | **Both defensible; ids identical.** For `" <mask>"` Rust reports the token string `" <mask>"` but the offset `(1, 7)`, so its own two answers disagree about whether the space belongs to the token. We report the vocabulary spelling, which is what `convertIdToToken` returns and what our offsets cover. |
+| Chat templates render a null as `""`, and a list of dictionaries without quotes around strings | swift-jinja directly, with no tokenizer involved | **Upstream swift-jinja.** Python Jinja renders `None` as `None` and uses `repr` for values inside a container. Reproducible in three lines of swift-jinja; nothing in this library is involved. |
+| Key order inside a tool's `parameters` | this library | **Caller's choice.** `[String: any Sendable]` is unordered, so user-named containers are emitted alphabetically. Pass `KeyValuePairs` or a `Jinja.Value` to fix the order. Canonical OpenAI and `get_json_schema` keys are always emitted in their documented order. |
+| A folder with both `chat_template.json` and a `chat_template` in `tokenizer_config.json` uses the former | `transformers` source | **Deliberate.** `chat_template.json` is `LEGACY_PROCESSOR_CHAT_TEMPLATE_FILE`, read by `AutoProcessor` and not by `AutoTokenizer`. swift-transformers applies the same precedence, and it is the template a vision model needs. It does mean a vision-language folder whose processor template has no tools branch renders without tools; pass the other template explicitly with `ChatTemplateArgument.literal` if you need it. |
