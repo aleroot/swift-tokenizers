@@ -7,7 +7,7 @@
 import Foundation
 
 /// Compact `token → id` map as serialized in BPE/WordPiece `model.vocab`.
-public struct PackedStringMap: Sendable, Hashable {
+struct PackedStringMap: Sendable, Hashable {
     let utf8: PageBuffer<UInt8>
     /// `count + 1` offsets into `utf8`. Token `i` is `utf8[offsets[i]..<offsets[i + 1]]`.
     let offsets: PageBuffer<UInt32>
@@ -75,7 +75,7 @@ public struct PackedStringMap: Sendable, Hashable {
 }
 
 /// Compact list of string pairs as serialized in BPE `model.merges`.
-public struct PackedStringPairs: Sendable, Hashable {
+struct PackedStringPairs: Sendable, Hashable {
     let utf8: PageBuffer<UInt8>
     /// Pair `i` is left `utf8[offsets[2i]..<offsets[2i + 1]]` and
     /// right `utf8[offsets[2i + 1]..<offsets[2i + 2]]`.
@@ -131,7 +131,7 @@ public struct PackedStringPairs: Sendable, Hashable {
 }
 
 /// Compact Unigram `model.vocab`: `(token, score)` rows, id = index.
-public struct PackedScoredTokens: Sendable, Hashable {
+struct PackedScoredTokens: Sendable, Hashable {
     let utf8: PageBuffer<UInt8>
     let offsets: PageBuffer<UInt32>
     let scores: PageBuffer<Double>
