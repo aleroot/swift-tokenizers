@@ -59,6 +59,23 @@ tokenizer.tokenize(text: "internationalization")
 // ["international", "ization"]
 ```
 
+### Score a pair of sequences
+
+Cross-encoder rerankers and sentence-pair classifiers read two texts joined by the separators
+their own template declares, plus a segment id per token saying which side it came from:
+
+```swift
+let encoding = try tokenizer.encode(text: query, textPair: passage)
+encoding.ids       // [CLS] query [SEP] passage [SEP], for a BERT-style template
+encoding.typeIds   // 0 for the first sequence, 1 for the second
+```
+
+The values come from the template, not from a convention: RoBERTa-style tokenizers put every
+token in segment 0. A tokenizer whose post-processor has no pair form throws
+``TokenizerError/unsupportedComponent(_:)`` rather than returning a plausible concatenation.
+``TokenEncoding/typeIds`` is `nil` for a single sequence, which never pays to build a table of
+zeros.
+
 ### Look tokens up
 
 ```swift

@@ -160,7 +160,7 @@ public protocol Tokenizer: Sendable {
 
     /// Renders `tokens` back to text.
     ///
-    /// Ids that name no token — out of range, or a hole in a vocabulary with gaps — contribute
+    /// Ids that name no token, out of range or a hole in a vocabulary with gaps, contribute
     /// nothing and are not reported, as in `tokenizers`. Use ``convertIdToToken(_:)``, which
     /// returns `nil` for exactly those ids, when a caller needs to detect them.
     func decode(tokens: [Int]) -> String

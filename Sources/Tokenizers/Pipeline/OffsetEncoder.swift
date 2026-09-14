@@ -1,7 +1,8 @@
 import Foundation
 
-/// Per-call state. Reuses the model's merge/lattice algorithms and, where token lengths
-/// are exact, its existing ID cache. Nothing is retained by an IDs-only tokenizer call.
+/// Per-thread state, pooled alongside the IDs-only encoder. Reuses the model's merge/lattice
+/// algorithms and, where token lengths are exact, its existing ID cache. Nothing is retained by
+/// an IDs-only tokenizer call.
 final class OffsetModelEncoder {
     /// Resolved once: no piece pays for a dynamic cast, and a model the alignment pipeline
     /// cannot segment is rejected before any work is done.
@@ -13,10 +14,13 @@ final class OffsetModelEncoder {
     }
 
     private let resolved: Model
+    /// The model's own piece encoder, created once so that no encode call converts the model to
+    /// an existential or allocates. Held non-optionally: reading an optional class property on
+    /// every piece is a reference-count operation on state every thread shares.
+    private let cachedEncoder: PieceEncoder
     private var symbols: [BPETokenizer.Symbol] = []
     private var mergeScratch = BPETokenizer.MergeScratch()
     private var lattice: UnigramTokenizer.Lattice?
-    private var cachedEncoder: PieceEncoder?
     private var ids: [Int] = []
     private var lengths: [Int] = []
     /// Whether a byte-level model's vocabulary spellings give exact source lengths.
@@ -26,31 +30,36 @@ final class OffsetModelEncoder {
         switch model {
         case let bpe as BPETokenizer:
             resolved = .bpe(bpe)
+            cachedEncoder = bpe.makeEncoder()
             cachedByteLengths =
                 !bpe.hasAffixes && bpe.symbolCount == bpe.vocab.count
                 && bpe.byteSymbolIds.allSatisfy { $0 >= 0 }
         case let unigram as UnigramTokenizer:
             resolved = .unigram(unigram)
+            cachedEncoder = unigram.makeEncoder()
             cachedByteLengths = false
         case let wordLevel as WordLevelTokenizer:
             resolved = .wordLevel(wordLevel)
+            cachedEncoder = wordLevel.makeEncoder()
             cachedByteLengths = false
         case let bert as BertTokenizer:
             resolved = .bert(bert)
+            cachedEncoder = bert.makeEncoder()
             cachedByteLengths = false
         default:
             throw TokenizerError.unsupportedComponent("offsets for model \(type(of: model))")
         }
     }
 
-    deinit { cachedEncoder?.finish() }
+    /// Brackets one encode call, exactly as the IDs-only path does: shared resources such as the
+    /// pre-token cache lock are held for the call and released after it.
+    func begin() { cachedEncoder.begin() }
 
-    private func encodeIDs(
-        _ bytes: UnsafeBufferPointer<UInt8>, byteLevel: Bool = false, using model: any FastTokenizingModel
-    ) {
-        if cachedEncoder == nil { cachedEncoder = model.makeEncoder(); cachedEncoder?.begin() }
+    func finish() { cachedEncoder.finish() }
+
+    private func encodeIDs(_ bytes: UnsafeBufferPointer<UInt8>, byteLevel: Bool = false) {
         ids.removeAll(keepingCapacity: true)
-        cachedEncoder?.encode(bytes: bytes, byteLevel: byteLevel, into: &ids)
+        cachedEncoder.encode(bytes: bytes, byteLevel: byteLevel, into: &ids)
     }
 
     /// Emits one token per ID in `ids`, sized by `sourceLength`.
@@ -58,6 +67,10 @@ final class OffsetModelEncoder {
     /// The IDs come from the shared encoder, so this path is served by the pre-token cache.
     /// It applies only when every token's source length is known and the lengths cover the
     /// input exactly; otherwise nothing is emitted and the caller segments the piece itself.
+    ///
+    /// Inlined so that `sourceLength` never becomes a closure holding the model: capturing it
+    /// once per piece is a reference count on state every encoding thread shares.
+    @inline(__always)
     private func appendDerivedTokens(
         covering count: Int, of text: AlignedText, into output: inout [AlignedToken],
         sourceLength: (Int) -> Int?
@@ -79,25 +92,46 @@ final class OffsetModelEncoder {
         return true
     }
 
-    func encode(_ text: AlignedText, byteLevel: Bool, into output: inout [AlignedToken]) throws {
-        guard !text.bytes.isEmpty else { return }
+    /// Segments one pre-token into aligned tokens.
+    typealias Segmenter = (AlignedText, Bool, inout [AlignedToken]) throws -> Void
+
+    /// Runs `body` with a segmenter bound to this encoder's model.
+    ///
+    /// The model is read out of ``resolved`` once per encode call rather than once per piece.
+    /// Every thread encoding with this tokenizer shares the model, so copying a reference to it
+    /// per piece is a contended atomic pair that stops the path scaling.
+    func withSegmenter<R>(_ body: (Segmenter) throws -> R) throws -> R {
         switch resolved {
-        case let .bpe(bpe): encode(text, byteLevel: byteLevel, with: bpe, into: &output)
-        case let .unigram(unigram): encode(text, byteLevel: byteLevel, with: unigram, into: &output)
+        case let .bpe(bpe):
+            return try body { text, byteLevel, output in
+                guard !text.bytes.isEmpty else { return }
+                self.encode(text, byteLevel: byteLevel, with: bpe, into: &output)
+            }
+        case let .unigram(unigram):
+            return try body { text, byteLevel, output in
+                guard !text.bytes.isEmpty else { return }
+                self.encode(text, byteLevel: byteLevel, with: unigram, into: &output)
+            }
         case let .wordLevel(wordLevel):
             // One token per chunk, covering all of it.
-            let text = byteLevel ? text.byteLevel() : text
-            text.bytes.withUnsafeBufferPointer { bytes in
-                guard let id = wordLevel.id(of: bytes) ?? wordLevel.unknownTokenId else { return }
-                output.append(AlignedToken(id: id, offset: text.sourceRange(0..<bytes.count)))
+            return try body { text, byteLevel, output in
+                guard !text.bytes.isEmpty else { return }
+                let text = byteLevel ? text.byteLevel() : text
+                text.bytes.withUnsafeBufferPointer { bytes in
+                    guard let id = wordLevel.id(of: bytes) ?? wordLevel.unknownTokenId else { return }
+                    output.append(AlignedToken(id: id, offset: text.sourceRange(0..<bytes.count)))
+                }
             }
         case let .bert(bert):
-            let text = byteLevel ? text.byteLevel() : text
-            if bert.serializedWordPiece {
-                text.bytes.withUnsafeBufferPointer { encodeIDs($0, using: bert) }
-                bert.appendOffsets(text, ids: ids, into: &output)
-            } else {
-                try bert.encode(text, into: &output)
+            return try body { text, byteLevel, output in
+                guard !text.bytes.isEmpty else { return }
+                let text = byteLevel ? text.byteLevel() : text
+                if bert.serializedWordPiece {
+                    text.bytes.withUnsafeBufferPointer { self.encodeIDs($0) }
+                    bert.appendOffsets(text, ids: self.ids, into: &output)
+                } else {
+                    try bert.encode(text, into: &output)
+                }
             }
         }
     }
@@ -109,7 +143,7 @@ final class OffsetModelEncoder {
             // The vocabulary spellings give exact source lengths, so the IDs carry the
             // segmentation and the merges do not have to be replayed here.
             if byteLevel ? cachedByteLengths : !bpe.hasAffixes && !bpe.ignoreMerges {
-                encodeIDs(bytes, byteLevel: byteLevel, using: bpe)
+                encodeIDs(bytes, byteLevel: byteLevel)
                 let derived = appendDerivedTokens(covering: bytes.count, of: text, into: &output) {
                     byteLevel ? bpe.byteLevelSourceLength(of: $0) : bpe.sourceLength(of: $0)
                 }
@@ -160,7 +194,7 @@ final class OffsetModelEncoder {
         let text = byteLevel ? text.byteLevel() : text
         if lattice == nil { lattice = UnigramTokenizer.Lattice() }
         text.bytes.withUnsafeBufferPointer { bytes in
-            encodeIDs(bytes, using: unigram)
+            encodeIDs(bytes)
             let derived = appendDerivedTokens(covering: bytes.count, of: text, into: &output) {
                 $0 == unigram.unknownTokenId ? nil : unigram.vocabulary.byteCount(of: $0)
             }
@@ -216,9 +250,8 @@ extension EncodePipeline {
         }
     }
 
-    func encode(_ text: String, model: any TokenizingModel) throws -> [AlignedToken] {
+    func encode(_ text: String, encoder: OffsetModelEncoder) throws -> [AlignedToken] {
         let source = AlignedText(text)
-        let encoder = try OffsetModelEncoder(model: model)
         var output: [AlignedToken] = []
         output.reserveCapacity(source.bytes.count / 3 + 4)
         var sectionStart = 0
@@ -237,17 +270,19 @@ extension EncodePipeline {
             }
             output.removeSubrange(write...)
         }
-        try runAligned(
-            source,
-            onToken: { id, piece in
-                fuse()
-                output.append(
-                    AlignedToken(id: id, offset: piece.sourceRange(0..<piece.bytes.count), spelling: piece.text))
-                sectionStart = output.count
-            },
-            onPiece: { piece, byteLevel in
-                try encoder.encode(piece, byteLevel: byteLevel, into: &output)
-            })
+        try encoder.withSegmenter { segment in
+            try runAligned(
+                source,
+                onToken: { id, piece in
+                    fuse()
+                    output.append(
+                        AlignedToken(id: id, offset: piece.sourceRange(0..<piece.bytes.count), spelling: piece.text))
+                    sectionStart = output.count
+                },
+                onPiece: { piece, byteLevel in
+                    try segment(piece, byteLevel, &output)
+                })
+        }
         fuse()
         // Byte tokens can end inside a UTF-8 scalar. Expose the complete original scalar
         // for each of them, matching HF's character offsets and producing safe UI ranges.

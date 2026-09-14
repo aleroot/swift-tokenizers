@@ -382,6 +382,8 @@ final class EncodeScratch {
     let buffers = ScratchBuffers()
     private var encoder: PieceEncoder?
     private var encoderModel: ObjectIdentifier?
+    private var offsetEncoder: OffsetModelEncoder?
+    private var offsetEncoderModel: ObjectIdentifier?
 
     /// The pooled encoder for the model `identity` names, created by `make` on first use.
     ///
@@ -400,6 +402,22 @@ final class EncodeScratch {
         guard let made = make() else { return nil }
         encoder = made
         encoderModel = identity
+        return made
+    }
+
+    /// The pooled source-alignment encoder for the model `identity` names, under the same reuse
+    /// rules as ``encoder(identity:make:)``. Offsets are opt-in, so a tokenizer that only ever
+    /// returns IDs never builds one.
+    @inline(__always)
+    func offsetEncoder(
+        identity: ObjectIdentifier, make: () throws -> OffsetModelEncoder
+    ) rethrows
+        -> OffsetModelEncoder
+    {
+        if let offsetEncoder, offsetEncoderModel == identity { return offsetEncoder }
+        let made = try make()
+        offsetEncoder = made
+        offsetEncoderModel = identity
         return made
     }
 }

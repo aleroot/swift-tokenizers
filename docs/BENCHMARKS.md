@@ -16,7 +16,7 @@ on an idle machine, with all engines run back to back over byte-identical input.
 Run to run variation is about 3% for throughput and 5% for load time. Where two runs of an engine
 disagreed, the tables quote its faster run.
 
-**Contents:** [Encode throughput](#encode-throughput) · [Multilingual text and SentencePiece](#multilingual-text-and-sentencepiece) · [Load time](#load-time) · [Memory](#memory) · [Decode](#decode) · [Embedding models and rerankers](#embedding-models-and-rerankers) · [Real model folders](#real-model-folders) · [Concurrent encoding](#concurrent-encoding) · [Correctness](#correctness) · [Why it is fast](#why-it-is-fast) · [Reproducing](#reproducing)
+**Contents:** [Encode throughput](#encode-throughput) · [Multilingual text and SentencePiece](#multilingual-text-and-sentencepiece) · [Which Hugging Face call to compare against](#which-hugging-face-call-to-compare-against) · [Load time](#load-time) · [Memory](#memory) · [Decode](#decode) · [Embedding models and rerankers](#embedding-models-and-rerankers) · [Real model folders](#real-model-folders) · [Concurrent encoding](#concurrent-encoding) · [Correctness](#correctness) · [Why it is fast](#why-it-is-fast) · [Reproducing](#reproducing)
 
 ## Encode throughput
 
@@ -30,8 +30,10 @@ English prose through the Qwen3 byte-level BPE pipeline (`mlx-community/Qwen3-0.
 | 11.5 KB × 100 | **236.2 MB/s** | 6.6 | 54.1 | 36.0 | 0.97 |
 | 1.15 MB × 1 | **231.4 MB/s** | 5.4 | 55.6 | 36.4 | 1.00 |
 
-On the 1.15 MB document that is **43× Hugging Face's Rust core, 4.2× tiktoken `o200k`** and
-**231× swift-transformers**, with identical token ids.
+On the 1.15 MB document that is **43× Hugging Face's `Tokenizer.encode`, 4.2× tiktoken `o200k`**
+and **231× swift-transformers**, with identical token ids. Hugging Face's fastest entry point,
+the ids-only batch call, reaches 7.2 MB/s on the same document, so the ratio against it is **32×**.
+[Which call to compare against](#which-hugging-face-call-to-compare-against) sets out all three.
 
 Short calls matter as much as bandwidth: a 53-byte query costs **0.40 µs**, against 10.1 µs for
 Hugging Face and 56 µs for swift-transformers.
@@ -59,6 +61,48 @@ same vocabulary and emits byte-identical ids on all 60,720 lines.
 
 Unigram is the heaviest path here, a Viterbi lattice over `▁`-prefixed pieces with no byte-level
 alphabet, and it is still 1.9× the C++ implementation of the same algorithm.
+
+## Which Hugging Face call to compare against
+
+Rust `tokenizers` has three entry points, and they do different amounts of work:
+
+| Call | Returns | Threads |
+|---|---|---|
+| `Tokenizer.encode` | a full `Encoding`: ids, type ids, tokens, offsets, word ids, attention and special-token masks | one, always |
+| `encode_batch` | the same, for a whole batch | rayon |
+| `encode_batch_fast` | the same for a whole batch, with offset tracking skipped and every offset left at zero | rayon |
+
+There is no way to ask it for ids alone from a single string, so a caller holding one text pays
+for the whole `Encoding` every time. The tables above use that call because it is the cheapest
+way each library encodes one text. The matched comparisons are here: our `encode(text:)` against
+`encode_batch_fast`, and `encode(text:withOffsets:)` against `encode_batch`. Same corpus, same
+vocabularies, identical token counts (T5 763,275, Gemma 3 1,989,660, Qwen 3 2,464,005).
+
+Ids only:
+
+| Model | ours, 1 thread | `encode_batch_fast` | ours, 8 threads | `encode_batch_fast`, 8 threads |
+|---|---:|---:|---:|---:|
+| T5, Unigram, 32k | **123.3 MB/s** | 14.7 | **477.9 MB/s** | 60.7 |
+| Gemma 3, SentencePiece BPE, 262k | **44.8 MB/s** | 19.1 | **208.7 MB/s** | 64.1 |
+| Qwen 3, byte-level BPE, 152k | **64.0 MB/s** | 6.7 | **169.1 MB/s** | 28.4 |
+
+Ids and source offsets:
+
+| Model | ours, 1 thread | `encode_batch` | ours, 8 threads | `encode_batch`, 8 threads |
+|---|---:|---:|---:|---:|
+| T5, Unigram, 32k | **18.1 MB/s** | 10.4 | **88.0 MB/s** | 46.8 |
+| Gemma 3, SentencePiece BPE, 262k | **30.8 MB/s** | 11.7 | **125.3 MB/s** | 46.3 |
+| Qwen 3, byte-level BPE, 152k | **35.3 MB/s** | 5.6 | **104.8 MB/s** | 25.2 |
+
+Two things follow. Materialising the full `Encoding` costs Rust 1.2× to 1.6× on its own batch
+API, for fields most callers never read. And `Tokenizer.encode` does not parallelise at all:
+10.5 MB/s on one thread and 10.5 on eight for T5, 12.0 and 11.9 for Gemma 3, 5.6 and 5.6 for
+Qwen 3. Rust puts its parallelism in the batch API, which needs the whole corpus in hand. Ours is
+in the call itself, so threads sharing one instance scale without a batch API
+(see [Concurrent encoding](#concurrent-encoding)).
+
+Offsets are opt-in here for the same reason: a caller who wants ids should not pay for
+alignment. When both are asked for, we are still 1.7× to 6.3× ahead.
 
 ## Load time
 
@@ -202,6 +246,7 @@ contention, where SentencePiece pulls ahead of the shared instance.
 | Check | Scope | Result |
 |---|---|---|
 | `DifferentialTests` | 24 tokenizer families × 301 adversarial texts, ids and decoded text vs `transformers` goldens | exact |
+| `PairEncodingTests` | 8 BERT, RoBERTa, XLM-R, Qwen and T5 tokenizers × 9 sequence pairs × both special-token modes, ids and segment ids vs Rust `tokenizers` | exact |
 | SentencePiece three-way | T5 and Gemma 3, all 60,720 FLORES lines, ids vs the C++ `.model` engine and vs the Rust core | 60,720/60,720 exact, both models |
 | Embedding harness | 12 embedding and reranker models × 68 texts | 816/816 exact |
 | Real model folders | 6 mlx-community folders × 301 texts, both special-token modes, chat templates with and without tools | exact |

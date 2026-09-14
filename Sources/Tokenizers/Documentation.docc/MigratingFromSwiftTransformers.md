@@ -37,11 +37,10 @@ a cache directory or an authentication token, and most apps already have all thr
 
 ### What is not implemented
 
-Inference only, single sequences:
+Inference only:
 
 - No training, no vocabulary learning, no BPE dropout above zero.
-- No padding and no sequence pairs. Pad in your own batching code, where you know the shape
-  your model wants.
+- No padding. Pad in your own batching code, where you know the shape your model wants.
 
 If a `tokenizer.json` asks for a component this library does not implement, loading throws
 ``TokenizerError/unsupportedComponent(_:)`` naming it. It does not quietly drop the component
@@ -61,6 +60,7 @@ sequences, and chat template keys rendered in a different order.
 ### What you gain besides speed
 
 - Source offsets: <doc:TokenAlignment>
+- Sequence pairs with segment ids: ``Tokenizer/encode(text:textPair:addSpecialTokens:)``
 - Incremental decoding: <doc:StreamingGeneration>
 - Assistant loss masks for fine tuning: <doc:ChatTemplates>
 - Special token aware truncation: ``TokenTruncation``

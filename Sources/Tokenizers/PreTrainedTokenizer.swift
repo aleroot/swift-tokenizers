@@ -55,6 +55,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     /// goes through token strings. Only the identity is stored: the hot path has to know
     /// *whether* there is a fast path, and reading an optional existential to find out copies
     /// it, which is a pair of contended reference-count updates per encode on a shared model.
+    /// Keys this tokenizer's pooled encoders, resolved once so no encode call reads the model
+    /// as an existential.
+    private let modelIdentity: ObjectIdentifier
     private let fastModelIdentity: ObjectIdentifier?
     /// The id-level post-processing step, resolved once at load so that encoding reads a single
     /// non-optional reference and allocates no callback.
@@ -135,6 +138,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         let model = try TokenizerModel.from(
             tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData, addedTokens: addedTokens, strict: strict)
         self.model = model
+        modelIdentity = ObjectIdentifier(model as AnyObject)
         fastModelIdentity = (model as? any FastTokenizingModel).map { ObjectIdentifier($0 as AnyObject) }
 
         // `fuse_unk` is a property of the WordPiece-style models; BPE and Unigram fuse
@@ -262,13 +266,26 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         guard withOffsets else {
             return TokenEncoding(text: text, ids: encode(text: text, addSpecialTokens: addSpecialTokens))
         }
-        var tokens = try pipeline.encode(text, model: model)
+        var tokens = try withOffsetEncoder { try pipeline.encode(text, encoder: $0) }
         if let postProcessor {
             tokens = try postProcessor.processOffsets(
                 tokens, text: text, addSpecialTokens: addSpecialTokens,
                 resolve: model.convertTokenToId, spelling: convertIdToToken)
         }
         return TokenEncoding(text: text, tokens: tokens)
+    }
+
+    /// Runs `body` with this thread's pooled source-alignment encoder, bracketing the call so
+    /// that shared resources are held for its duration only.
+    private func withOffsetEncoder<R>(_ body: (OffsetModelEncoder) throws -> R) throws -> R {
+        let scratch = scratchPool.take()
+        defer { scratchPool.recycle(scratch) }
+        let encoder = try scratch.offsetEncoder(identity: modelIdentity) {
+            try OffsetModelEncoder(model: model)
+        }
+        encoder.begin()
+        defer { encoder.finish() }
+        return try body(encoder)
     }
 
     /// Runs the pipeline up to (excluding) the post-processor.
@@ -581,7 +598,7 @@ extension PreTrainedTokenizer {
         }
         let budget = copies > 0 ? (maxLength - overhead) / copies : 0
         if withOffsets {
-            var tokens = try pipeline.encode(text, model: model)
+            var tokens = try withOffsetEncoder { try pipeline.encode(text, encoder: $0) }
             tokens.truncate(to: budget, side: truncationSide)
             if let postProcessor {
                 tokens = try postProcessor.processOffsets(

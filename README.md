@@ -12,8 +12,8 @@
 
 swift-tokenizers is a native Swift 6 implementation of the tokenizers used by today's language
 models: byte-level and SentencePiece **BPE**, **Unigram**, **WordPiece** and **WordLevel**. It
-loads `tokenizer.json` files published on the Hugging Face Hub, with single-sequence inference
-checked against Hugging Face references. It ships as a drop-in replacement for the
+loads `tokenizer.json` files published on the Hugging Face Hub, with inference checked against
+Hugging Face references. It ships as a drop-in replacement for the
 `Tokenizers` product of
 [swift-transformers](https://github.com/huggingface/swift-transformers), plugs seamlessly into
 [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm), and is the tokenizer behind
@@ -37,8 +37,8 @@ let text = tokenizer.decode(tokens: ids)          // "Hello world"
   also check generated configurations and source offsets.
 - **Broad inference support.** The model and pipeline component families listed below, plus
   added and special tokens, chat templates with tools and assistant masks, source offsets,
-  streaming decoding, special-token-aware truncation and O(1) vocabulary lookup.
-  Nonzero BPE dropout, tokenizer training, padding and pair encodings are out of scope.
+  sequence pairs with segment ids, streaming decoding, special-token-aware truncation and O(1)
+  vocabulary lookup. Tokenizer training, nonzero BPE dropout and padding are out of scope.
 - **Drop-in.** Same `Tokenizer`, `PreTrainedTokenizer`, `AutoTokenizer`, `Config` and
   `TokenizerError` API as swift-transformers; existing consumers compile unchanged.
 - **Lean.** One dependency, [swift-jinja](https://github.com/huggingface/swift-jinja), for chat
@@ -90,6 +90,10 @@ tokenizer.eosTokenId, tokenizer.bosToken, tokenizer.unknownToken
 let encoding = try tokenizer.encode(text: "Hello world", withOffsets: true)
 let ranges = encoding.utf16Ranges(expandingToGraphemeClusters: true)
 
+// Sequence pairs for cross-encoders, with the segment ids the model's template declares
+let pair = try tokenizer.encode(text: query, textPair: passage)
+pair.ids, pair.typeIds
+
 // Chat templates, with optional tool definitions
 let prompt = try tokenizer.applyChatTemplate(messages: messages, tools: tools)
 ```
@@ -124,6 +128,11 @@ on all 60,720 lines, verified before timing.
 | T5, Unigram, 32k | 125.9 MiB/s | **1.9x** faster | 11.5x faster |
 | Gemma 3, SentencePiece BPE, 262k | 44.5 MiB/s | **1.9x** faster | 3.6x faster |
 | Qwen 3, byte-level BPE, 152k | 64.2 MiB/s | n/a | 10.9x faster |
+
+The Hugging Face column is its `Tokenizer.encode`, the only way it encodes a single text, which
+always builds a full `Encoding`. Against its fastest path, the ids-only batch call, the same
+corpus on one thread gives 8.6x, 2.3x and 9.6x. Both comparisons, with and without source
+offsets, are in [docs/BENCHMARKS.md](docs/BENCHMARKS.md#which-hugging-face-call-to-compare-against).
 
 `tiktoken` cannot load a Hub tokenizer, so it runs its own vocabulary over the same text: it
 reaches 20.2 MiB/s (`cl100k_base`) and 19.8 MiB/s (`o200k_base`), which the chart marks as a
