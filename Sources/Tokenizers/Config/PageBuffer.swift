@@ -1,10 +1,49 @@
-// Growable table storage whose pages come straight from the VM system and go back to it when
-// the buffer is released. The large tables parsed out of `tokenizer.json` live here: they are
-// consumed while the tokenizer is built and then dropped, and memory freed through `munmap`
-// leaves the process footprint immediately, whereas blocks returned to `malloc` can stay
-// resident in the allocator's caches.
+// Table storage whose pages come straight from the VM system and go back to it when the
+// storage is released. The large tables parsed out of `tokenizer.json` and the scratch the
+// tokenizer models build from them live here: they are consumed while the tokenizer is built
+// and then dropped, and memory freed through `munmap` leaves the process footprint
+// immediately, whereas blocks returned to `malloc` can stay resident in the allocator's caches.
 
 import Foundation
+
+/// A fixed block of anonymous pages holding trivial elements.
+///
+/// Pages are zero-filled and cost nothing until they are first touched, so a block may be
+/// sized to a generous upper bound. `@unchecked Sendable`: the block is a plain allocation
+/// and carries no mutable state of its own.
+final class PageBlock<Element>: @unchecked Sendable {
+    let base: UnsafeMutablePointer<Element>
+    /// Elements the block can hold, at least the requested count.
+    let count: Int
+    /// Zero when the mapping failed and the allocator supplied the block instead.
+    private let mappedBytes: Int
+
+    init(count requested: Int) {
+        let elements = max(requested, 1)
+        let stride = MemoryLayout<Element>.stride
+        let page = Int(getpagesize())
+        let bytes = (elements * stride + page - 1) / page * page
+        if let raw = mmap(nil, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0), raw != MAP_FAILED {
+            base = raw.bindMemory(to: Element.self, capacity: bytes / stride)
+            count = bytes / stride
+            mappedBytes = bytes
+            return
+        }
+        // Address space exhausted: fall back to the allocator, zeroed to match the mapping.
+        base = .allocate(capacity: elements)
+        count = elements
+        mappedBytes = 0
+        memset(base, 0, elements * stride)
+    }
+
+    deinit {
+        if mappedBytes == 0 {
+            base.deallocate()
+        } else {
+            munmap(UnsafeMutableRawPointer(base), mappedBytes)
+        }
+    }
+}
 
 /// A contiguous, append-only buffer of trivial elements backed by anonymous pages.
 ///
@@ -16,16 +55,16 @@ import Foundation
 /// once it is stored in a `Config`.
 final class PageBuffer<Element>: @unchecked Sendable {
     private(set) var count = 0
+    private var storage: PageBlock<Element>
+    /// Mirrors of the block's fields so appending touches no other object.
     private var base: UnsafeMutablePointer<Element>
     private var capacity: Int
-    private var mappedBytes: Int
 
     /// Creates a buffer able to hold `capacity` elements without reallocating.
     init(capacity: Int) {
-        let (pointer, bytes, elements) = Self.map(elements: max(capacity, 1))
-        base = pointer
-        mappedBytes = bytes
-        self.capacity = elements
+        storage = PageBlock(count: capacity)
+        base = storage.base
+        self.capacity = storage.count
     }
 
     /// Copies an array into a page-backed buffer.
@@ -36,10 +75,6 @@ final class PageBuffer<Element>: @unchecked Sendable {
             base.initialize(from: address, count: source.count)
         }
         count = elements.count
-    }
-
-    deinit {
-        Self.unmap(base, bytes: mappedBytes)
     }
 
     @inline(__always)
@@ -106,36 +141,11 @@ final class PageBuffer<Element>: @unchecked Sendable {
     private func grow(toHold needed: Int) {
         var target = max(capacity * 2, 16)
         while target < needed { target *= 2 }
-        let (pointer, bytes, elements) = Self.map(elements: target)
-        if count > 0 { pointer.update(from: base, count: count) }
-        Self.unmap(base, bytes: mappedBytes)
-        base = pointer
-        mappedBytes = bytes
-        capacity = elements
-    }
-
-    private static var pageSize: Int { Int(getpagesize()) }
-
-    /// Maps enough anonymous pages for `elements`, returning the usable element capacity.
-    private static func map(elements: Int) -> (UnsafeMutablePointer<Element>, Int, Int) {
-        let stride = MemoryLayout<Element>.stride
-        let page = pageSize
-        let bytes = ((elements * stride + page - 1) / page) * page
-        let raw = mmap(nil, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0)
-        if let raw, raw != MAP_FAILED {
-            return (raw.bindMemory(to: Element.self, capacity: bytes / stride), bytes, bytes / stride)
-        }
-        // Address space exhausted: fall back to the allocator; `bytes == 0` marks the block.
-        let pointer = UnsafeMutablePointer<Element>.allocate(capacity: elements)
-        return (pointer, 0, elements)
-    }
-
-    private static func unmap(_ pointer: UnsafeMutablePointer<Element>, bytes: Int) {
-        if bytes == 0 {
-            pointer.deallocate()
-        } else {
-            munmap(UnsafeMutableRawPointer(pointer), bytes)
-        }
+        let grown = PageBlock<Element>(count: target)
+        if count > 0 { grown.base.update(from: base, count: count) }
+        storage = grown
+        base = grown.base
+        capacity = grown.count
     }
 }
 

@@ -1,9 +1,15 @@
 // Static byte-keyed trie in double-array form (Aoe 1989, as popularised by Darts).
 //
 // Every node is one 12-byte unit `(base, check, value)`. The transition from `node` on byte
-// `c` is `child = base[node] ^ c`, valid iff `check[child] == node`, so a prefix walk costs
-// one unit load per input byte and no hashing. Nodes are laid out in depth-first order,
+// `c` is `child = base[node] ^ c`, valid iff `check[child]` names `node`, so a prefix walk
+// costs one unit load per input byte and no hashing. Nodes are laid out in depth-first order,
 // which keeps the chains that dominate real vocabularies on adjacent cache lines.
+//
+// An all-zero unit is a free slot: slot 0 is left unused so that no node is named by
+// `check == 0`, and `value` is stored biased by one. The unit array is therefore built on
+// pages that the VM system zero-fills on first touch, so a vocabulary's worth of units never
+// has to be written before it is used and the slack in the upper bound the builder reserves
+// costs neither time nor memory.
 //
 // Construction partitions the key set by its next byte one trie level at a time (an MSD
 // radix sort fused with node placement), so it never compares whole keys, and allocates
@@ -16,11 +22,14 @@ import Foundation
 final class DoubleArrayTrie: @unchecked Sendable {
     struct Unit {
         var base: Int32
+        /// Owning node; `0` in a free slot, which no node ever names.
         var check: Int32
+        /// Stored value plus one; `0` when the node ends no key.
         var value: Int32
     }
 
-    static let root: Int32 = 0
+    /// Slot 0 is reserved so that a zeroed unit cannot name a node.
+    static let root: Int32 = 1
 
     /// Immutable after `init`; manually managed so hot loops perform no retain/release or
     /// copy-on-write checks.
@@ -62,7 +71,7 @@ final class DoubleArrayTrie: @unchecked Sendable {
 
     /// Value stored at `node` (`-1` when the node is not a key end).
     @inline(__always)
-    func value(at node: Int32) -> Int32 { units[Int(node)].value }
+    func value(at node: Int32) -> Int32 { units[Int(node)].value &- 1 }
 
     /// Calls `body(length, value)` for every key that is a prefix of `bytes[start...]`, shortest
     /// first. Stops at the first byte without a transition.
@@ -77,7 +86,7 @@ final class DoubleArrayTrie: @unchecked Sendable {
             if unit.check != node { return }
             node = child
             i += 1
-            if unit.value >= 0 { body(i - start, unit.value) }
+            if unit.value != 0 { body(i - start, unit.value &- 1) }
         }
     }
 
@@ -88,20 +97,27 @@ final class DoubleArrayTrie: @unchecked Sendable {
             guard let next = child(of: node, byte: byte) else { return -1 }
             node = next
         }
-        return units[Int(node)].value
+        return units[Int(node)].value &- 1
     }
 
     // MARK: - Construction
 
     private struct Builder {
-        private static let free: Int32 = -1
-        private static let empty = Unit(base: 0, check: free, value: -1)
         /// Partition label for keys that end at the current depth (sorts before any byte).
         private static let terminal = -1
 
         let utf8: UnsafeBufferPointer<UInt8>
         let offsets: UnsafeBufferPointer<UInt32>
         let keyTotal: Int
+
+        /// Owners of the large tables below. Pages rather than allocations: a vocabulary's
+        /// unit array is tens of megabytes that the allocator would keep resident long after
+        /// the trie has been trimmed to the size it ended up needing.
+        private var unitPages: PageBlock<Unit>
+        private var usedPages: PageBlock<UInt64>
+        private let orderPages: PageBlock<UInt64>
+        private let keyIndexPages: PageBlock<UInt32>
+        private let labelPages: PageBlock<UInt16>
 
         /// Keys as `start << 32 | end` (byte offsets), permuted in place so each node's keys
         /// form a contiguous range. Carrying both bounds means a partition step touches only
@@ -110,11 +126,11 @@ final class DoubleArrayTrie: @unchecked Sendable {
         private var keyIndex: UnsafeMutablePointer<UInt32>
         private var units: UnsafeMutablePointer<Unit>
         private(set) var capacity: Int
-        /// Occupied slots (`check != free`), as a bitmap for fast base search.
+        /// Occupied slots, as a bitmap for fast base search.
         private var used: UnsafeMutablePointer<UInt64>
-        private var highWater = 1  // one past the highest used slot
-        private var firstFree = 1  // lowest free slot (slot 0 is the root)
-        private var frontier = 1  // search start for multi-child nodes
+        private var highWater = 2  // one past the highest used slot
+        private var firstFree = 2  // lowest free slot (0 is reserved, 1 is the root)
+        private var frontier = 2  // search start for multi-child nodes
         private(set) var keyCount = 0
 
         /// Per-node scratch: bucket bookkeeping for the counting sort, the partition byte of
@@ -134,8 +150,10 @@ final class DoubleArrayTrie: @unchecked Sendable {
             self.utf8 = utf8
             self.offsets = offsets
             self.keyTotal = keyTotal
-            order = .allocate(capacity: keyTotal)
-            keyIndex = .allocate(capacity: keyTotal)
+            orderPages = PageBlock(count: keyTotal)
+            keyIndexPages = PageBlock(count: keyTotal)
+            order = orderPages.base
+            keyIndex = keyIndexPages.base
             for i in 0..<keyTotal {
                 order[i] = UInt64(offsets[i]) << 32 | UInt64(offsets[i + 1])
                 keyIndex[i] = UInt32(i)
@@ -144,16 +162,18 @@ final class DoubleArrayTrie: @unchecked Sendable {
             // Upper bound on nodes is `totalBytes + 1`; the extra blocks guarantee that a node
             // with up to 256 children can always be placed without growing.
             capacity = (totalBytes + 1 + 512 + 255) & ~255
-            units = .allocate(capacity: capacity)
-            units.initialize(repeating: Self.empty, count: capacity)
-            used = .allocate(capacity: capacity / 64)
-            used.initialize(repeating: 0, count: capacity / 64)
+            unitPages = PageBlock(count: capacity)
+            units = unitPages.base
+            usedPages = PageBlock(count: capacity / 64)
+            used = usedPages.base
             counts = .allocate(capacity: 257)
             cursors = .allocate(capacity: 257)
-            labelOf = .allocate(capacity: max(keyTotal, 1))
+            labelPages = PageBlock(count: max(keyTotal, 1))
+            labelOf = labelPages.base
             groups = .allocate(capacity: 257)
             stack = .allocate(capacity: stackCapacity)
             markUsed(0)
+            markUsed(Int(DoubleArrayTrie.root))
         }
 
         @inline(__always) private mutating func push(_ node: Int32, _ lo: Int, _ hi: Int, _ depth: Int) {
@@ -170,25 +190,17 @@ final class DoubleArrayTrie: @unchecked Sendable {
         }
 
         /// Hands the unit array (trimmed to the last used 256-block) to the trie.
+        /// Copies the trie into an allocation of exactly the size it ended up needing; the
+        /// builder's pages are released with it.
         mutating func finish() -> UnsafeMutablePointer<Unit> {
-            let trimmed = (highWater + 255) & ~255
-            if trimmed < capacity {
-                let compact = UnsafeMutablePointer<Unit>.allocate(capacity: trimmed)
-                compact.moveInitialize(from: units, count: trimmed)
-                (units + trimmed).deinitialize(count: capacity - trimmed)
-                units.deallocate()
-                units = compact
-                capacity = trimmed
-            }
-            used.deallocate()
-            order.deallocate()
-            keyIndex.deallocate()
+            capacity = (highWater + 255) & ~255
+            let compact = UnsafeMutablePointer<Unit>.allocate(capacity: capacity)
+            compact.initialize(from: units, count: capacity)
             counts.deallocate()
             cursors.deallocate()
-            labelOf.deallocate()
             groups.deallocate()
             stack.deallocate()
-            return units
+            return compact
         }
 
         @inline(__always) private func start(_ entry: UInt64) -> Int { Int(entry >> 32) }
@@ -211,16 +223,14 @@ final class DoubleArrayTrie: @unchecked Sendable {
 
         private mutating func grow() {
             let newCapacity = capacity * 2
-            let newUnits = UnsafeMutablePointer<Unit>.allocate(capacity: newCapacity)
-            newUnits.moveInitialize(from: units, count: capacity)
-            (newUnits + capacity).initialize(repeating: Self.empty, count: newCapacity - capacity)
-            units.deallocate()
-            units = newUnits
-            let newUsed = UnsafeMutablePointer<UInt64>.allocate(capacity: newCapacity / 64)
-            newUsed.moveInitialize(from: used, count: capacity / 64)
-            (newUsed + capacity / 64).initialize(repeating: 0, count: (newCapacity - capacity) / 64)
-            used.deallocate()
-            used = newUsed
+            let grownUnits = PageBlock<Unit>(count: newCapacity)
+            grownUnits.base.update(from: units, count: capacity)
+            unitPages = grownUnits
+            units = grownUnits.base
+            let grownUsed = PageBlock<UInt64>(count: newCapacity / 64)
+            grownUsed.base.update(from: used, count: capacity / 64)
+            usedPages = grownUsed
+            used = grownUsed.base
             capacity = newCapacity
         }
 
@@ -350,7 +360,7 @@ final class DoubleArrayTrie: @unchecked Sendable {
                 position += 1
             }
             if end > start(key) {
-                units[Int(node)].value = Int32(keyIndex[keyPosition])
+                units[Int(node)].value = Int32(keyIndex[keyPosition]) &+ 1
                 keyCount += 1
             }
         }
@@ -373,7 +383,7 @@ final class DoubleArrayTrie: @unchecked Sendable {
                     if depth > 0 {
                         var value: UInt32 = 0
                         for k in groups[0].lo..<groups[0].hi { value = max(value, keyIndex[k]) }
-                        units[Int(node)].value = Int32(value)
+                        units[Int(node)].value = Int32(value) &+ 1
                         keyCount += 1
                     }
                     firstChild = 1
