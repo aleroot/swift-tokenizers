@@ -76,6 +76,20 @@ jobs:
       - name: Address sanitizer (byte kernels and raw storage)
         run: swift test --sanitize=address --filter "ByteKernels|OptimizationRegression|ConfigTests|TrieTests|UnicodeTablesTests|UnicodeNormalizationTests|CorrectnessAuditTests|JSONFuzz|BPEMerge"
 
+  docs:
+    name: Documentation
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.4.app
+      # The DocC plugin is appended to the checkout instead of the manifest, so that it never
+      # appears in the dependency graph of an app. Same approach as swiftlang/github-workflows.
+      - name: Check the DocC catalog (warnings are errors)
+        run: |
+          printf '\npackage.dependencies.append(\n    .package(url: "https://github.com/swiftlang/swift-docc-plugin", from: "1.0.0")\n)\n' >> Package.swift
+          swift package plugin generate-documentation --target Tokenizers --warnings-as-errors --analyze
+
   ios:
     name: Build (iOS)
     runs-on: macos-15
