@@ -8,6 +8,12 @@ public struct TokenEncoding: Sendable {
     public let ids: [Int]
     public let offsets: [Range<Int>?]?
     public let text: String
+    /// The second sequence, when this encodes a pair.
+    public let textPair: String?
+    /// The segment each ID belongs to, for a pair encoding: `nil` for a single sequence, which
+    /// never pays to compute a table of zeros. A tokenizer's pair template decides the values,
+    /// so they are not always 0 and 1: RoBERTa-style templates put everything in segment 0.
+    public let typeIds: [Int]?
 
     /// Creates an encoding for a custom tokenizer. Ranges must use Unicode-scalar
     /// boundaries in `text`; offsets and IDs must have the same count.
@@ -15,27 +21,42 @@ public struct TokenEncoding: Sendable {
         var copy = text
         let valid = copy.withUTF8 { bytes in
             guard let offsets else { return true }
-            return ids.count == offsets.count && offsets.allSatisfy { offset in
-                guard let offset else { return true }
-                guard offset.lowerBound >= 0, offset.upperBound <= bytes.count else { return false }
-                return (offset.lowerBound == bytes.count || bytes[offset.lowerBound] & 0xC0 != 0x80)
-                    && (offset.upperBound == bytes.count || bytes[offset.upperBound] & 0xC0 != 0x80)
-            }
+            return ids.count == offsets.count
+                && offsets.allSatisfy { offset in
+                    guard let offset else { return true }
+                    guard offset.lowerBound >= 0, offset.upperBound <= bytes.count else { return false }
+                    return (offset.lowerBound == bytes.count || bytes[offset.lowerBound] & 0xC0 != 0x80)
+                        && (offset.upperBound == bytes.count || bytes[offset.upperBound] & 0xC0 != 0x80)
+                }
         }
         guard valid else { throw TokenizerError.invalidConfiguration("Invalid source offsets") }
         self.text = text
         self.ids = ids
         self.offsets = offsets
+        textPair = nil
+        typeIds = nil
     }
 
     init(text: String, ids: [Int]) {
         self.text = text
         self.ids = ids
         offsets = nil
+        textPair = nil
+        typeIds = nil
+    }
+
+    init(text: String, textPair: String, pair: PairEncoding) {
+        self.text = text
+        self.textPair = textPair
+        ids = pair.ids
+        typeIds = pair.typeIds
+        offsets = nil
     }
 
     init(text: String, tokens: [AlignedToken]) {
         self.text = text
+        textPair = nil
+        typeIds = nil
         ids = tokens.map(\.id)
         // Post-processors trim byte offsets. Like HF's character conversion, a
         // trimmed boundary inside a scalar rounds down to that scalar's start.
@@ -75,7 +96,8 @@ public struct TokenEncoding: Sendable {
             positions[i] = utf16
             return offsets.map { offset in
                 offset.map {
-                    NSRange(location: positions[$0.lowerBound], length: positions[$0.upperBound] - positions[$0.lowerBound])
+                    NSRange(
+                        location: positions[$0.lowerBound], length: positions[$0.upperBound] - positions[$0.lowerBound])
                 }
             }
         }
@@ -129,6 +151,18 @@ public extension Tokenizer {
 
     func encode(text: String, withOffsets: Bool) throws -> TokenEncoding {
         try encode(text: text, addSpecialTokens: true, withOffsets: withOffsets)
+    }
+
+    /// Encodes a sequence pair through the tokenizer's pair template, which is what a
+    /// cross-encoder reranker or a sentence-pair classifier expects.
+    ///
+    /// Third-party conformers retain source compatibility and may override this method.
+    func encode(text: String, textPair: String, addSpecialTokens: Bool) throws -> TokenEncoding {
+        throw TokenizerError.unsupportedComponent("sequence pairs for this tokenizer")
+    }
+
+    func encode(text: String, textPair: String) throws -> TokenEncoding {
+        try encode(text: text, textPair: textPair, addSpecialTokens: true)
     }
 }
 

@@ -44,15 +44,17 @@ extension PostProcessor {
         }
     }
 
-    func processOffsets(_ tokens: [AlignedToken], addSpecialTokens: Bool,
-                        resolve: (String) -> Int?, spelling: (Int) -> String?) throws -> [AlignedToken] {
+    func processOffsets(
+        _ tokens: [AlignedToken], addSpecialTokens: Bool,
+        resolve: (String) -> Int?, spelling: (Int) -> String?
+    ) throws -> [AlignedToken] {
         switch self {
         case let template as TemplateProcessing:
             var result: [AlignedToken] = []
             for item in template.singleItems {
                 switch item {
                 case .sequenceA: result.append(contentsOf: tokens)
-                case let .special(token, special):
+                case let .special(token, special, _):
                     guard addSpecialTokens else { continue }
                     let ids = TemplateProcessing.ids(of: token, special, resolving: resolve)
                     result.append(contentsOf: ids.map { AlignedToken(id: $0, offset: nil) })
@@ -61,9 +63,11 @@ extension PostProcessor {
             }
             return result
         case let byteLevel as ByteLevelPostProcessor:
-            return byteLevel.trimOffsets ? Self.trim(tokens, prefixSpace: byteLevel.addPrefixSpace, spelling: spelling) : tokens
+            return byteLevel.trimOffsets
+                ? Self.trim(tokens, prefixSpace: byteLevel.addPrefixSpace, spelling: spelling) : tokens
         case let roberta as RobertaProcessing:
-            var result = roberta.trimOffset ? Self.trim(tokens, prefixSpace: roberta.addPrefixSpace, spelling: spelling) : tokens
+            var result =
+                roberta.trimOffset ? Self.trim(tokens, prefixSpace: roberta.addPrefixSpace, spelling: spelling) : tokens
             if addSpecialTokens {
                 result.insert(AlignedToken(id: Int(roberta.cls.0), offset: nil), at: 0)
                 result.append(AlignedToken(id: Int(roberta.sep.0), offset: nil))
@@ -83,7 +87,8 @@ extension PostProcessor {
         }
     }
 
-    private static func trim(_ tokens: [AlignedToken], prefixSpace: Bool, spelling: (Int) -> String?) -> [AlignedToken] {
+    private static func trim(_ tokens: [AlignedToken], prefixSpace: Bool, spelling: (Int) -> String?) -> [AlignedToken]
+    {
         tokens.enumerated().map { index, token in
             guard let range = token.offset, let text = token.spelling ?? spelling(token.id) else { return token }
             func whitespace(_ scalar: Unicode.Scalar) -> Bool { scalar == "Ġ" || scalar.properties.isWhitespace }

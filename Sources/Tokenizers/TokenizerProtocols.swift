@@ -144,6 +144,7 @@ public protocol Tokenizer: Sendable {
     func encode(text: String) -> [Int]
     func encode(text: String, addSpecialTokens: Bool) -> [Int]
     func encode(text: String, addSpecialTokens: Bool, withOffsets: Bool) throws -> TokenEncoding
+    func encode(text: String, textPair: String, addSpecialTokens: Bool) throws -> TokenEncoding
     func callAsFunction(_ text: String, addSpecialTokens: Bool) -> [Int]
 
     func encode(

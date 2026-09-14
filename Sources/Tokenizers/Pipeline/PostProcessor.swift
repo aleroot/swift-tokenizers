@@ -21,8 +21,33 @@ public extension PostProcessor {
 /// non-optional reference to whatever performs the step. Reading an optional existential
 /// property per encode call costs a pair of reference-count updates on an object every encoding
 /// thread shares, which is what stops a shared tokenizer scaling past a few threads.
+/// A sequence pair in id space: the spliced ids and the segment each one belongs to.
+struct PairEncoding {
+    private(set) var ids: [Int] = []
+    private(set) var typeIds: [Int] = []
+
+    init(capacity: Int) {
+        ids.reserveCapacity(capacity)
+        typeIds.reserveCapacity(capacity)
+    }
+
+    mutating func append(_ values: some Sequence<Int>, typeId: Int) {
+        for value in values {
+            ids.append(value)
+            typeIds.append(typeId)
+        }
+    }
+}
+
 protocol IdPostProcessor: Sendable {
     func postProcess(ids: inout [Int], addSpecialTokens: Bool)
+
+    /// Splices a sequence pair through this processor's pair template.
+    ///
+    /// A sequence carries its index as its segment id, as in `tokenizers`; a processor that
+    /// declares segment ids of its own overrides that. `nil` when the processor has no pair
+    /// form at id level, which the caller reports rather than guessing at one.
+    func postProcess(ids: [Int], pair: [Int], addSpecialTokens: Bool) -> PairEncoding?
 
     /// This processor with everything it needs from a vocabulary already resolved. The default
     /// is `self`, which is right for every processor whose special pieces declare their own ids;
@@ -32,12 +57,27 @@ protocol IdPostProcessor: Sendable {
 
 extension IdPostProcessor {
     func bound(resolving resolve: (String) -> Int?) -> any IdPostProcessor { self }
+
+    func postProcess(ids: [Int], pair: [Int], addSpecialTokens: Bool) -> PairEncoding? { nil }
+
+    /// The two sequences one after the other, each carrying its index as its segment id, which
+    /// is what `tokenizers` produces for a processor that adds nothing around a pair.
+    func concatenated(_ ids: [Int], _ pair: [Int]) -> PairEncoding {
+        var result = PairEncoding(capacity: ids.count + pair.count)
+        result.append(ids, typeId: 0)
+        result.append(pair, typeId: 1)
+        return result
+    }
 }
 
 /// Leaves ids untouched, for a tokenizer that declares no post-processor. An empty struct, so
 /// the existential holding it is copied without touching a reference count.
 struct NoIdPostProcessing: IdPostProcessor {
     func postProcess(ids: inout [Int], addSpecialTokens: Bool) {}
+
+    func postProcess(ids: [Int], pair: [Int], addSpecialTokens: Bool) -> PairEncoding? {
+        concatenated(ids, pair)
+    }
 }
 
 /// Round-trips through token strings, for a processor that has no id-level path. A class so the
@@ -100,10 +140,11 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
     }
 
     enum Item: Sendable {
-        /// The template's identifier, and its `special_tokens` entry when the file has one.
-        case special(String, SpecialToken?)
-        case sequenceA
-        case sequenceB
+        /// The template's identifier, its `special_tokens` entry when the file has one, and the
+        /// segment the piece belongs to.
+        case special(String, SpecialToken?, typeId: Int)
+        case sequenceA(typeId: Int)
+        case sequenceB(typeId: Int)
         case ignored
     }
 
@@ -113,12 +154,22 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
         case sequence
     }
 
+    /// A pair template piece in id space. Unlike the single template, a pair names both
+    /// sequences and its segment ids are part of the result.
+    private enum PairIdItem {
+        case ids([Int], typeId: Int)
+        case sequenceA(typeId: Int)
+        case sequenceB(typeId: Int)
+    }
+
     let single: [Config]
     let pair: [Config]
     let singleItems: [Item]
     let pairItems: [Item]
     /// `singleItems` compiled to ids.
     private let idItems: [IdItem]
+    /// `pairItems` compiled to ids, with the segment each piece declares.
+    private let pairIdItems: [PairIdItem]
     /// The ids around the sequence, when the compiled template contains exactly one sequence
     /// piece: the overwhelmingly common `[specials] $A [specials]` shape then costs two splices,
     /// with no loop and no temporary array.
@@ -143,12 +194,13 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
         else {
             throw TokenizerError.invalidConfiguration("TemplateProcessing single template references sequence B")
         }
-        needsVocabulary = singleItems.contains {
-            if case let .special(_, special) = $0 { return special == nil }; return false
+        needsVocabulary = (singleItems + pairItems).contains {
+            if case let .special(_, special, _) = $0 { return special == nil }; return false
         }
         // Unbound: a special piece with no declared ids resolves to nothing, which is what a
         // failed vocabulary lookup contributes.
         idItems = Self.compile(singleItems) { _ in nil }
+        pairIdItems = Self.compilePair(pairItems) { _ in nil }
         affixes = Self.affixes(of: idItems)
     }
 
@@ -162,6 +214,7 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
         self.pairItems = pairItems
         needsVocabulary = false
         idItems = Self.compile(singleItems, resolving: resolve)
+        pairIdItems = Self.compilePair(pairItems, resolving: resolve)
         affixes = Self.affixes(of: idItems)
     }
 
@@ -177,10 +230,25 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
         items.compactMap { item in
             switch item {
             case .sequenceA: return .sequence
-            case let .special(token, special):
+            case let .special(token, special, _):
                 let ids = Self.ids(of: token, special, resolving: resolve)
                 return ids.isEmpty ? nil : .ids(ids)
             case .sequenceB, .ignored: return nil
+            }
+        }
+    }
+
+    /// Resolves a pair template to ids. Both sequences survive here, each with the segment the
+    /// template gives it.
+    private static func compilePair(_ items: [Item], resolving resolve: (String) -> Int?) -> [PairIdItem] {
+        items.compactMap { item in
+            switch item {
+            case let .sequenceA(typeId): return .sequenceA(typeId: typeId)
+            case let .sequenceB(typeId): return .sequenceB(typeId: typeId)
+            case let .special(token, special, typeId):
+                let ids = Self.ids(of: token, special, resolving: resolve)
+                return ids.isEmpty ? nil : .ids(ids, typeId: typeId)
+            case .ignored: return nil
             }
         }
     }
@@ -212,10 +280,13 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
     }
 
     private static func item(_ config: Config, specials: [String: SpecialToken]) -> Item {
-        if let id = config.SpecialToken.id.string() { return .special(id, specials[id] ?? nil) }
+        if let id = config.SpecialToken.id.string() {
+            return .special(id, specials[id] ?? nil, typeId: config.SpecialToken.typeId.integer(or: 0))
+        }
+        let typeId = config.Sequence.typeId.integer(or: 0)
         switch config.Sequence.id.string() {
-        case "A": return .sequenceA
-        case "B": return .sequenceB
+        case "A": return .sequenceA(typeId: typeId)
+        case "B": return .sequenceB(typeId: typeId)
         default: return .ignored
         }
     }
@@ -226,7 +297,7 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
         out.reserveCapacity(tokens.count + (tokensPair?.count ?? 0) + items.count)
         for item in items {
             switch item {
-            case let .special(id, special):
+            case let .special(id, special, _):
                 if addSpecialTokens { out.append(contentsOf: special?.tokens ?? [id]) }
             case .sequenceA:
                 out.append(contentsOf: tokens)
@@ -237,6 +308,20 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
             }
         }
         return out
+    }
+
+    /// The template decides the segments, so it runs whether or not specials are added: only
+    /// the special pieces drop out, exactly as `apply_template` does.
+    func postProcess(ids: [Int], pair: [Int], addSpecialTokens: Bool) -> PairEncoding? {
+        var result = PairEncoding(capacity: ids.count + pair.count + pairIdItems.count)
+        for item in pairIdItems {
+            switch item {
+            case let .sequenceA(typeId): result.append(ids, typeId: typeId)
+            case let .sequenceB(typeId): result.append(pair, typeId: typeId)
+            case let .ids(specials, typeId): if addSpecialTokens { result.append(specials, typeId: typeId) }
+            }
+        }
+        return result
     }
 
     func postProcess(ids: inout [Int], addSpecialTokens: Bool) {
@@ -272,6 +357,11 @@ final class ByteLevelPostProcessor: PostProcessor, IdPostProcessor {
     }
 
     func postProcess(ids: inout [Int], addSpecialTokens: Bool) {}
+
+    // `trim_offsets` moves offset boundaries only, so a pair is the two sequences as they are.
+    func postProcess(ids: [Int], pair: [Int], addSpecialTokens: Bool) -> PairEncoding? {
+        concatenated(ids, pair)
+    }
 }
 
 final class RobertaProcessing: PostProcessor, IdPostProcessor {
@@ -309,6 +399,24 @@ final class RobertaProcessing: PostProcessor, IdPostProcessor {
         ids.insert(Int(cls.0), at: 0)
         ids.append(Int(sep.0))
     }
+
+    /// RoBERTa puts every id in segment 0, pair or not, and separates the two sequences with a
+    /// doubled `sep`.
+    func postProcess(ids: [Int], pair: [Int], addSpecialTokens: Bool) -> PairEncoding? {
+        var result = PairEncoding(capacity: ids.count + pair.count + 4)
+        guard addSpecialTokens else {
+            result.append(ids, typeId: 0)
+            result.append(pair, typeId: 0)
+            return result
+        }
+        result.append(CollectionOfOne(Int(cls.0)), typeId: 0)
+        result.append(ids, typeId: 0)
+        result.append(CollectionOfOne(Int(sep.0)), typeId: 0)
+        result.append(CollectionOfOne(Int(sep.0)), typeId: 0)
+        result.append(pair, typeId: 0)
+        result.append(CollectionOfOne(Int(sep.0)), typeId: 0)
+        return result
+    }
 }
 
 final class BertProcessing: PostProcessor, IdPostProcessor {
@@ -333,6 +441,17 @@ final class BertProcessing: PostProcessor, IdPostProcessor {
         guard addSpecialTokens else { return }
         ids.insert(Int(cls.0), at: 0)
         ids.append(Int(sep.0))
+    }
+
+    func postProcess(ids: [Int], pair: [Int], addSpecialTokens: Bool) -> PairEncoding? {
+        guard addSpecialTokens else { return concatenated(ids, pair) }
+        var result = PairEncoding(capacity: ids.count + pair.count + 3)
+        result.append(CollectionOfOne(Int(cls.0)), typeId: 0)
+        result.append(ids, typeId: 0)
+        result.append(CollectionOfOne(Int(sep.0)), typeId: 0)
+        result.append(pair, typeId: 1)
+        result.append(CollectionOfOne(Int(sep.0)), typeId: 1)
+        return result
     }
 }
 
@@ -368,6 +487,21 @@ final class SequenceProcessing: PostProcessor, IdPostProcessor {
         for processor in idProcessors {
             processor.postProcess(ids: &ids, addSpecialTokens: addSpecialTokens)
         }
+    }
+
+    /// Exactly one member may shape a pair. Chaining two of them would have the second treat
+    /// the first one's output as a single sequence, which is not what any of them mean.
+    func postProcess(ids: [Int], pair: [Int], addSpecialTokens: Bool) -> PairEncoding? {
+        var result: PairEncoding?
+        for processor in idProcessors {
+            guard let spliced = processor.postProcess(ids: ids, pair: pair, addSpecialTokens: addSpecialTokens)
+            else { return nil }
+            // A member that adds nothing around the pair leaves the shaping to another.
+            if spliced.ids.count == ids.count + pair.count { continue }
+            guard result == nil else { return nil }
+            result = spliced
+        }
+        return result ?? concatenated(ids, pair)
     }
 
     func bound(resolving resolve: (String) -> Int?) -> any IdPostProcessor {

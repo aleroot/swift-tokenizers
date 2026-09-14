@@ -242,6 +242,21 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         return ids
     }
 
+    /// Encodes a sequence pair through the tokenizer's pair template, which is what a
+    /// cross-encoder reranker or a sentence-pair classifier expects.
+    ///
+    /// - Throws: ``TokenizerError/unsupportedComponent(_:)`` when the tokenizer's post-processor
+    ///   has no pair form, rather than returning a plausible-looking concatenation.
+    public func encode(text: String, textPair: String, addSpecialTokens: Bool = true) throws -> TokenEncoding {
+        let first = encodeWithoutPostProcessing(text: text)
+        let second = encodeWithoutPostProcessing(text: textPair)
+        guard let pair = idPostProcessor.postProcess(ids: first, pair: second, addSpecialTokens: addSpecialTokens)
+        else {
+            throw TokenizerError.unsupportedComponent("sequence pairs for this tokenizer's post-processor")
+        }
+        return TokenEncoding(text: text, textPair: textPair, pair: pair)
+    }
+
     /// Encodes with source alignment, without changing the IDs-only encode path.
     public func encode(text: String, addSpecialTokens: Bool = true, withOffsets: Bool) throws -> TokenEncoding {
         guard withOffsets else {
