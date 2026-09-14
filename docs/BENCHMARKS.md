@@ -5,11 +5,11 @@ including the other implementations. The [JSON parser follow-up](#json-parser-fo
 records a later before/after experiment on an M2. The [source-offset measurements](#source-offset-encoding)
 also use an M2. All figures are measurements, not projections.
 
-The [headline](#headline), [SentencePiece](#sentencepiece) and [load time](#load-time) tables were
-re-measured after the pre-tokenization and scratch-ownership work landed, with every engine run
-one at a time on an otherwise idle machine. Short inputs are sensitive to CPU clock ramp: an
-11.5 KB encode varies by about 15% depending on what ran before it, so the headline quotes the
-1.15 MB document, which is stable to 1%.
+The [headline](#headline) and [SentencePiece](#sentencepiece) tables were re-measured after the
+pre-tokenization and scratch-ownership work landed, with every engine run one at a time on an
+otherwise idle machine. The [load time](#load-time) table is from a later sitting, noted there.
+Short inputs are sensitive to CPU clock ramp: an 11.5 KB encode varies by about 15% depending on
+what ran before it, so the headline quotes the 1.15 MB document, which is stable to 1%.
 
 | | |
 |---|---|
@@ -170,27 +170,47 @@ seven. Rain tapped against the glass roof. ” The multilingual paragraph is
 
 ## Load time
 
-Median of 5 loads of the same folder, warm filesystem cache.
+Median of 5 loads of the same folder, warm filesystem cache. Re-measured in one sitting after
+the concurrent merge resolution and the page-backed trie builder landed; the machine carried
+more background load than the sitting the encode tables come from, which raises every column
+here by roughly the same amount and leaves the comparison between them intact.
 
 | Tokenizer (`tokenizer.json`) | swift-tokenizers | HF `tokenizers` 0.22.2 | `transformers` 4.57.6 | swift-transformers |
 |---|---:|---:|---:|---:|
-| Qwen3-0.6B byte-level BPE (10.9 MiB) | 23.0 ms | 97.0 ms | 94.8 ms | 297.0 ms |
-| Llama-3.2-1B byte-level BPE (16.4 MiB) | 35.4 ms | 129.8 ms | 131.4 ms | 469.0 ms |
-| multilingual-e5-small Unigram, 250k pieces (16.3 MiB) | 41.6 ms | 211.9 ms | 321.2 ms | 270.2 ms |
-| bert-base-uncased WordPiece, 30k (0.4 MiB) | 1.8 ms | 8.4 ms | 13.6 ms | 14.4 ms |
+| Qwen3-0.6B byte-level BPE (10.9 MiB) | 17.2 ms | 108.4 ms | 106.9 ms | 325.5 ms |
+| Llama-3.2-1B byte-level BPE (16.4 MiB) | 24.2 ms | 143.9 ms | 144.2 ms | 517.4 ms |
+| multilingual-e5-small Unigram, 250k pieces (16.3 MiB) | 45.8 ms | 165.7 ms | 287.0 ms | 305.6 ms |
+| bert-base-uncased WordPiece, 30k (0.4 MiB) | 1.8 ms | 9.0 ms | 14.9 ms | 15.6 ms |
 
-Stage breakdown for the two interesting cases:
+Stage breakdown for the two interesting cases, from the same sitting:
 
 | Stage | Qwen3 BPE (10.9 MiB) | XLM-R Unigram (16.3 MiB, 250,002 pieces) |
 |---|---:|---:|
-| Parse + pack `tokenizer.json` (`Config(tokenizerJSON:)`) | 22.7 ms | 22.7 ms |
-| — for comparison: `Config(jsonData:)` | 33.6 ms | — |
-| — for comparison: `JSONSerialization` alone | 54.7 ms | — |
-| Build packed vocabulary | (in parse) | 6.5 ms |
-| Build double-array trie | — | 20.0 ms (785,408 units, 9.2 MB) |
-| Build `Precompiled` charsmap normalizer | — | 0.3 ms |
-| Expand generated Unicode tables (historical implementation) | 0.05 ms | 0.05 ms |
-| **Total `AutoTokenizer.load`** | **23.0 ms** | **41.6 ms** |
+| Read + parse + pack `tokenizer.json` (`Config(tokenizerJSON:)`) | 10.5 ms | 16.5 ms |
+| Parse `tokenizer_config.json` | 0.2 ms | 0.3 ms |
+| Build packed vocabulary | 4.1 ms | 7.7 ms |
+| Build merge table (symbols resolved across cores) | 3.1 ms | — |
+| Build double-array trie | — | 23.4 ms (785,408 units, 9.2 MB) |
+| Remaining model and pipeline tables | 4.0 ms | 0.4 ms |
+| **Total `AutoTokenizer.load`** | **17.2 ms** | **45.8 ms** |
+
+Byte-level BPE spends most of a load in the parser; Unigram spends it in the trie. Resolving
+each merge rank's three vocabulary lookups is a memory-latency problem rather than a work
+problem, so it runs on every available core, and the table is still filled in rank order, which
+makes the result independent of how the ranks were divided.
+
+Forcing the rank list into a fixed number of chunks shows how the gain arrives, so it does not
+depend on having many cores:
+
+| Chunks | Llama-3.2-1B | Gemma 3 (31.8 MiB, 262k) | Qwen3-0.6B |
+|---:|---:|---:|---:|
+| 1 (serial) | 32.4 ms | 72.4 ms | 21.1 ms |
+| 2 | 28.0 ms | 64.1 ms | 18.9 ms |
+| 4 | 25.8 ms | 57.9 ms | 17.2 ms |
+| default (4 per core, capped at 8 cores) | 23.9 ms | 54.3 ms | 16.8 ms |
+
+Several chunks per core rather than one per core keeps a phone's efficiency cores from holding
+up an even split.
 
 ### JSON parser follow-up
 
@@ -282,17 +302,22 @@ warm process (several tokenizers loaded in sequence, as in an app).
 
 | Tokenizer | `tokenizer.json` | Live heap | `phys_footprint` |
 |---|---:|---:|---:|
-| Qwen3-Embedding-0.6B (byte-level BPE) | 10.9 MiB | +11.1 MB | +10.1 MB |
-| Qwen3-Reranker-0.6B (byte-level BPE) | 10.9 MiB | +10.9 MB | +9.0 MB |
-| Llama-3.2-1B-Instruct (byte-level BPE) | 16.4 MiB | +13.5 MB | +13.4 MB |
-| multilingual-e5-small (Unigram, 250k) | 16.3 MiB | +19.1 MB | +50.3 MB † |
-| bge-m3 / bge-reranker-v2-m3 (Unigram, 250k) | 16.3 MiB | +19.1 MB | +19.7 MB |
-| jina-reranker-v2-base-multilingual (Unigram, 250k) | 16.3 MiB | +19.1 MB | +19.5 MB |
-| bert-base-uncased (WordPiece, 30k) | 0.4 MiB | +1.1 MB | +0.7 MB |
-| nomic-embed-text-v1.5 (WordPiece, 30k) | 0.7 MiB | +1.0 MB | +0.1 MB |
+| Qwen3-Embedding-0.6B (byte-level BPE) | 10.9 MiB | +11.1 MB | +10.3 MB |
+| Qwen3-Reranker-0.6B (byte-level BPE) | 10.9 MiB | +10.9 MB | +9.1 MB |
+| Llama-3.2-1B-Instruct (byte-level BPE) | 16.4 MiB | +13.5 MB | +13.3 MB |
+| multilingual-e5-small (Unigram, 250k) | 16.3 MiB | +19.1 MB | +20.0 MB |
+| bge-m3 (Unigram, 250k) | 16.3 MiB | +19.1 MB | +19.4 MB |
+| bge-reranker-v2-m3 (Unigram, 250k) | 16.3 MiB | +19.1 MB | +18.1 MB |
+| jina-reranker-v2-base-multilingual (Unigram, 250k) | 16.3 MiB | +19.1 MB | +18.3 MB |
+| bert-base-uncased (WordPiece, 30k) | 0.4 MiB | +1.1 MB | +1.0 MB |
+| nomic-embed-text-v1.5 (WordPiece, 30k) | 0.7 MiB | +1.0 MB | +0.8 MB |
 
-† The first Unigram loaded in a process keeps dirty pages from the trie builder's peak
-allocations; every later one settles at ~19.5 MB.
+Footprint tracks live heap for every family, including the first Unigram loaded in a process.
+The trie builder reserves an upper bound of tens of megabytes for its unit array, so it works on
+anonymous pages that the VM system zero-fills on first touch and unmaps when the trie is trimmed
+to size: the reserved slack is never written, and the scratch does not stay behind in the
+allocator. Measured on the FLORES corpus harness, a cold load of multilingual-e5-small peaks at
+20.4 MB rather than 51.9 MB, and T5 at 3.9 MB rather than 7.3 MB.
 
 The two large structures are the packed vocabulary (2,581,345 bytes of token UTF-8 plus a 4-byte
 offset per piece and a byte-hash index) and the double-array trie (785,408 × 12-byte units). The
@@ -322,8 +347,8 @@ batch (318 KB). Per-text medians; the Hugging Face column is the same corpus thr
 | Qwen3-Reranker-0.6B | byte-level BPE | 0.4 µs | 3.0 µs · 198 MB/s | 11.3 µs · 201 MB/s | 1.6 µs · 125 MB/s | 1.56 ms · 194 MB/s | 101.6 µs · 5.8 MB/s | 34× |
 | Llama-3.2-1B-Instruct | byte-level BPE | 0.7 µs | 3.3 µs · 179 MB/s | 10.6 µs · 214 MB/s | 1.5 µs · 137 MB/s | 1.62 ms · 187 MB/s | 91.0 µs · 6.5 MB/s | 28× |
 
-Load times for the same models: 1.6–1.8 ms (WordPiece, 0.4–0.7 MiB), 22.5–22.7 ms (Qwen3 BPE,
-10.9 MiB), 34.6 ms (Llama-3.2 BPE, 16.4 MiB), 48.8–49.2 ms (XLM-R Unigram, 16.3 MiB).
+Load times for the same models: 1.6–2.0 ms (WordPiece, 0.4–0.7 MiB), 17.2–17.4 ms (Qwen3 BPE,
+10.9 MiB), 24.2 ms (Llama-3.2 BPE, 16.4 MiB), 45.9–46.2 ms (XLM-R Unigram, 16.3 MiB).
 
 A reranker scoring 100 candidates spends well under a millisecond tokenizing them; a
 multilingual-e5-small index of 1,000 passages takes ~2.2 ms.
@@ -543,11 +568,16 @@ hand-written over UTF-8 with NEON lane masks instead of being expressed as regul
 * **Double-array tries.** Unigram (SentencePiece) segmentation runs the Viterbi lattice on
   UTF-8 offsets and enumerates candidate pieces with a static double-array trie: one 12-byte
   unit per node, one load per input byte, no hashing. The trie is built at load time with an
-  in-place radix partition fused with node placement (~20 ms for XLM-R's 250k pieces, 785,408
-  units for 250,002 keys). The same structure matches added tokens.
+  in-place radix partition fused with node placement (~23 ms for XLM-R's 250k pieces, 785,408
+  units for 250,002 keys). A zeroed unit is a free slot, so the builder reserves its upper bound
+  on anonymous pages, never writes the slack, and hands the memory back when it trims the trie
+  to size. The same structure matches added tokens.
 * **Integer BPE.** Symbols are token ids, not strings; merges are resolved through a flat
   open-addressing table keyed by `(leftId, rightId)`. A byte-level pretoken goes from raw UTF-8
-  bytes to symbol ids through a 256-entry table — no `String` is ever built.
+  bytes to symbol ids through a 256-entry table — no `String` is ever built. Interning a
+  published merge list means a few hundred thousand independent probes into tables larger than
+  the last-level cache, so at load time they are resolved across cores and the table is filled
+  in rank order afterwards, which keeps the result independent of the split.
 * **Regex-free pre-tokenization.** The GPT-2, Llama-3/cl100k, Qwen-2, Qwen-3.5, o200k
   (GPT-4o / gpt-oss / Muse), Falcon-H1 and DeepSeek (V2 / V3 / R1 / V4) split patterns are
   implemented as hand-written
@@ -615,7 +645,7 @@ hand-written over UTF-8 with NEON lane masks instead of being expressed as regul
   2.5k runs plus 1.5k decompositions; all expand in ~0.05 ms instead of querying scalar
   properties at launch.
 * **Small footprint.** Merge tables index dense entries through 32-bit slots, caches store
-  32-bit ids, and decode tables are built lazily — a Qwen3 tokenizer retains ~13 MB, a BERT
+  32-bit ids, and decode tables are built lazily — a Qwen3 tokenizer retains ~10 MB, a BERT
   tokenizer ~1 MB including its word cache.
 * **Exact SentencePiece chunking.** Llama-2-style tokenizers treat a whole text section as one
   BPE word. Every BPE output token is a merge product, so a merge can only cross a `▁` word

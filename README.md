@@ -131,16 +131,16 @@ reference line.
 
 ![Memory retained by a loaded tokenizer](docs/memory.svg)
 
-A loaded tokenizer keeps 6 to 12 times less memory than Hugging Face's Rust core and less than
-SentencePiece on both models it can load: 7.8 MiB against 10.4 MiB on T5, 35.0 MiB against
+A loaded tokenizer keeps 11 to 13 times less memory than Hugging Face's Rust core and less than
+SentencePiece on both models it can load: 3.9 MiB against 10.4 MiB on T5, 35.1 MiB against
 56.4 MiB on Gemma 3, even though the same 262k vocabulary arrives as a 31.8 MiB `tokenizer.json`
-instead of a 4.5 MiB protobuf. The tables parsed out of the JSON live in page-backed buffers that
-go straight back to the OS once the tokenizer is built.
+instead of a 4.5 MiB protobuf. The tables parsed out of the JSON, and the scratch the models
+build from them, live on pages that go straight back to the OS once the tokenizer is built.
 
 English prose is friendlier to every engine. On a 1.15 MB document the same Qwen 3 tokenizer
 reaches **231 MiB/s** single-threaded, against 55 MiB/s for `tiktoken` (`o200k_base`), 5.4 MiB/s
 for Hugging Face's Rust core and 0.9 MiB/s for swift-transformers, and it loads its 10.9 MiB
-`tokenizer.json` in **23 ms** against 97 ms.
+`tokenizer.json` in **17 ms** against 108 ms.
 
 Every tokenizer family, embedding and reranker models, end-to-end figures through mlx-swift-lm,
 cold-cache runs, concurrency scaling, methodology and how to reproduce all of it:
