@@ -662,12 +662,12 @@ struct JSONConfigParser {
             if !isASCII, !Self.isValidUTF8(slice) {
                 throw JSONConfigError.invalidUTF8(offset: start)
             }
-            buffer.append(contentsOf: slice)
+            buffer.append(bytes: slice)
             return
         }
         let string = try parseStringFromEscape(start: start, firstEscape: i)
         var copy = string
-        copy.withUTF8 { buffer.append(contentsOf: $0) }
+        copy.withUTF8 { buffer.append(bytes: $0) }
     }
 
     /// Shared escape decoder for ordinary strings and packed tokenizer tables.

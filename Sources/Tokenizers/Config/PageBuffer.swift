@@ -62,6 +62,26 @@ final class PageBuffer<Element>: @unchecked Sendable {
         count += source.count
     }
 
+    /// Reserves room for `n` more elements and returns the write position, leaving `count`
+    /// unchanged until ``commit(_:)``.
+    @inline(__always)
+    func reserveTail(_ n: Int) -> UnsafeMutablePointer<Element> {
+        if count + n > capacity { grow(toHold: count + n) }
+        return base + count
+    }
+
+    @inline(__always)
+    func commit(_ n: Int) { count += n }
+
+    /// Runs `body` with a zero-filled block of `count` elements whose pages leave the process
+    /// footprint as soon as the call returns. Use for load-time tables that are large enough
+    /// that the allocator would hold on to them afterwards.
+    static func withScratch<R>(count: Int, _ body: (UnsafeMutablePointer<Element>) throws -> R) rethrows -> R {
+        let buffer = PageBuffer<Element>(capacity: max(count, 1))
+        defer { withExtendedLifetime(buffer) {} }
+        return try body(buffer.reserveTail(count))
+    }
+
     /// Drops the last `n` elements.
     func removeLast(_ n: Int) {
         precondition(n >= 0 && n <= count)
@@ -131,5 +151,39 @@ extension PageBuffer where Element: Hashable {
     func hash(into hasher: inout Hasher) {
         hasher.combine(count)
         withUnsafeBufferPointer { for element in $0 { hasher.combine(element) } }
+    }
+}
+
+extension PageBuffer where Element == UInt8 {
+    /// Appends a token spelling. Vocabulary and merge entries are a handful of bytes long,
+    /// where a call into `memmove` costs several times the copy itself; overlapping
+    /// fixed-width loads cover every short length without a loop.
+    @inline(__always)
+    func append(bytes source: UnsafeBufferPointer<UInt8>) {
+        let n = source.count
+        guard n > 0, let read = source.baseAddress else { return }
+        let write = reserveTail(n)
+        switch n {
+        case 16...:
+            write.update(from: read, count: n)
+        case 8...:
+            let head = UnsafeRawPointer(read).loadUnaligned(as: UInt64.self)
+            let tail = UnsafeRawPointer(read + n - 8).loadUnaligned(as: UInt64.self)
+            UnsafeMutableRawPointer(write).storeBytes(of: head, as: UInt64.self)
+            UnsafeMutableRawPointer(write + n - 8).storeBytes(of: tail, as: UInt64.self)
+        case 4...:
+            let head = UnsafeRawPointer(read).loadUnaligned(as: UInt32.self)
+            let tail = UnsafeRawPointer(read + n - 4).loadUnaligned(as: UInt32.self)
+            UnsafeMutableRawPointer(write).storeBytes(of: head, as: UInt32.self)
+            UnsafeMutableRawPointer(write + n - 4).storeBytes(of: tail, as: UInt32.self)
+        case 2...:
+            let head = UnsafeRawPointer(read).loadUnaligned(as: UInt16.self)
+            let tail = UnsafeRawPointer(read + n - 2).loadUnaligned(as: UInt16.self)
+            UnsafeMutableRawPointer(write).storeBytes(of: head, as: UInt16.self)
+            UnsafeMutableRawPointer(write + n - 2).storeBytes(of: tail, as: UInt16.self)
+        default:
+            write.pointee = read.pointee
+        }
+        commit(n)
     }
 }

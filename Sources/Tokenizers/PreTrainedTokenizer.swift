@@ -625,6 +625,9 @@ final class ByteLevelDecodeTable: Sendable {
         count = vocabulary.count
         var storage: [UInt8] = []
         var offsets = [UInt32](repeating: 0, count: count + 1)
+        // A decoded token is never longer than its byte-level spelling, so the vocabulary's
+        // own storage is an upper bound and the table is filled without a single reallocation.
+        storage.reserveCapacity(vocabulary.withStorage { bytes, _ in bytes.count })
         for id in 0..<count {
             offsets[id] = UInt32(storage.count)
             guard vocabulary.contains(id: id) else { continue }

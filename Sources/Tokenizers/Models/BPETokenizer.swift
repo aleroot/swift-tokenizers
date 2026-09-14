@@ -94,7 +94,10 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
         let vocab: ModelVocabulary
         let prefixBytes: [UInt8]
         var table: MergeTableBuilder
-        var concat: [UInt8] = []
+        /// Scratch for the merge product. Owned storage rather than an `Array` so that
+        /// concatenating a pair, once per merge rank, costs no uniqueness check and no
+        /// bounds checks.
+        private let concat = PageBuffer<UInt8>(capacity: 256)
         var chunkingSafe: Bool
         var guards: [(bytes: [UInt8], offset: Int)] = []
 
@@ -105,7 +108,6 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
             self.vocab = vocab
             prefixBytes = continuingPrefix.isEmpty ? [] : Array(continuingPrefix.utf8)
             table = MergeTableBuilder(expectedCount: expectedCount)
-            concat.reserveCapacity(64)
             chunkingSafe =
                 vocab.id(of: sentencePieceUnderline) != nil && continuingPrefix.isEmpty && endSuffix.isEmpty
                 && !ignoreMerges
@@ -113,11 +115,24 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
 
         func requireSymbol(_ bytes: UnsafeBufferPointer<UInt8>) throws -> Int32 {
             let id = vocab.id(of: bytes)
-            guard id >= 0 else {
-                throw TokenizerError.invalidConfiguration(
-                    "BPE merge token `\(String(decoding: bytes, as: UTF8.self))` is absent from the model vocabulary")
-            }
+            guard id >= 0 else { try absent(bytes) }
             return id
+        }
+
+        private func absent(_ bytes: UnsafeBufferPointer<UInt8>) throws -> Never {
+            throw TokenizerError.invalidConfiguration(
+                "BPE merge token `\(String(decoding: bytes, as: UTF8.self))` is absent from the model vocabulary")
+        }
+
+        /// Writes the merge product into the scratch buffer and returns it.
+        private func product(
+            left leftBytes: UnsafeBufferPointer<UInt8>, right rightBytes: UnsafeBufferPointer<UInt8>
+        ) -> UnsafeBufferPointer<UInt8> {
+            let skip = BPETokenizer.prefixSkip(right: rightBytes, prefix: prefixBytes)
+            let total = leftBytes.count + max(rightBytes.count - skip, 0)
+            let write = concat.reserveTail(total)
+            BPETokenizer.concatenate(left: leftBytes, right: rightBytes, skip: skip, into: write)
+            return UnsafeBufferPointer(start: write, count: total)
         }
 
         mutating func add(
@@ -125,38 +140,135 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
         ) throws {
             let left = try requireSymbol(leftBytes)
             let right = try requireSymbol(rightBytes)
-            var skip = 0
-            if !prefixBytes.isEmpty, rightBytes.count >= prefixBytes.count {
-                var matches = true
-                for i in 0..<prefixBytes.count where rightBytes[i] != prefixBytes[i] {
-                    matches = false
-                    break
-                }
-                if matches { skip = prefixBytes.count }
+            let product = product(left: leftBytes, right: rightBytes)
+            table.insert(
+                left: left, right: right, rank: UInt32(rank), merged: try requireSymbol(product))
+            if chunkingSafe { addGuards(product) }
+        }
+
+        /// Fills one rank from ids resolved ahead of time, re-deriving only what the fast
+        /// pass deliberately left out.
+        mutating func add(
+            resolved: ResolvedMerge, left leftBytes: UnsafeBufferPointer<UInt8>,
+            right rightBytes: UnsafeBufferPointer<UInt8>, rank: Int
+        ) throws {
+            guard resolved.left >= 0 else { try absent(leftBytes) }
+            guard resolved.right >= 0 else { try absent(rightBytes) }
+            guard resolved.merged >= 0 else { try absent(product(left: leftBytes, right: rightBytes)) }
+            table.insert(left: resolved.left, right: resolved.right, rank: UInt32(rank), merged: resolved.merged)
+            if chunkingSafe, resolved.guarded {
+                addGuards(product(left: leftBytes, right: rightBytes))
             }
-            concat.removeAll(keepingCapacity: true)
-            concat.append(contentsOf: leftBytes)
-            if skip < rightBytes.count {
-                concat.append(contentsOf: UnsafeBufferPointer(rebasing: rightBytes[skip...]))
+        }
+
+        /// Records the boundaries inside a merge product that a metaspace chunk must not cut.
+        /// The scan rejects the overwhelming majority of products on their first byte triple.
+        private mutating func addGuards(_ product: UnsafeBufferPointer<UInt8>) {
+            guard BPETokenizer.hasInteriorMetaspace(product) else { return }
+            let bytes = Array(product)
+            for offset in BPETokenizer.interiorMetaspaceOffsets(product) {
+                if !guards.contains(where: { $0.offset == offset && $0.bytes == bytes }) {
+                    guards.append((bytes, offset))
+                }
             }
-            let merged = try concat.withUnsafeBufferPointer { try requireSymbol($0) }
-            table.insert(left: left, right: right, rank: UInt32(rank), merged: merged)
-            if chunkingSafe {
-                for offset in BPETokenizer.interiorMetaspaceOffsets(concat) {
-                    if !guards.contains(where: { $0.offset == offset && $0.bytes == concat }) {
-                        guards.append((concat, offset))
-                    }
-                }
-                if guards.count > BPETokenizer.maxMetaspaceChunkGuards {
-                    chunkingSafe = false
-                    guards.removeAll(keepingCapacity: false)
-                }
+            if guards.count > BPETokenizer.maxMetaspaceChunkGuards {
+                chunkingSafe = false
+                guards.removeAll(keepingCapacity: false)
             }
         }
 
         func finish() -> (table: MergeTable, symbolCount: Int, chunking: Bool, guards: [(bytes: [UInt8], offset: Int)])
         {
             (table.build(), vocab.vocabulary.count, chunkingSafe, chunkingSafe ? guards : [])
+        }
+    }
+
+    /// The three vocabulary ids a merge rank resolves to, plus whether its product needs a
+    /// metaspace chunk guard. An id is `-1` when the token is absent from the vocabulary.
+    private struct ResolvedMerge {
+        var left: Int32 = -1
+        var right: Int32 = -1
+        var merged: Int32 = -1
+        var guarded: Bool = false
+    }
+
+    /// Number of bytes of `right` that the merge product drops because they repeat the
+    /// model's continuing-subword prefix.
+    @inline(__always)
+    private static func prefixSkip(right: UnsafeBufferPointer<UInt8>, prefix: [UInt8]) -> Int {
+        guard !prefix.isEmpty, right.count >= prefix.count else { return 0 }
+        for i in 0..<prefix.count where right[i] != prefix[i] { return 0 }
+        return prefix.count
+    }
+
+    @inline(__always)
+    private static func concatenate(
+        left: UnsafeBufferPointer<UInt8>, right: UnsafeBufferPointer<UInt8>, skip: Int,
+        into write: UnsafeMutablePointer<UInt8>
+    ) {
+        if let address = left.baseAddress, !left.isEmpty { write.update(from: address, count: left.count) }
+        if skip < right.count, let address = right.baseAddress {
+            (write + left.count).update(from: address + skip, count: right.count - skip)
+        }
+    }
+
+    /// Merge counts from which resolving the symbols across cores pays for the hand-off.
+    /// Byte-level vocabularies serialize a hundred thousand merges and more.
+    private static let concurrentMergeThreshold = 32768
+
+    /// Resolves every rank's three symbol ids before the table is filled.
+    ///
+    /// Each rank probes an open-addressing index and a token-byte table that together are far
+    /// larger than the last-level cache, and the probes are independent of one another, so the
+    /// pass is limited by memory latency rather than by work. Splitting it across cores
+    /// overlaps those misses; the table itself is still filled in rank order afterwards, so
+    /// the result does not depend on how the ranks were divided.
+    private static func resolveMerges(
+        pairs: PackedStringPairs, vocab: ModelVocabulary, prefixBytes: [UInt8], guarded: Bool,
+        into resolved: UnsafeMutablePointer<ResolvedMerge>
+    ) {
+        let total = pairs.count
+        // Several chunks per core: the ranks are split up front, and a phone's efficiency
+        // cores would otherwise hold up an even split.
+        let chunks = min(ProcessInfo.processInfo.activeProcessorCount, 8) * 4
+        let span = (total + chunks - 1) / chunks
+        pairs.utf8.withUnsafeBufferPointer { utf8 in
+            pairs.offsets.withUnsafeBufferPointer { offsets in
+                // Each worker writes only its own half-open range of `resolved` and reads the
+                // parsed tables, which are immutable for the duration of the pass.
+                nonisolated(unsafe) let utf8 = utf8
+                nonisolated(unsafe) let offsets = offsets
+                nonisolated(unsafe) let resolved = resolved
+                DispatchQueue.concurrentPerform(iterations: chunks) { chunk in
+                    let lower = chunk * span
+                    let upper = min(lower + span, total)
+                    guard lower < upper else { return }
+                    var capacity = 256
+                    var scratch = UnsafeMutablePointer<UInt8>.allocate(capacity: capacity)
+                    defer { scratch.deallocate() }
+                    for rank in lower..<upper {
+                        let leftLow = Int(offsets[2 * rank])
+                        let leftHigh = Int(offsets[2 * rank + 1])
+                        let rightHigh = Int(offsets[2 * rank + 2])
+                        let left = UnsafeBufferPointer(rebasing: utf8[leftLow..<leftHigh])
+                        let right = UnsafeBufferPointer(rebasing: utf8[leftHigh..<rightHigh])
+                        let skip = prefixSkip(right: right, prefix: prefixBytes)
+                        let length = left.count + max(right.count - skip, 0)
+                        if length > capacity {
+                            scratch.deallocate()
+                            capacity = max(length, capacity * 2)
+                            scratch = .allocate(capacity: capacity)
+                        }
+                        concatenate(left: left, right: right, skip: skip, into: scratch)
+                        let product = UnsafeBufferPointer(start: scratch, count: length)
+                        resolved[rank] = ResolvedMerge(
+                            left: vocab.id(of: left),
+                            right: vocab.id(of: right),
+                            merged: vocab.id(of: product),
+                            guarded: guarded && hasInteriorMetaspace(product))
+                    }
+                }
+            }
         }
     }
 
@@ -183,7 +295,8 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
                 a = String(parts[0])
                 b = String(parts[1])
             } else if !legacy, let pair = element.array(), pair.count == 2,
-                      let left = pair[0].string(), let right = pair[1].string() {
+                let left = pair[0].string(), let right = pair[1].string()
+            {
                 a = left
                 b = right
             } else {
@@ -208,6 +321,19 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
         var intern = MergeIntern(
             vocab: vocab, continuingPrefix: continuingPrefix, endSuffix: endSuffix, ignoreMerges: ignoreMerges,
             expectedCount: pairs.count)
+        if pairs.count >= concurrentMergeThreshold, ProcessInfo.processInfo.activeProcessorCount > 1 {
+            return try PageBuffer<ResolvedMerge>.withScratch(count: pairs.count) { resolved in
+                resolveMerges(
+                    pairs: pairs, vocab: vocab, prefixBytes: Array(continuingPrefix.utf8),
+                    guarded: intern.chunkingSafe, into: resolved)
+                for rank in 0..<pairs.count {
+                    try pairs.withPair(at: rank) { left, right in
+                        try intern.add(resolved: resolved[rank], left: left, right: right, rank: rank)
+                    }
+                }
+                return intern.finish()
+            }
+        }
         for rank in 0..<pairs.count {
             try pairs.withPair(at: rank) { left, right in
                 try intern.add(left: left, right: right, rank: rank)
@@ -290,7 +416,17 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
     }
 
     /// `<0x00>` … `<0xFF>`
-    static let hexaTokenStrings: [String] = (0..<256).map { String(format: "<0x%02X>", $0) }
+    static let hexaTokenStrings: [String] = {
+        let digits = Array("0123456789ABCDEF".utf8)
+        let angleOpen = UInt8(ascii: "<"), angleClose = UInt8(ascii: ">")
+        return (0..<256).map { byte in
+            String(
+                decoding: [
+                    angleOpen, UInt8(ascii: "0"), UInt8(ascii: "x"), digits[byte >> 4], digits[byte & 15],
+                    angleClose,
+                ], as: UTF8.self)
+        }
+    }()
 
     /// `true` if `token` has a `▁` at a non-initial position that is not preceded by `▁`.
     static func hasInteriorMetaspace(_ token: String) -> Bool {
@@ -299,7 +435,7 @@ final class BPETokenizer: PreTrainedTokenizerModel, FastTokenizingModel, @unchec
     }
 
     /// Byte offsets of every `▁` in `bytes` at a non-initial position not preceded by `▁`.
-    static func interiorMetaspaceOffsets(_ bytes: [UInt8]) -> [Int] {
+    static func interiorMetaspaceOffsets(_ bytes: UnsafeBufferPointer<UInt8>) -> [Int] {
         var result: [Int] = []
         var i = 1
         let n = bytes.count
