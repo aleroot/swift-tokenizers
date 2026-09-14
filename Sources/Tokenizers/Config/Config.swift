@@ -21,7 +21,7 @@ public struct Config: Hashable, Sendable,
     let value: Data
 
     /// The underlying value kinds a configuration node can hold.
-    public enum Data: Sendable {
+    enum Data: Sendable {
         case null
         case string(BinaryDistinctString)
         case integer(Int)
@@ -654,9 +654,4 @@ extension Config: Codable {
         var intValue: Int? { nil }
         init?(intValue: Int) { nil }
     }
-}
-
-public enum ConfigError: Error {
-    case typeMismatch(expected: Config.Data, actual: Config.Data)
-    case typeConversionFailed(value: any Sendable, targetType: any Sendable.Type)
 }
