@@ -13,33 +13,33 @@
 <line x1="78" y1="74.0" x2="876" y2="74.0" stroke="#d8dee4" stroke-width="1"/>
 <text x="68" y="78.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#57606a" text-anchor="end">400</text>
 <text x="18" y="220.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#57606a" text-anchor="middle" transform="rotate(-90 18 220.0)">MiB</text>
-<rect x="104.0" y="363.1" width="46" height="2.9" fill="#F05138" rx="2"/>
-<text x="127.0" y="357.1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">3.9</text>
-<rect x="160.0" y="358.4" width="46" height="7.6" fill="#4285F4" rx="2"/>
-<text x="183.0" y="352.4" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">10.4</text>
-<rect x="216.0" y="330.3" width="46" height="35.7" fill="#FF9D00" rx="2"/>
-<text x="239.0" y="324.3" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">49.0</text>
+<rect x="104.0" y="363.2" width="46" height="2.8" fill="#F05138" rx="2"/>
+<text x="127.0" y="357.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">3.9</text>
+<rect x="160.0" y="357.5" width="46" height="8.5" fill="#4285F4" rx="2"/>
+<text x="183.0" y="351.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">11.7</text>
+<rect x="216.0" y="331.9" width="46" height="34.1" fill="#FF9D00" rx="2"/>
+<text x="239.0" y="325.9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">46.7</text>
 <rect x="272.0" y="346.0" width="46" height="20.0" fill="#9AA0A6" rx="2"/>
 <text x="295.0" y="340.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">27.4</text>
 <text x="211.0" y="390.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#1f2328" text-anchor="middle">T5</text>
 <text x="211.0" y="405.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#1f2328" text-anchor="middle">Unigram, 32k</text>
-<rect x="370.0" y="340.4" width="46" height="25.6" fill="#F05138" rx="2"/>
-<text x="393.0" y="334.4" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">35.1</text>
+<rect x="370.0" y="340.8" width="46" height="25.2" fill="#F05138" rx="2"/>
+<text x="393.0" y="334.8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">34.5</text>
 <rect x="426.0" y="324.8" width="46" height="41.2" fill="#4285F4" rx="2"/>
-<text x="449.0" y="318.8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">56.4</text>
-<rect x="482.0" y="87.2" width="46" height="278.8" fill="#FF9D00" rx="2"/>
-<text x="505.0" y="81.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">381.9</text>
-<rect x="538.0" y="263.6" width="46" height="102.4" fill="#9AA0A6" rx="2"/>
-<text x="561.0" y="257.6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">140.3</text>
+<text x="449.0" y="318.8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">56.5</text>
+<rect x="482.0" y="87.3" width="46" height="278.7" fill="#FF9D00" rx="2"/>
+<text x="505.0" y="81.3" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">381.8</text>
+<rect x="538.0" y="264.0" width="46" height="102.0" fill="#9AA0A6" rx="2"/>
+<text x="561.0" y="258.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">139.8</text>
 <text x="477.0" y="390.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#1f2328" text-anchor="middle">Gemma 3</text>
 <text x="477.0" y="405.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#1f2328" text-anchor="middle">BPE, 262k</text>
 <rect x="636.0" y="358.5" width="46" height="7.5" fill="#F05138" rx="2"/>
-<text x="659.0" y="352.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">10.3</text>
+<text x="659.0" y="352.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">10.2</text>
 <text x="715.0" y="358.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8c959f" text-anchor="middle">n/a</text>
-<rect x="748.0" y="276.9" width="46" height="89.1" fill="#FF9D00" rx="2"/>
-<text x="771.0" y="270.9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">122.1</text>
+<rect x="748.0" y="268.5" width="46" height="97.5" fill="#FF9D00" rx="2"/>
+<text x="771.0" y="262.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">133.6</text>
 <rect x="804.0" y="314.3" width="46" height="51.7" fill="#9AA0A6" rx="2"/>
-<text x="827.0" y="308.3" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">70.9</text>
+<text x="827.0" y="308.3" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">70.8</text>
 <text x="743.0" y="390.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#1f2328" text-anchor="middle">Qwen 3</text>
 <text x="743.0" y="405.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#1f2328" text-anchor="middle">byte-level BPE, 152k</text>
 <line x1="78" y1="366" x2="876" y2="366" stroke="#1f2328" stroke-width="1.2"/>

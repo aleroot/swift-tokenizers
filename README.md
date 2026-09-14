@@ -121,26 +121,26 @@ on all 60,720 lines, verified before timing.
 
 | Model | swift-tokenizers | vs SentencePiece C++ | vs HF `tokenizers` |
 |---|---:|---:|---:|
-| T5, Unigram, 32k | 120.5 MiB/s | **1.8x** faster | 11.1x faster |
-| Gemma 3, SentencePiece BPE, 262k | 42.8 MiB/s | **1.8x** faster | 3.4x faster |
-| Qwen 3, byte-level BPE, 152k | 61.3 MiB/s | n/a | 10.6x faster |
+| T5, Unigram, 32k | 125.9 MiB/s | **1.9x** faster | 11.5x faster |
+| Gemma 3, SentencePiece BPE, 262k | 44.5 MiB/s | **1.9x** faster | 3.6x faster |
+| Qwen 3, byte-level BPE, 152k | 64.2 MiB/s | n/a | 10.9x faster |
 
 `tiktoken` cannot load a Hub tokenizer, so it runs its own vocabulary over the same text: it
-reaches 20.0 MiB/s (`cl100k_base`) and 19.4 MiB/s (`o200k_base`), which the chart marks as a
+reaches 20.2 MiB/s (`cl100k_base`) and 19.8 MiB/s (`o200k_base`), which the chart marks as a
 reference line.
 
 ![Memory retained by a loaded tokenizer](docs/memory.svg)
 
 A loaded tokenizer keeps 11 to 13 times less memory than Hugging Face's Rust core and less than
-SentencePiece on both models it can load: 3.9 MiB against 10.4 MiB on T5, 35.1 MiB against
-56.4 MiB on Gemma 3, even though the same 262k vocabulary arrives as a 31.8 MiB `tokenizer.json`
+SentencePiece on both models it can load: 3.9 MiB against 11.7 MiB on T5, 34.5 MiB against
+56.5 MiB on Gemma 3, even though the same 262k vocabulary arrives as a 31.8 MiB `tokenizer.json`
 instead of a 4.5 MiB protobuf. The tables parsed out of the JSON, and the scratch the models
 build from them, live on pages that go straight back to the OS once the tokenizer is built.
 
 English prose is friendlier to every engine. On a 1.15 MB document the same Qwen 3 tokenizer
-reaches **231 MiB/s** single-threaded, against 55 MiB/s for `tiktoken` (`o200k_base`), 5.4 MiB/s
-for Hugging Face's Rust core and 0.9 MiB/s for swift-transformers, and it loads its 10.9 MiB
-`tokenizer.json` in **17 ms** against 108 ms.
+reaches **231 MiB/s** single-threaded, against 56 MiB/s for `tiktoken` (`o200k_base`), 5.4 MiB/s
+for Hugging Face's Rust core and 1.0 MiB/s for swift-transformers, and it loads its 10.9 MiB
+`tokenizer.json` in **15.7 ms** against 89.9 ms.
 
 Every tokenizer family, embedding and reranker models, end-to-end figures through mlx-swift-lm,
 cold-cache runs, concurrency scaling, methodology and how to reproduce all of it:

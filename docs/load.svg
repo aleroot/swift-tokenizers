@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="470" viewBox="0 0 900 470" role="img" aria-label="Time to load a tokenizer folder">
+<rect width="900" height="470" fill="#ffffff"/>
+<text x="84" y="30" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" font-weight="600" fill="#1f2328">Time to load a tokenizer folder</text>
+<text x="84" y="50" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#57606a">Warm filesystem cache, median of 5 loads, all four engines measured together. Lower is better.</text>
+<line x1="84" y1="366.0" x2="876" y2="366.0" stroke="#d8dee4" stroke-width="1"/>
+<text x="74" y="370.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#57606a" text-anchor="end">0</text>
+<line x1="84" y1="307.6" x2="876" y2="307.6" stroke="#d8dee4" stroke-width="1"/>
+<text x="74" y="311.6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#57606a" text-anchor="end">100</text>
+<line x1="84" y1="249.2" x2="876" y2="249.2" stroke="#d8dee4" stroke-width="1"/>
+<text x="74" y="253.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#57606a" text-anchor="end">200</text>
+<line x1="84" y1="190.8" x2="876" y2="190.8" stroke="#d8dee4" stroke-width="1"/>
+<text x="74" y="194.8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#57606a" text-anchor="end">300</text>
+<line x1="84" y1="132.4" x2="876" y2="132.4" stroke="#d8dee4" stroke-width="1"/>
+<text x="74" y="136.4" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#57606a" text-anchor="end">400</text>
+<line x1="84" y1="74.0" x2="876" y2="74.0" stroke="#d8dee4" stroke-width="1"/>
+<text x="74" y="78.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" fill="#57606a" text-anchor="end">500</text>
+<text x="18" y="220.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#57606a" text-anchor="middle" transform="rotate(-90 18 220.0)">milliseconds</text>
+<rect x="76.0" y="356.8" width="46" height="9.2" fill="#F05138" rx="2"/>
+<text x="99.0" y="350.8" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">16</text>
+<rect x="132.0" y="313.5" width="46" height="52.5" fill="#FF9D00" rx="2"/>
+<text x="155.0" y="307.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">90</text>
+<rect x="188.0" y="311.6" width="46" height="54.4" fill="#7B61FF" rx="2"/>
+<text x="211.0" y="305.6" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">93</text>
+<rect x="244.0" y="196.5" width="46" height="169.5" fill="#9AA0A6" rx="2"/>
+<text x="267.0" y="190.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">290</text>
+<text x="183.0" y="386.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328" text-anchor="middle">Qwen3-0.6B</text>
+<text x="183.0" y="401.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328" text-anchor="middle">BPE, 10.9 MiB</text>
+<rect x="274.0" y="353.0" width="46" height="13.0" fill="#F05138" rx="2"/>
+<text x="297.0" y="347.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">22</text>
+<rect x="330.0" y="295.5" width="46" height="70.5" fill="#FF9D00" rx="2"/>
+<text x="353.0" y="289.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">121</text>
+<rect x="386.0" y="288.3" width="46" height="77.7" fill="#7B61FF" rx="2"/>
+<text x="409.0" y="282.3" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">133</text>
+<rect x="442.0" y="96.5" width="46" height="269.5" fill="#9AA0A6" rx="2"/>
+<text x="465.0" y="90.5" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">461</text>
+<text x="381.0" y="386.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328" text-anchor="middle">Llama-3.2-1B</text>
+<text x="381.0" y="401.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328" text-anchor="middle">BPE, 16.4 MiB</text>
+<rect x="472.0" y="342.2" width="46" height="23.8" fill="#F05138" rx="2"/>
+<text x="495.0" y="336.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">41</text>
+<rect x="528.0" y="284.9" width="46" height="81.1" fill="#FF9D00" rx="2"/>
+<text x="551.0" y="278.9" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">139</text>
+<rect x="584.0" y="225.7" width="46" height="140.3" fill="#7B61FF" rx="2"/>
+<text x="607.0" y="219.7" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">240</text>
+<rect x="640.0" y="211.4" width="46" height="154.6" fill="#9AA0A6" rx="2"/>
+<text x="663.0" y="205.4" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">265</text>
+<text x="579.0" y="386.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328" text-anchor="middle">e5-small</text>
+<text x="579.0" y="401.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328" text-anchor="middle">Unigram, 16.3 MiB</text>
+<rect x="670.0" y="364.3" width="46" height="1.7" fill="#F05138" rx="2"/>
+<text x="693.0" y="358.3" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">3</text>
+<rect x="726.0" y="361.2" width="46" height="4.8" fill="#FF9D00" rx="2"/>
+<text x="749.0" y="355.2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">8</text>
+<rect x="782.0" y="358.1" width="46" height="7.9" fill="#7B61FF" rx="2"/>
+<text x="805.0" y="352.1" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">14</text>
+<rect x="838.0" y="357.7" width="46" height="8.3" fill="#9AA0A6" rx="2"/>
+<text x="861.0" y="351.7" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11.5" font-weight="600" fill="#1f2328" text-anchor="middle">14</text>
+<text x="777.0" y="386.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328" text-anchor="middle">bert-base-uncased</text>
+<text x="777.0" y="401.0" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328" text-anchor="middle">WordPiece, 0.4 MiB</text>
+<rect x="84.0" y="428" width="11" height="11" fill="#F05138" rx="2"/>
+<text x="101.0" y="438" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">swift-tokenizers</text>
+<rect x="221.2" y="428" width="11" height="11" fill="#FF9D00" rx="2"/>
+<text x="238.2" y="438" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">HF tokenizers</text>
+<rect x="336.8" y="428" width="11" height="11" fill="#7B61FF" rx="2"/>
+<text x="353.8" y="438" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">transformers</text>
+<rect x="445.2" y="428" width="11" height="11" fill="#9AA0A6" rx="2"/>
+<text x="462.2" y="438" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">swift-transformers</text>
+<text x="480.0" y="460" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#8c959f" text-anchor="middle">Apple M4 Pro. transformers is the Python wrapper over the same Rust core.</text>
+</svg>
