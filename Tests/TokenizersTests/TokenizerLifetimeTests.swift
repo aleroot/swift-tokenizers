@@ -40,9 +40,9 @@ struct TokenizerLifetimeTests {
     }
 
     @Test(
-        "Prepared decode tables release their vocabulary and model",
+        "Byte decoders release their vocabulary and model",
         arguments: ["BPE", "Unigram", "WordPiece", "WordLevel"])
-    func releasesPreparedDecode(type: String) throws {
+    func releasesByteDecoder(type: String) throws {
         weak var model: AnyObject?
         weak var vocabulary: Vocabulary?
         weak var wrapper: PreTrainedTokenizer?
@@ -51,7 +51,6 @@ struct TokenizerLifetimeTests {
             model = tokenizer.model as AnyObject
             vocabulary = (tokenizer.model as? any VocabularyOwningModel)?.decodeVocabulary
             wrapper = tokenizer
-            tokenizer.prepareForDecoding()
             _ = tokenizer.decode(tokens: [0, 1])
             var stream = tokenizer.makeStreamDecoder()
             _ = try stream.append(token: 1)

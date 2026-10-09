@@ -158,13 +158,6 @@ public protocol Tokenizer: Sendable {
 
     func makeStreamDecoder(skipSpecialTokens: Bool) -> TokenStreamDecoder
 
-    /// Precomputes optional decode tables for faster repeated decoding.
-    ///
-    /// This synchronous, idempotent operation trades startup work and retained memory for
-    /// throughput. Call it before creating streams, away from latency-sensitive work.
-    /// Ordinary decoding does not require preparation. Custom conformers default to a no-op.
-    func prepareForDecoding()
-
     /// Renders `tokens` back to text.
     ///
     /// Ids that name no token, out of range or a hole in a vocabulary with gaps, contribute
@@ -220,8 +213,6 @@ public protocol Tokenizer: Sendable {
 
 public extension Tokenizer {
     var hasChatTemplate: Bool { false }
-
-    func prepareForDecoding() {}
 
     func callAsFunction(_ text: String, addSpecialTokens: Bool = true) -> [Int] {
         encode(text: text, addSpecialTokens: addSpecialTokens)

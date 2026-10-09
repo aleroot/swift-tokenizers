@@ -163,6 +163,15 @@ final class ByteFallbackDecoder: Decoder {
         return hi << 4 | lo
     }
 
+    /// Parses a borrowed vocabulary spelling without creating a token string.
+    static func parseByte(_ bytes: UnsafeBufferPointer<UInt8>) -> UInt8? {
+        guard bytes.count == 6, bytes[0] == UInt8(ascii: "<"), bytes[1] == UInt8(ascii: "0"),
+            bytes[2] == UInt8(ascii: "x"), bytes[5] == UInt8(ascii: ">"),
+            let hi = hexValue(bytes[3]), let lo = hexValue(bytes[4])
+        else { return nil }
+        return hi << 4 | lo
+    }
+
     private static func hexValue(_ c: UInt8) -> UInt8? {
         switch c {
         case UInt8(ascii: "0")...UInt8(ascii: "9"): return c - UInt8(ascii: "0")

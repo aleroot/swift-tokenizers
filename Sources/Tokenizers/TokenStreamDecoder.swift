@@ -11,7 +11,7 @@ public struct TokenStreamDecoder: Sendable {
     private let skipSpecialTokens: Bool
     private let skipped: Set<Int>
     private let mode: Mode
-    private let pieces: PieceDecodeTable?
+    private let pieces: PieceDecoder?
     private let cleanupEnabled: Bool
     private var cleanup: [StreamingReplacement]
     private var pendingUTF8: [UInt8] = []
@@ -38,7 +38,7 @@ public struct TokenStreamDecoder: Sendable {
 
     init(
         tokenizer: PreTrainedTokenizer, skipSpecialTokens: Bool, decoder: (any Decoder)?,
-        table: ByteLevelDecodeTable?, pieces: PieceDecodeTable?, cleanup: Bool, skipped: Set<Int>
+        table: ByteLevelDecodeTable?, pieces: PieceDecoder?, cleanup: Bool, skipped: Set<Int>
     ) {
         let mode: Mode
         switch decoder {
@@ -59,7 +59,7 @@ public struct TokenStreamDecoder: Sendable {
 
     private init(
         tokenizer: any Tokenizer, skipSpecialTokens: Bool, skipped: Set<Int>, mode: Mode,
-        pieces: PieceDecodeTable? = nil, cleanup: Bool
+        pieces: PieceDecoder? = nil, cleanup: Bool
     ) {
         self.tokenizer = tokenizer
         self.skipSpecialTokens = skipSpecialTokens
@@ -112,7 +112,7 @@ public struct TokenStreamDecoder: Sendable {
         if let pieces {
             switch mode {
             case .wordPiece, .metaspace, .fallback:
-                return appendPiece(token, table: pieces)
+                return appendPiece(token, decoder: pieces)
             default:
                 break
             }
@@ -151,18 +151,17 @@ public struct TokenStreamDecoder: Sendable {
         return emit(bytes, final: false)
     }
 
-    /// Table-backed piece. Byte-fallback ids stay buffered; everything else is the precomputed
-    /// spelling, including the first-token form, so this path does no string replacement.
-    private mutating func appendPiece(_ id: Int, table: PieceDecodeTable) -> String {
+    /// Decodes a piece directly from vocabulary bytes, holding byte-fallback runs until valid.
+    private mutating func appendPiece(_ id: Int, decoder: PieceDecoder) -> String {
         let useLead: Bool
         switch mode {
         case .wordPiece, .metaspace: useLead = first
         default: useLead = false
         }
-        // Each stored piece is a finished UTF-8 string. Boundary holding is only needed when a
+        // Each local piece is a finished UTF-8 string. Boundary holding is only needed when a
         // byte-fallback run, a leading strip, or cleanup can still change the tail.
         if pendingFallback.isEmpty, stripRemaining == 0, !cleanupEnabled, pendingUTF8.isEmpty {
-            switch table.streamPiece(id, lead: useLead) {
+            switch decoder.streamPiece(id, lead: useLead) {
             case .absent:
                 return ""
             case let .fallback(byte):
@@ -176,7 +175,7 @@ public struct TokenStreamDecoder: Sendable {
         var result = ""
         var sawPiece = false
         guard
-            let _ = table.withDecoded(
+            let _ = decoder.withDecoded(
                 id, lead: useLead,
                 { buffer, fallback in
                     if let fallback {

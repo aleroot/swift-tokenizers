@@ -64,9 +64,8 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     private let idPostProcessor: any IdPostProcessor
     /// Built on first decode: embedding and reranking apps never pay for it.
     private let byteLevelDecodeTable: Lazy<ByteLevelDecodeTable>?
-    /// Explicitly prepared for the SentencePiece-shaped decoders (`Replace`/`ByteFallback`/`Fuse`,
-    /// `Metaspace`, `WordPiece`), so cold decoding never pays for a whole-vocabulary table.
-    private let pieceDecodeTable: Lazy<PieceDecodeTable>?
+    /// Immutable byte decoder plan; processes only the ids in each call.
+    private let pieceDecoder: PieceDecoder?
 
     /// Compiled Jinja templates keyed by their source, bounded by ``chatTemplateCacheLimit``.
     private struct CompiledChatTemplate: Sendable {
@@ -168,11 +167,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             let vocabulary = (model as? any VocabularyOwningModel)?.decodeVocabulary
         {
             let spellings = normalizedSpellings
-            pieceDecodeTable = Lazy {
-                PieceDecodeTable(vocabulary: vocabulary, normalizedSpellings: spellings, shape: shape)
-            }
+            pieceDecoder = PieceDecoder(vocabulary: vocabulary, normalizedSpellings: spellings, shape: shape)
         } else {
-            pieceDecodeTable = nil
+            pieceDecoder = nil
         }
     }
 
@@ -363,13 +360,6 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 
     // MARK: - Decoding
 
-    /// Precomputes the optional decode tables once. Call before creating streams to opt into
-    /// faster repeated decoding without adding table construction to the first decode call.
-    public func prepareForDecoding() {
-        _ = byteLevelDecodeTable?.value
-        _ = pieceDecodeTable?.value
-    }
-
     public func decode(tokens: [Int], skipSpecialTokens: Bool = false) -> String {
         if let byteLevelDecodeTable {
             guard !tokens.isEmpty else { return "" }
@@ -377,9 +367,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
                 tokens, skipping: skipSpecialTokens ? specialTokenIds : [], cleanup: cleanUpTokenizationSpaces)
         }
 
-        if let pieceDecodeTable = pieceDecodeTable?.loadedValue {
+        if let pieceDecoder {
             guard !tokens.isEmpty else { return "" }
-            return pieceDecodeTable.decode(
+            return pieceDecoder.decode(
                 tokens, skipping: skipSpecialTokens ? specialTokenIds : [], cleanup: cleanUpTokenizationSpaces)
         }
 
@@ -645,7 +635,7 @@ extension PreTrainedTokenizer {
         TokenStreamDecoder(
             tokenizer: self, skipSpecialTokens: skipSpecialTokens, decoder: decoder,
             table: byteLevelDecodeTable?.value,
-            pieces: pieceDecodeTable?.loadedValue,
+            pieces: pieceDecoder,
             cleanup: cleanUpTokenizationSpaces, skipped: specialTokenIds)
     }
 

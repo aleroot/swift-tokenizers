@@ -43,18 +43,6 @@ response that ends mid character loses its last glyph without it.
 
 ### Sessions
 
-For repeated decoding, optionally call ``Tokenizer/prepareForDecoding()`` before creating
-streams. It synchronously precomputes supported decode tables, trading startup work and
-retained memory for throughput. Run preparation outside latency-sensitive work, for example
-while loading the model. Calls are idempotent and safe to make concurrently. Decoding without
-preparation keeps the ordinary path for SentencePiece, Metaspace, and WordPiece, and existing
-streams keep their current decoding strategy.
-
-```swift
-tokenizer.prepareForDecoding()
-var stream = tokenizer.makeStreamDecoder(skipSpecialTokens: true)
-```
-
 A decoder is a struct with value semantics. Copying it copies its state, so one session per
 response, and no sharing between concurrent generations.
 

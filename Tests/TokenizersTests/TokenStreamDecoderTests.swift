@@ -25,27 +25,24 @@ struct TokenStreamDecoderTests {
         let pretrained = try #require(tokenizer as? PreTrainedTokenizer)
         let strings = ids.compactMap { tokenizer.convertIdToToken($0) }
         let expected = pretrained.cleanUp(text: pretrained.decodeTokens(strings).joined())
-        for prepared in [false, true] {
-            if prepared { tokenizer.prepareForDecoding() }
-            var stream = tokenizer.makeStreamDecoder()
-            #expect(stream.isIncremental == incremental)
-            var result = ""
-            for id in ids {
-                result += try stream.append(token: id)
-                #expect(expected.utf8.starts(with: result.utf8))
-            }
-            result += stream.finish()
-            #expect(result.utf8.elementsEqual(expected.utf8))
-            #expect(stream.finish().isEmpty)
-            #expect(throws: TokenizerError.self) { try stream.append(token: 0) }
-            stream.reset()
-            var repeated = ""
-            for id in ids { repeated += try stream.append(token: id) }
-            repeated += stream.finish()
-            #expect(repeated.utf8.elementsEqual(expected.utf8))
-            let batch = tokenizer.decode(tokens: ids)
-            #expect(batch.utf8.elementsEqual(expected.utf8))
+        var stream = tokenizer.makeStreamDecoder()
+        #expect(stream.isIncremental == incremental)
+        var result = ""
+        for id in ids {
+            result += try stream.append(token: id)
+            #expect(expected.utf8.starts(with: result.utf8))
         }
+        result += stream.finish()
+        #expect(result.utf8.elementsEqual(expected.utf8))
+        #expect(stream.finish().isEmpty)
+        #expect(throws: TokenizerError.self) { try stream.append(token: 0) }
+        stream.reset()
+        var repeated = ""
+        for id in ids { repeated += try stream.append(token: id) }
+        repeated += stream.finish()
+        #expect(repeated.utf8.elementsEqual(expected.utf8))
+        let batch = tokenizer.decode(tokens: ids)
+        #expect(batch.utf8.elementsEqual(expected.utf8))
     }
 
     @Test("Byte-level streams hold partial scalars and preserve genuine replacement characters")
@@ -120,8 +117,8 @@ struct TokenStreamDecoderTests {
         }
     }
 
-    @Test("Preparation preserves normalized added tokens, skipped specials, and active streams")
-    func preparationAndSpecialTokens() throws {
+    @Test("Direct byte decoding preserves normalized added tokens and skipped specials")
+    func normalizedSpecialTokens() throws {
         let data: Config = [
             "model": [
                 "type": "BPE", "vocab": ["": 0, "<s>": 1, "▁hello": 2, "<0xC3>": 3, "<0xA9>": 4, "end": 5],
@@ -145,17 +142,15 @@ struct TokenStreamDecoderTests {
             var original = tokenizer.makeStreamDecoder(skipSpecialTokens: skip)
             var result = ""
             for id in ids.prefix(3) { result += try original.append(token: id) }
-            tokenizer.prepareForDecoding()
-            tokenizer.prepareForDecoding()
             for id in ids.dropFirst(3) { result += try original.append(token: id) }
             result += original.finish()
             #expect(result.utf8.elementsEqual(expected.utf8))
             #expect(tokenizer.decode(tokens: ids, skipSpecialTokens: skip).utf8.elementsEqual(expected.utf8))
-            var prepared = tokenizer.makeStreamDecoder(skipSpecialTokens: skip)
-            var preparedResult = ""
-            for id in ids { preparedResult += try prepared.append(token: id) }
-            preparedResult += prepared.finish()
-            #expect(preparedResult.utf8.elementsEqual(expected.utf8))
+            var second = tokenizer.makeStreamDecoder(skipSpecialTokens: skip)
+            var secondResult = ""
+            for id in ids { secondResult += try second.append(token: id) }
+            secondResult += second.finish()
+            #expect(secondResult.utf8.elementsEqual(expected.utf8))
         }
     }
 

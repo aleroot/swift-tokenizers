@@ -3,22 +3,25 @@ import Testing
 
 @testable import Tokenizers
 
-@Suite("Piece decode table parity")
-struct PieceDecodeTableTests {
+@Suite("Direct byte decode parity")
+struct PieceDecoderTests {
     private let entries: [(String, Int)] = [
         ("", 0), ("hello", 1), ("##s", 2), ("▁a▁b", 3), (" .", 4),
         ("<0xC3>", 5), ("<0xA9>", 6), ("<0xFF>", 7), ("<0x20>", 8),
         (" ' ", 9), ("do not", 10), ("é", 12), ("e\u{301}", 13),
+        ("😀a😀b", 14), ("   ", 15), ("  x  ", 16),
     ]
 
-    @Test("Decoded slices match the decoder for empty, sparse, skipped and fallback ids")
+    @Test("Direct decoding matches the decoder for empty, sparse, skipped and fallback ids")
     func parity() throws {
         let configs: [Config] = [
             ["type": "WordPiece", "prefix": "##", "cleanup": false],
             ["type": "WordPiece", "prefix": "##", "cleanup": true],
             ["type": "WordPiece", "prefix": "", "cleanup": true],
+            ["type": "WordPiece", "prefix": "▁", "cleanup": true],
             ["type": "Metaspace", "replacement": "▁", "prepend_scheme": "always"],
             ["type": "Metaspace", "replacement": "▁", "prepend_scheme": "never"],
+            ["type": "Metaspace", "replacement": "😀", "prepend_scheme": "always"],
             [
                 "type": "Sequence",
                 "decoders": [
@@ -34,13 +37,38 @@ struct PieceDecodeTableTests {
                     ["type": "Replace", "pattern": ["String": "hello"], "content": ""]
                 ],
             ],
+            [
+                "type": "Sequence",
+                "decoders": [
+                    ["type": "Replace", "pattern": ["String": "hello"], "content": "▁"],
+                    ["type": "Replace", "pattern": ["String": "▁"], "content": " "],
+                    ["type": "Replace", "pattern": ["String": " "], "content": ""],
+                    ["type": "ByteFallback"], ["type": "Fuse"],
+                ],
+            ],
+            [
+                "type": "Sequence",
+                "decoders": [
+                    ["type": "Replace", "pattern": ["String": "absent"], "content": "ignored"],
+                    ["type": "Replace", "pattern": ["String": "hello"], "content": "<0xC3>"],
+                    ["type": "ByteFallback"], ["type": "Fuse"],
+                ],
+            ],
+            [
+                "type": "Sequence",
+                "decoders": [
+                    ["type": "Replace", "pattern": ["Regex": " {2,}"], "content": "_"],
+                    ["type": "Replace", "pattern": ["String": "_"], "content": " "],
+                    ["type": "Fuse"], ["type": "Strip", "content": " ", "start": 1, "stop": 0],
+                ],
+            ],
         ]
         let vocabulary = try Vocabulary(entries: entries)
         let spellings = [12: "▁normalized"]
         var sequences = [[Int](), [0], [1, 0], [0, 1], [1, 0, 2], [5, 0, 6], [5, 6, 7], [8, 8, 1]]
         // Exhaustive three-token combinations include a hole, invalid ids, special tokens,
         // empty pieces between fallback bytes, and canonically equivalent byte spellings.
-        let ids = [-1] + Array(0...13) + [Int.max]
+        let ids = [-1] + Array(0...16) + [Int.max]
         for a in ids {
             for b in ids {
                 for c in ids { sequences.append([a, b, c]) }
@@ -49,7 +77,7 @@ struct PieceDecodeTableTests {
         for config in configs {
             let decoder = try #require(try DecoderFactory.fromConfig(config: config))
             let shape = try #require(PieceDecodeShape.classify(decoder))
-            let table = PieceDecodeTable(vocabulary: vocabulary, normalizedSpellings: spellings, shape: shape)
+            let table = PieceDecoder(vocabulary: vocabulary, normalizedSpellings: spellings, shape: shape)
             for skipped: Set<Int> in [[], [0, 3, 7]] {
                 for sequence in sequences {
                     let strings = sequence.compactMap { id -> String? in
@@ -79,7 +107,7 @@ struct PieceDecodeTableTests {
             .metaspace(pattern: Array("▁".utf8), removeLeading: true),
             .wordPiece(prefix: Array("##".utf8), cleanup: false),
         ] {
-            let table = PieceDecodeTable(vocabulary: vocabulary, normalizedSpellings: [:], shape: shape)
+            let table = PieceDecoder(vocabulary: vocabulary, normalizedSpellings: [:], shape: shape)
             #expect(table.decode([0], skipping: []).isEmpty)
         }
     }
@@ -89,7 +117,7 @@ struct PieceDecodeTableTests {
         let entries = (0..<256).map { (String(format: "<0x%02X>", $0), $0) } + [("", 256), ("text", 257)]
         let vocabulary = try Vocabulary(entries: entries)
         let decoder = ByteFallbackDecoder(config: [:])
-        let table = PieceDecodeTable(
+        let table = PieceDecoder(
             vocabulary: vocabulary, normalizedSpellings: [:],
             shape: .spm(replacements: [], byteFallback: true, strip: nil))
         var rng: UInt64 = 0x9E37_79B9_7F4A_7C15
@@ -138,9 +166,8 @@ struct PieceDecodeTableTests {
         let expected = tokenizer.cleanUp(
             text: tokenizer.decodeTokens(ids.compactMap { tokenizer.convertIdToToken($0) }).joined())
         try await withThrowingTaskGroup(of: Void.self) { group in
-            for worker in 0..<32 {
+            for _ in 0..<32 {
                 group.addTask {
-                    if worker.isMultiple(of: 2) { tokenizer.prepareForDecoding() }
                     #expect(tokenizer.decode(tokens: ids).utf8.elementsEqual(expected.utf8))
                     var stream = tokenizer.makeStreamDecoder()
                     var result = ""

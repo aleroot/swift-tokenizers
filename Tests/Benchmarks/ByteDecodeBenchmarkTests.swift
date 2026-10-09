@@ -4,9 +4,9 @@ import Testing
 @testable import Tokenizers
 
 /// Opt-in, portable comparisons against the decoder's string pipeline. No mutable switches
-/// in library code; run with RUN_BENCHMARKS=1 swift test -c release --filter DecodeTableBenchmarkTests.
+/// in library code; run with RUN_BENCHMARKS=1 swift test -c release --filter ByteDecodeBenchmarkTests.
 @Suite(.serialized, .enabled(if: ProcessInfo.processInfo.environment["RUN_BENCHMARKS"] == "1"))
-struct DecodeTableBenchmarkTests {
+struct ByteDecodeBenchmarkTests {
     @Test(
         "Batch and streaming decode across tokenizer families",
         arguments: [
@@ -37,12 +37,9 @@ struct DecodeTableBenchmarkTests {
         benchmarkMeasure(label: "cold batch", iterations: 1, warmup: 0) {
             checksum &+= tokenizer.decode(tokens: ids).utf8.count
         }
-        benchmarkMeasure(label: "prepare tables", iterations: 1, warmup: 0) {
-            tokenizer.prepareForDecoding()
-        }
         for (label, tokens) in [("prose", ids), ("query", Array(ids.prefix(12)))] {
             benchmarkMeasure(label: "\(label) string", iterations: 20) { checksum &+= reference(tokens).utf8.count }
-            benchmarkMeasure(label: "\(label) table", iterations: 20) {
+            benchmarkMeasure(label: "\(label) bytes", iterations: 20) {
                 checksum &+= tokenizer.decode(tokens: tokens).utf8.count
             }
             #expect(tokenizer.decode(tokens: tokens).utf8.elementsEqual(reference(tokens).utf8))

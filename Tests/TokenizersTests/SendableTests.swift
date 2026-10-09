@@ -158,8 +158,7 @@ struct SendableTests {
                 group.addTask {
                     for iteration in 0..<40 {
                         let index = (worker + iteration) % texts.count
-                        // Race preparation against ordinary decoding without changing output.
-                        if iteration == 1 { tokenizer.prepareForDecoding() }
+                        // Shared byte decoders and byte-level tables must preserve exact output.
                         #expect(tokenizer.decode(tokens: ids[index]).utf8.elementsEqual(decoded[index].utf8))
                         #expect(tokenizer.encode(text: texts[index]) == ids[index])
                         #expect(tokenizer.tokenize(text: texts[index]) == reference.tokenize(text: texts[index]))
