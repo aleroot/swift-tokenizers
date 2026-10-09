@@ -22,7 +22,7 @@ struct SendableTests {
         #expect(count.withLock { $0 } == 8_001)
     }
 
-    @Test("Concurrent lazy initialization publishes one winning value")
+    @Test("Concurrent lazy initialization runs the factory exactly once")
     func lazyPublication() {
         final class Value: Sendable {}
         let calls = Locked(0)
@@ -39,9 +39,38 @@ struct SendableTests {
         }
         #expect(identities.withLock { $0 } == [ObjectIdentifier(lazy.value)])
         let factoryCalls = calls.withLock { $0 }
-        #expect(factoryCalls >= 1 && factoryCalls <= 16)
+        #expect(factoryCalls == 1)
         _ = lazy.value
         #expect(calls.withLock { $0 } == factoryCalls)
+    }
+
+    @Test("Reading a lazy snapshot neither initializes nor waits for its factory")
+    func lazySnapshot() {
+        let started = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let read = DispatchSemaphore(value: 0)
+        let lazy = Lazy {
+            started.signal()
+            release.wait()
+            return 42
+        }
+        #expect(lazy.loadedValue == nil)
+        #expect(started.wait(timeout: .now()) == .timedOut)
+        Thread.detachNewThread {
+            #expect(lazy.value == 42)
+            finished.signal()
+        }
+        #expect(started.wait(timeout: .now() + 5) == .success)
+        Thread.detachNewThread {
+            #expect(lazy.loadedValue == nil)
+            read.signal()
+        }
+        let snapshotFinished = read.wait(timeout: .now() + 5)
+        release.signal()
+        #expect(snapshotFinished == .success)
+        #expect(finished.wait(timeout: .now() + 5) == .success)
+        #expect(lazy.loadedValue == 42)
     }
 
     @Test("Nested scratch leases remain exclusive and reused encoders follow model identity")
@@ -60,7 +89,9 @@ struct SendableTests {
         func model(id: Int) throws -> WordLevelTokenizer {
             try WordLevelTokenizer(
                 tokenizerConfig: [:],
-                tokenizerData: ["model": ["type": "WordLevel", "unk_token": "<unk>", "vocab": ["<unk>": 0, "a": Config(id)]]],
+                tokenizerData: [
+                    "model": ["type": "WordLevel", "unk_token": "<unk>", "vocab": ["<unk>": 0, "a": Config(id)]]
+                ],
                 addedTokens: [:])
         }
         let first = try model(id: 1)
@@ -127,8 +158,9 @@ struct SendableTests {
                 group.addTask {
                     for iteration in 0..<40 {
                         let index = (worker + iteration) % texts.count
-                        // No prior decode on this instance: exercise Lazy's publication too.
-                        #expect(tokenizer.decode(tokens: ids[index]) == decoded[index])
+                        // Race preparation against ordinary decoding without changing output.
+                        if iteration == 1 { tokenizer.prepareForDecoding() }
+                        #expect(tokenizer.decode(tokens: ids[index]).utf8.elementsEqual(decoded[index].utf8))
                         #expect(tokenizer.encode(text: texts[index]) == ids[index])
                         #expect(tokenizer.tokenize(text: texts[index]) == reference.tokenize(text: texts[index]))
                         let encoded = try tokenizer.encode(text: texts[index], withOffsets: true)

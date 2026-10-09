@@ -11,6 +11,7 @@ public struct TokenStreamDecoder: Sendable {
     private let skipSpecialTokens: Bool
     private let skipped: Set<Int>
     private let mode: Mode
+    private let pieces: PieceDecodeTable?
     private let cleanupEnabled: Bool
     private var cleanup: [StreamingReplacement]
     private var pendingUTF8: [UInt8] = []
@@ -37,7 +38,7 @@ public struct TokenStreamDecoder: Sendable {
 
     init(
         tokenizer: PreTrainedTokenizer, skipSpecialTokens: Bool, decoder: (any Decoder)?,
-        table: ByteLevelDecodeTable?, cleanup: Bool, skipped: Set<Int>
+        table: ByteLevelDecodeTable?, pieces: PieceDecodeTable?, cleanup: Bool, skipped: Set<Int>
     ) {
         let mode: Mode
         switch decoder {
@@ -53,14 +54,18 @@ public struct TokenStreamDecoder: Sendable {
         }
         self.init(
             tokenizer: tokenizer, skipSpecialTokens: skipSpecialTokens,
-            skipped: skipSpecialTokens ? skipped : [], mode: mode, cleanup: cleanup)
+            skipped: skipSpecialTokens ? skipped : [], mode: mode, pieces: pieces, cleanup: cleanup)
     }
 
-    private init(tokenizer: any Tokenizer, skipSpecialTokens: Bool, skipped: Set<Int>, mode: Mode, cleanup: Bool) {
+    private init(
+        tokenizer: any Tokenizer, skipSpecialTokens: Bool, skipped: Set<Int>, mode: Mode,
+        pieces: PieceDecodeTable? = nil, cleanup: Bool
+    ) {
         self.tokenizer = tokenizer
         self.skipSpecialTokens = skipSpecialTokens
         self.skipped = skipped
         self.mode = mode
+        self.pieces = pieces
         cleanupEnabled = cleanup
         self.cleanup = cleanup ? TokenizationCleanup.replacements.map(StreamingReplacement.init) : []
         if case .buffered = mode { isIncremental = false } else { isIncremental = true }
@@ -104,6 +109,14 @@ public struct TokenStreamDecoder: Sendable {
         }
         if case .buffered = mode { bufferedIDs.append(token); return "" }
         guard !skipped.contains(token) else { return "" }
+        if let pieces {
+            switch mode {
+            case .wordPiece, .metaspace, .fallback:
+                return appendPiece(token, table: pieces)
+            default:
+                break
+            }
+        }
         var bytes: [UInt8] = []
         if case let .byteLevel(table?) = mode {
             if !cleanupEnabled { return table.withBytes(for: token) { emitUTF8($0, final: false) } }
@@ -136,6 +149,48 @@ public struct TokenStreamDecoder: Sendable {
             first = false
         }
         return emit(bytes, final: false)
+    }
+
+    /// Table-backed piece. Byte-fallback ids stay buffered; everything else is the precomputed
+    /// spelling, including the first-token form, so this path does no string replacement.
+    private mutating func appendPiece(_ id: Int, table: PieceDecodeTable) -> String {
+        let useLead: Bool
+        switch mode {
+        case .wordPiece, .metaspace: useLead = first
+        default: useLead = false
+        }
+        // Each stored piece is a finished UTF-8 string. Boundary holding is only needed when a
+        // byte-fallback run, a leading strip, or cleanup can still change the tail.
+        if pendingFallback.isEmpty, stripRemaining == 0, !cleanupEnabled, pendingUTF8.isEmpty {
+            switch table.streamPiece(id, lead: useLead) {
+            case .absent:
+                return ""
+            case let .fallback(byte):
+                pendingFallback.append(byte)
+                return ""
+            case let .text(text):
+                first = false
+                return text
+            }
+        }
+        var result = ""
+        var sawPiece = false
+        guard
+            let _ = table.withDecoded(
+                id, lead: useLead,
+                { buffer, fallback in
+                    if let fallback {
+                        pendingFallback.append(fallback)
+                        return
+                    }
+                    sawPiece = true
+                    var bytes = flushFallback()
+                    if buffer.count > 0 { bytes.append(contentsOf: buffer) }
+                    result = emit(bytes, final: false)
+                })
+        else { return "" }
+        if sawPiece { first = false }
+        return result
     }
 
     /// Drains pending text. Idempotent; call `reset()` before reusing the session.

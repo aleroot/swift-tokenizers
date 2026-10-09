@@ -51,6 +51,10 @@ public final class WordLevelTokenizer: PreTrainedTokenizerModel, Sendable {
     }
 }
 
+extension WordLevelTokenizer: VocabularyOwningModel {
+    var decodeVocabulary: Vocabulary { vocabulary }
+}
+
 extension WordLevelTokenizer: FastTokenizingModel {
     func makeEncoder() -> PieceEncoder { Encoder(model: self) }
 

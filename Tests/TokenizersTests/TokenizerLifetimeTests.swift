@@ -10,7 +10,7 @@ struct TokenizerLifetimeTests {
         init(_ value: AnyObject?) { self.value = value }
     }
 
-    private func tokenizer(_ type: String = "BPE") throws -> PreTrainedTokenizer {
+    private func tokenizer(_ type: String = "BPE", decoder: Config = Config()) throws -> PreTrainedTokenizer {
         let model: Config
         switch type {
         case "Unigram": model = ["type": "Unigram", "vocab": [["<unk>", 0.0], ["a", -1.0]], "unk_id": 0]
@@ -18,7 +18,7 @@ struct TokenizerLifetimeTests {
         case "WordLevel": model = ["type": "WordLevel", "vocab": ["<unk>": 0, "a": 1], "unk_token": "<unk>"]
         default: model = ["type": "BPE", "vocab": ["a": 0], "merges": []]
         }
-        return try PreTrainedTokenizer(tokenizerConfig: [:], tokenizerData: ["model": model])
+        return try PreTrainedTokenizer(tokenizerConfig: [:], tokenizerData: ["model": model, "decoder": decoder])
     }
 
     @Test(arguments: ["BPE", "Unigram", "WordPiece", "WordLevel"], [false, true])
@@ -37,6 +37,30 @@ struct TokenizerLifetimeTests {
         }
         #expect(wrapper == nil)
         #expect(model == nil)
+    }
+
+    @Test(
+        "Prepared decode tables release their vocabulary and model",
+        arguments: ["BPE", "Unigram", "WordPiece", "WordLevel"])
+    func releasesPreparedDecode(type: String) throws {
+        weak var model: AnyObject?
+        weak var vocabulary: Vocabulary?
+        weak var wrapper: PreTrainedTokenizer?
+        try autoreleasepool {
+            let tokenizer = try tokenizer(type, decoder: ["type": "WordPiece", "prefix": "##", "cleanup": true])
+            model = tokenizer.model as AnyObject
+            vocabulary = (tokenizer.model as? any VocabularyOwningModel)?.decodeVocabulary
+            wrapper = tokenizer
+            tokenizer.prepareForDecoding()
+            _ = tokenizer.decode(tokens: [0, 1])
+            var stream = tokenizer.makeStreamDecoder()
+            _ = try stream.append(token: 1)
+            _ = stream.finish()
+            #expect(vocabulary != nil)
+        }
+        #expect(wrapper == nil)
+        #expect(model == nil)
+        #expect(vocabulary == nil)
     }
 
     @Test("Releasing on another thread reclaims idle worker scratch before thread exit")

@@ -262,6 +262,10 @@ extension BertTokenizer: PreTrainedTokenizerModel {
     }
 }
 
+extension BertTokenizer: VocabularyOwningModel {
+    var decodeVocabulary: Vocabulary { vocabulary }
+}
+
 extension BertTokenizer: FastTokenizingModel {
     func makeEncoder() -> PieceEncoder { Encoder(model: self) }
 

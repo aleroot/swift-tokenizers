@@ -62,22 +62,25 @@ final class Locked<Value: Sendable>: @unchecked Sendable {
     }
 }
 
-/// A value computed on first access, safe to share across threads. The factory may run more
-/// than once under contention; the first result wins.
+/// A value computed once on first access, safe to share across threads. Reading ``loadedValue``
+/// never starts initialization or waits for the factory to finish.
 final class Lazy<Value: Sendable>: Sendable {
     private let make: @Sendable () -> Value
     private let storage = Locked<Value?>(nil)
+    private let initializationLock = UnfairLock()
 
     init(_ make: @escaping @Sendable () -> Value) {
         self.make = make
     }
 
+    var loadedValue: Value? { storage.withLock { $0 } }
+
     var value: Value {
-        if let value = storage.withLock({ $0 }) { return value }
-        let value = make()
-        return storage.withLock { stored in
-            if let stored { return stored }
-            stored = value
+        if let value = loadedValue { return value }
+        return initializationLock.withLock {
+            if let value = loadedValue { return value }
+            let value = make()
+            storage.withLock { $0 = value }
             return value
         }
     }

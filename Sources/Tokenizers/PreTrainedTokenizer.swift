@@ -64,6 +64,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     private let idPostProcessor: any IdPostProcessor
     /// Built on first decode: embedding and reranking apps never pay for it.
     private let byteLevelDecodeTable: Lazy<ByteLevelDecodeTable>?
+    /// Explicitly prepared for the SentencePiece-shaped decoders (`Replace`/`ByteFallback`/`Fuse`,
+    /// `Metaspace`, `WordPiece`), so cold decoding never pays for a whole-vocabulary table.
+    private let pieceDecodeTable: Lazy<PieceDecodeTable>?
 
     /// Compiled Jinja templates keyed by their source, bounded by ``chatTemplateCacheLimit``.
     private struct CompiledChatTemplate: Sendable {
@@ -159,6 +162,17 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             byteLevelDecodeTable = Lazy { ByteLevelDecodeTable(vocabulary: bpe.vocab) }
         } else {
             byteLevelDecodeTable = nil
+        }
+        if byteLevelDecodeTable == nil,
+            let shape = PieceDecodeShape.classify(decoder),
+            let vocabulary = (model as? any VocabularyOwningModel)?.decodeVocabulary
+        {
+            let spellings = normalizedSpellings
+            pieceDecodeTable = Lazy {
+                PieceDecodeTable(vocabulary: vocabulary, normalizedSpellings: spellings, shape: shape)
+            }
+        } else {
+            pieceDecodeTable = nil
         }
     }
 
@@ -349,11 +363,24 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 
     // MARK: - Decoding
 
+    /// Precomputes the optional decode tables once. Call before creating streams to opt into
+    /// faster repeated decoding without adding table construction to the first decode call.
+    public func prepareForDecoding() {
+        _ = byteLevelDecodeTable?.value
+        _ = pieceDecodeTable?.value
+    }
+
     public func decode(tokens: [Int], skipSpecialTokens: Bool = false) -> String {
         if let byteLevelDecodeTable {
             guard !tokens.isEmpty else { return "" }
-            return cleanUp(
-                text: byteLevelDecodeTable.value.decode(tokens, skipping: skipSpecialTokens ? specialTokenIds : []))
+            return byteLevelDecodeTable.value.decode(
+                tokens, skipping: skipSpecialTokens ? specialTokenIds : [], cleanup: cleanUpTokenizationSpaces)
+        }
+
+        if let pieceDecodeTable = pieceDecodeTable?.loadedValue {
+            guard !tokens.isEmpty else { return "" }
+            return pieceDecodeTable.decode(
+                tokens, skipping: skipSpecialTokens ? specialTokenIds : [], cleanup: cleanUpTokenizationSpaces)
         }
 
         var tokenStrings: [String] = []
@@ -617,8 +644,9 @@ extension PreTrainedTokenizer {
     public func makeStreamDecoder(skipSpecialTokens: Bool = false) -> TokenStreamDecoder {
         TokenStreamDecoder(
             tokenizer: self, skipSpecialTokens: skipSpecialTokens, decoder: decoder,
-            table: byteLevelDecodeTable?.value, cleanup: cleanUpTokenizationSpaces,
-            skipped: specialTokenIds)
+            table: byteLevelDecodeTable?.value,
+            pieces: pieceDecodeTable?.loadedValue,
+            cleanup: cleanUpTokenizationSpaces, skipped: specialTokenIds)
     }
 
     public func encodeChatTemplateWithAssistantMask(
@@ -698,10 +726,10 @@ final class ByteLevelDecodeTable: Sendable {
         bytes.append(contentsOf: storage[Int(offsets[id])..<Int(offsets[id + 1])])
     }
 
-    func decode(_ ids: [Int], skipping skipped: Set<Int>) -> String {
+    func decode(_ ids: [Int], skipping skipped: Set<Int>, cleanup: Bool = false) -> String {
         storage.withUnsafeBufferPointer { buffer in
             // Token inspection needs no concatenation buffer, including for partial UTF-8.
-            if ids.count == 1 {
+            if ids.count == 1, !cleanup {
                 let id = ids[0]
                 guard id >= 0, id < count, !skipped.contains(id) else { return "" }
                 return String(decoding: buffer[Int(offsets[id])..<Int(offsets[id + 1])], as: UTF8.self)
@@ -729,6 +757,9 @@ final class ByteLevelDecodeTable: Sendable {
                         written += length
                     }
                 }
+                if cleanup, written > 0 {
+                    written = TokenizationCleanup.compact(output.baseAddress!, count: written, wordPiece: false)
+                }
                 return written
             }
         }
@@ -743,10 +774,19 @@ enum TokenizationCleanup {
         (" ' ", "'"), (" n't", "n't"), (" 'm", "'m"), (" 's", "'s"), (" 've", "'ve"), (" 're", "'re"),
     ].map { (Array($0.0.utf8), Array($0.1.utf8)) }
 
-    private static let wordPieceReplacements =
-        Array(replacements.prefix(7))
-        + [(pattern: Array(" do not".utf8), replacement: Array(" don't".utf8))]
-        + Array(replacements.suffix(3))
+    /// Replacement bytes indexed for ``matchAt``: punctuation, `'`, `n't`, `'m`, `'s`, `'ve`,
+    /// `'re`, and the WordPiece ` don't`.
+    private static let dot = [UInt8(ascii: ".")]
+    private static let question = [UInt8(ascii: "?")]
+    private static let exclamation = [UInt8(ascii: "!")]
+    private static let comma = [UInt8(ascii: ",")]
+    private static let apostrophe = [UInt8(ascii: "'")]
+    private static let nt = Array("n't".utf8)
+    private static let m = Array("'m".utf8)
+    private static let s = Array("'s".utf8)
+    private static let ve = Array("'ve".utf8)
+    private static let re = Array("'re".utf8)
+    private static let dont = Array(" don't".utf8)
 
     /// Sequentially applies the classic `clean_up_tokenization_spaces` replacements.
     static func cleanUp(_ text: String, wordPiece: Bool = false) -> String {
@@ -770,36 +810,137 @@ enum TokenizationCleanup {
         }
         guard candidate else { return text }
 
-        var bytes = Array(text.utf8)
-        for (pattern, replacement) in wordPiece ? wordPieceReplacements : replacements {
-            bytes = replace(bytes, pattern: pattern, with: replacement)
-        }
-        return String(decoding: bytes, as: UTF8.self)
+        return String(decoding: cleanUp(Array(text.utf8), wordPiece: wordPiece), as: UTF8.self)
     }
 
-    private static func replace(_ bytes: [UInt8], pattern: [UInt8], with replacement: [UInt8]) -> [UInt8] {
-        guard bytes.count >= pattern.count else { return bytes }
-        var out: [UInt8] = []
-        out.reserveCapacity(bytes.count)
-        var i = 0
-        let n = bytes.count
-        let m = pattern.count
-        let first = pattern[0]
-        while i < n {
-            if bytes[i] == first, i + m <= n, matches(bytes, at: i, pattern) {
-                out.append(contentsOf: replacement)
-                i += m
-            } else {
-                out.append(bytes[i])
-                i += 1
+    /// Applies the ordered replacements in place. Punctuation and spaced apostrophes run
+    /// first: an apostrophe replacement can create a contraction such as `" n't"` or `" 's"`
+    /// that the second pass must see. Every rule shortens its match.
+    static func cleanUp(_ bytes: [UInt8], wordPiece: Bool = false) -> [UInt8] {
+        guard
+            bytes.withUnsafeBufferPointer({ buffer in
+                guard let base = buffer.baseAddress else { return false }
+                return hasCandidate(base, count: buffer.count, wordPiece: wordPiece)
+            })
+        else { return bytes }
+        var copy = bytes
+        let written = copy.withUnsafeMutableBufferPointer { buffer -> Int in
+            guard let base = buffer.baseAddress else { return 0 }
+            return compact(base, count: buffer.count, wordPiece: wordPiece)
+        }
+        guard written != bytes.count else { return bytes }
+        copy.removeSubrange(written..<copy.count)
+        return copy
+    }
+
+    /// Compacts `count` initialized bytes in place. Returns the number that remain.
+    static func compact(_ base: UnsafeMutablePointer<UInt8>, count: Int, wordPiece: Bool) -> Int {
+        guard hasCandidate(base, count: count, wordPiece: wordPiece) else { return count }
+        let written = compactPass(base, count: count, wordPiece: wordPiece, contractions: false)
+        return compactPass(base, count: written, wordPiece: wordPiece, contractions: true)
+    }
+
+    /// Reject ordinary text before allocating a copy or running the replacement passes.
+    private static func hasCandidate(_ base: UnsafePointer<UInt8>, count: Int, wordPiece: Bool) -> Bool {
+        guard count >= 2 else { return false }
+        for i in 0..<(count - 1) where base[i] == UInt8(ascii: " ") {
+            switch base[i + 1] {
+            case UInt8(ascii: "."), UInt8(ascii: "?"), UInt8(ascii: "!"), UInt8(ascii: ","),
+                UInt8(ascii: "'"), UInt8(ascii: "n"):
+                return true
+            case UInt8(ascii: "d") where wordPiece:
+                return true
+            default:
+                break
             }
         }
-        return out
+        return false
     }
 
+    private static func compactPass(
+        _ base: UnsafeMutablePointer<UInt8>, count: Int, wordPiece: Bool, contractions: Bool
+    ) -> Int {
+        guard count >= 2 else { return count }
+        var read = 0
+        var write = 0
+        while read < count {
+            if let (length, replacement) = matchAt(base, read, count, wordPiece: wordPiece, contractions: contractions)
+            {
+                replacement.withUnsafeBufferPointer { source in
+                    if let start = source.baseAddress, source.count > 0 {
+                        (base + write).update(from: start, count: source.count)
+                    }
+                }
+                write += replacement.count
+                read += length
+            } else if write == read {
+                read += 1
+                write += 1
+            } else {
+                base[write] = base[read]
+                write += 1
+                read += 1
+            }
+        }
+        return write
+    }
+
+    /// The rule matching at `i` in the selected group, or `nil`.
     @inline(__always)
-    private static func matches(_ bytes: [UInt8], at i: Int, _ pattern: [UInt8]) -> Bool {
-        for k in 0..<pattern.count where bytes[i + k] != pattern[k] { return false }
-        return true
+    private static func matchAt(
+        _ base: UnsafePointer<UInt8>, _ i: Int, _ n: Int, wordPiece: Bool, contractions: Bool
+    ) -> (length: Int, replacement: [UInt8])? {
+        guard base[i] == UInt8(ascii: " "), i + 1 < n else { return nil }
+        switch base[i + 1] {
+        case UInt8(ascii: ".") where !contractions:
+            return (2, dot)
+        case UInt8(ascii: "?") where !contractions:
+            return (2, question)
+        case UInt8(ascii: "!") where !contractions:
+            return (2, exclamation)
+        case UInt8(ascii: ",") where !contractions:
+            return (2, comma)
+        case UInt8(ascii: "'"):
+            guard i + 2 < n else { return nil }
+            switch base[i + 2] {
+            case UInt8(ascii: " ") where !contractions:
+                // The trailing space of `" ' "` can begin a punctuation rule, which runs in an
+                // earlier pass and so wins even though it starts later. Every other rule that
+                // could start there runs in a later pass and loses to this one.
+                if i + 3 < n,
+                    [UInt8(ascii: "."), UInt8(ascii: "?"), UInt8(ascii: "!"), UInt8(ascii: ",")]
+                        .contains(base[i + 3])
+                {
+                    return nil
+                }
+                return (3, apostrophe)
+            case UInt8(ascii: "m") where contractions:
+                return (3, m)
+            case UInt8(ascii: "s") where contractions:
+                return (3, s)
+            case UInt8(ascii: "v") where contractions && i + 3 < n && base[i + 3] == UInt8(ascii: "e"):
+                return (4, ve)
+            case UInt8(ascii: "r") where contractions && i + 3 < n && base[i + 3] == UInt8(ascii: "e"):
+                return (4, re)
+            default:
+                return nil
+            }
+        case UInt8(ascii: "n") where contractions:
+            guard i + 3 < n, base[i + 2] == UInt8(ascii: "'"), base[i + 3] == UInt8(ascii: "t") else {
+                return nil
+            }
+            return (4, nt)
+        case UInt8(ascii: "d") where contractions && wordPiece:
+            guard i + 6 < n,
+                base[i + 2] == UInt8(ascii: "o"),
+                base[i + 3] == UInt8(ascii: " "),
+                base[i + 4] == UInt8(ascii: "n"),
+                base[i + 5] == UInt8(ascii: "o"),
+                base[i + 6] == UInt8(ascii: "t")
+            else { return nil }
+            return (7, dont)
+        default:
+            return nil
+        }
     }
 }
