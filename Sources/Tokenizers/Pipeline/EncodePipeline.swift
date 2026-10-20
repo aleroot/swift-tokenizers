@@ -246,6 +246,7 @@ struct EncodePipeline: Sendable {
     /// `isIdentity` at once. Reading an optional existential per section costs a pair of
     /// contended reference-count updates on a shared tokenizer.
     let normalizer: any ByteNormalizer
+    private let normalizerNeedsSourceOffset: Bool
     /// Splits around added tokens declared `normalized: true`, matched after normalization.
     let normalizedSplitter: AddedTokenSplitter?
     /// Never `nil`: a tokenizer with no pre-tokenizer gets a runner with no stages, which hands
@@ -254,6 +255,18 @@ struct EncodePipeline: Sendable {
     let preTokenizer: PreTokenizationRunner
     /// Collapse runs of the unknown id inside each section (`fuse_unk`, WordPiece models).
     let fuseUnknownId: Int?
+
+    init(
+        splitter: AddedTokenSplitter?, normalizer: any ByteNormalizer,
+        normalizedSplitter: AddedTokenSplitter?, preTokenizer: PreTokenizationRunner, fuseUnknownId: Int?
+    ) {
+        self.splitter = splitter
+        self.normalizer = normalizer
+        normalizerNeedsSourceOffset = normalizer.needsSourceOffset
+        self.normalizedSplitter = normalizedSplitter
+        self.preTokenizer = preTokenizer
+        self.fuseUnknownId = fuseUnknownId
+    }
 
     /// Calls `onToken(id)` for every added token and `onPiece(bytes, byteLevel)` for every
     /// pre-tokenized piece of `text`, in input order.
@@ -293,9 +306,17 @@ struct EncodePipeline: Sendable {
                 // `firstSection`: the text starts the input (`tokenizers` checks original offset 0).
                 let flags: PreTokenizerFlags = range.lowerBound == 0 ? .firstSection : []
                 let raw = UnsafeBufferPointer(rebasing: bytes[range])
-                if !normalizer.isIdentity(on: raw) {
+                let unchanged =
+                    normalizerNeedsSourceOffset
+                    ? normalizer.isIdentity(on: raw, at: range.lowerBound) : normalizer.isIdentity(on: raw)
+                if !unchanged {
                     scratch.normalized.removeAll(keepingCapacity: true)
-                    normalizer.normalize(raw, into: &scratch.normalized, scratch: scratch.buffers)
+                    if normalizerNeedsSourceOffset {
+                        normalizer.normalize(
+                            raw, at: range.lowerBound, into: &scratch.normalized, scratch: scratch.buffers)
+                    } else {
+                        normalizer.normalize(raw, into: &scratch.normalized, scratch: scratch.buffers)
+                    }
                     scratch.normalized.withUnsafeBufferPointer { normalized in
                         preTokenizeNormalized(normalized, flags: flags, scratch: scratch, onToken, onPiece)
                     }

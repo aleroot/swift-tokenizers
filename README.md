@@ -12,8 +12,8 @@
 
 swift-tokenizers is a native Swift 6 implementation of the tokenizers used by today's language
 models: byte-level and SentencePiece **BPE**, **Unigram**, **WordPiece** and **WordLevel**. It
-loads `tokenizer.json` files published on the Hugging Face Hub, with inference checked against
-Hugging Face references. It replaces the local inference APIs of the
+loads legacy 1.0 and canonical 2.0 `tokenizer.json` files published on the Hugging Face Hub,
+with inference checked against Hugging Face references. It replaces the local inference APIs of the
 `Tokenizers` product in
 [swift-transformers](https://github.com/huggingface/swift-transformers), integrates with
 [mlx-swift-lm](https://github.com/ml-explore/mlx-swift-lm), and is the tokenizer behind
@@ -110,7 +110,7 @@ Python for standard schemas. For tokenizer JSON you already hold in memory, use
 | | |
 |---|---|
 | **Models** | byte-level and SentencePiece BPE (GPT-2, Llama 2 / 3, Qwen, Mistral, Gemma, DeepSeek, Phi, Falcon, Whisper, Cohere, RoBERTa, o200k ...), Unigram (T5, XLM-RoBERTa, multilingual-e5, bge-m3 ...), WordPiece (BERT, DistilBERT, MiniLM, bge, nomic ...), WordLevel |
-| **Normalizers** | Sequence, Prepend, Replace, Lowercase, NFC, NFD, NFKC, NFKD, BertNormalizer, Precompiled, StripAccents, Strip, Nmt, ByteLevel |
+| **Normalizers** | Sequence, Prepend, Replace, Lowercase, NFC, NFD, NFKC, NFKD, BertNormalizer, Precompiled, StripAccents, Strip, Nmt, ByteLevel, MetaspaceNormalizer |
 | **Pre-tokenizers** | Sequence, ByteLevel, Split, Metaspace, Whitespace, WhitespaceSplit, Punctuation, Digits, BertPreTokenizer, CharDelimiterSplit, FixedLength, UnicodeScripts |
 | **Post-processors** | TemplateProcessing, ByteLevel, RobertaProcessing, BertProcessing, Sequence |
 | **Decoders** | Sequence, ByteLevel, ByteFallback, Fuse, Strip, Replace, Metaspace, WordPiece, BPEDecoder, CTC |

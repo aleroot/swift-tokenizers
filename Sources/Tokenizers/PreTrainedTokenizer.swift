@@ -125,7 +125,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         let preTokenizer = try PreTokenizerFactory.fromConfig(config: tokenizerData["preTokenizer"])
         self.preTokenizer = preTokenizer
         self.normalizer = normalizer
-        postProcessor = try PostProcessorFactory.fromConfig(config: tokenizerData["postProcessor"])
+        let postProcessor = try PostProcessorFactory.fromConfig(config: tokenizerData["postProcessor"])
         decoder = try DecoderFactory.fromConfig(config: tokenizerData["decoder"])
         // `transformers` >= 4.45 defaults `clean_up_tokenization_spaces` to `False`.
         cleanUpTokenizationSpaces = tokenizerConfig.cleanUpTokenizationSpaces.boolean(or: false)
@@ -141,6 +141,8 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         let model = try TokenizerModel.from(
             tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData, addedTokens: addedTokens, strict: strict)
         self.model = model
+        self.postProcessor = postProcessor?.bindingVocabulary(
+            resolving: model.convertTokenToId, spelling: model.convertIdToToken)
         modelIdentity = ObjectIdentifier(model as AnyObject)
         fastModelIdentity = (model as? any FastTokenizingModel).map { ObjectIdentifier($0 as AnyObject) }
 
@@ -151,11 +153,12 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             splitter: AddedTokenSplitter(tokens: splitterTokens),
             normalizer: normalizer ?? IdentityNormalizer(),
             normalizedSplitter: AddedTokenSplitter(tokens: normalizedTokens),
-            preTokenizer: PreTokenizationRunner(stages: preTokenizer?.stages ?? []),
+            preTokenizer: PreTokenizationRunner(
+                stages: try PreTokenizerFactory.stages(preTokenizer, model: tokenizerData.model)),
             fuseUnknownId: fusesUnknown ? model.unknownTokenId : nil
         )
 
-        idPostProcessor = Self.makeIdPostProcessor(postProcessor, model: model)
+        idPostProcessor = Self.makeIdPostProcessor(self.postProcessor, model: model)
 
         if decoder is ByteLevelDecoder, normalizedSpellings.isEmpty, let bpe = model as? BPETokenizer {
             byteLevelDecodeTable = Lazy { ByteLevelDecodeTable(vocabulary: bpe.vocab) }

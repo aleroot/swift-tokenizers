@@ -211,6 +211,24 @@ enum PreTokenizerType: String {
 }
 
 struct PreTokenizerFactory {
+    /// In JSON 2.0, byte-level encoding belongs to the BPE model. Compile it into the
+    /// existing terminal marker so IDs, token strings and offsets share the same path.
+    static func stages(_ preTokenizer: (any StagedPreTokenizer)?, model: Config) throws -> [PreTokenizationStage] {
+        var stages = preTokenizer?.stages ?? []
+        if !model.byteLevel.isNull() {
+            guard case let .boolean(byteLevel) = model.byteLevel.value else {
+                throw TokenizerError.invalidConfiguration("model.byte_level must be a boolean")
+            }
+            if byteLevel {
+                guard model.type.string() == "BPE" else {
+                    throw TokenizerError.invalidConfiguration("model.byte_level requires a BPE model")
+                }
+                if stages.last?.shape != .byteLevel { stages.append(ByteLevelStage()) }
+            }
+        }
+        return stages
+    }
+
     static func fromConfig(config: Config?) throws -> (any StagedPreTokenizer)? {
         guard let config, let typeName = config.type.string() else { return nil }
         switch PreTokenizerType(rawValue: typeName) {

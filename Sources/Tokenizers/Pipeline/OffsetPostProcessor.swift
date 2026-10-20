@@ -54,6 +54,10 @@ extension PostProcessor {
             for item in template.singleItems {
                 switch item {
                 case .sequenceA: result.append(contentsOf: tokens)
+                case let .ids(ids, _, _):
+                    if addSpecialTokens {
+                        result.append(contentsOf: ids.map { AlignedToken(id: $0, offset: nil) })
+                    }
                 case let .special(token, special, _):
                     guard addSpecialTokens else { continue }
                     let ids = TemplateProcessing.ids(of: token, special, resolving: resolve)

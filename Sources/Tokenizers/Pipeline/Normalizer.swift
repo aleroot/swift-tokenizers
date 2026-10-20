@@ -19,6 +19,8 @@ public extension Normalizer {
 
 /// Byte-level contract implemented by every built-in normalizer.
 protocol ByteNormalizer: Normalizer {
+    /// Resolved at load time. Ordinary normalizers retain their existing dispatch path.
+    var needsSourceOffset: Bool { get }
     /// Appends the normalized form of `bytes` (well-formed UTF-8) to `output`.
     /// - Parameter scratch: buffers for intermediate results; never aliases `output`.
     func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers)
@@ -26,10 +28,22 @@ protocol ByteNormalizer: Normalizer {
     /// `true` when normalizing `bytes` is guaranteed to return them unchanged, letting callers
     /// skip the copy. Must be cheap (a linear scan at most); `false` is always a safe answer.
     func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>, at sourceOffset: Int) -> Bool
+    func normalize(
+        _ bytes: UnsafeBufferPointer<UInt8>, at sourceOffset: Int,
+        into output: inout [UInt8], scratch: ScratchBuffers)
 }
 
 extension ByteNormalizer {
+    var needsSourceOffset: Bool { false }
     func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool { false }
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>, at sourceOffset: Int) -> Bool { isIdentity(on: bytes) }
+    func normalize(
+        _ bytes: UnsafeBufferPointer<UInt8>, at sourceOffset: Int,
+        into output: inout [UInt8], scratch: ScratchBuffers
+    ) {
+        normalize(bytes, into: &output, scratch: scratch)
+    }
 
     func normalize(text: String) -> String {
         var copy = text
@@ -74,6 +88,7 @@ enum NormalizerType: String {
     case Strip
     case Nmt
     case ByteLevel
+    case MetaspaceNormalizer
     case Unknown = ""
 }
 
@@ -95,6 +110,7 @@ struct NormalizerFactory {
         case .Strip: return StripNormalizer(config: config)
         case .Nmt: return NmtNormalizer(config: config)
         case .ByteLevel: return ByteLevelNormalizer(config: config)
+        case .MetaspaceNormalizer: return try MetaspaceNormalizer(config: config)
         default: throw TokenizerError.unsupportedComponent("normalizer `\(typeName)`")
         }
     }
@@ -102,23 +118,40 @@ struct NormalizerFactory {
 
 final class NormalizerSequence: ByteNormalizer {
     let normalizers: [any ByteNormalizer]
+    let needsSourceOffset: Bool
+    private let probesMetaspaceFirst: Bool
 
     required init(config: Config) throws {
         let configs = try require(config.normalizers.array(), "Sequence normalizer", field: "normalizers")
         normalizers = try configs.compactMap { try NormalizerFactory.fromConfig(config: $0) }
+        needsSourceOffset = normalizers.contains { $0.needsSourceOffset }
+        probesMetaspaceFirst = normalizers.last is MetaspaceNormalizer
     }
 
     func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
-        normalizers.allSatisfy { $0.isIdentity(on: bytes) }
+        // A required Metaspace prefix proves a rewrite without scanning earlier
+        // Unicode stages. Those stages are checked once when normalization runs.
+        if probesMetaspaceFirst, !normalizers[normalizers.count - 1].isIdentity(on: bytes) { return false }
+        return normalizers.allSatisfy { $0.isIdentity(on: bytes) }
     }
 
     func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
+        if needsSourceOffset {
+            normalize(bytes, at: 0, into: &output, scratch: scratch)
+            return
+        }
         // Stages that would not change the text are skipped; the rest ping-pong between two
         // scratch buffers.
         var index = 0
         while index < normalizers.count, normalizers[index].isIdentity(on: bytes) { index += 1 }
         guard index < normalizers.count else {
             output.append(contentsOf: bytes)
+            return
+        }
+        // A common canonical chain is Precompiled → Metaspace, with the first stage
+        // unchanged on ASCII. Let the last stage write straight to the caller's buffer.
+        if index == normalizers.count - 1 {
+            normalizers[index].normalize(bytes, into: &output, scratch: scratch)
             return
         }
         var current = scratch.take()
@@ -135,6 +168,50 @@ final class NormalizerSequence: ByteNormalizer {
             if current.withUnsafeBufferPointer({ stage.isIdentity(on: $0) }) { continue }
             next.removeAll(keepingCapacity: true)
             current.withUnsafeBufferPointer { stage.normalize($0, into: &next, scratch: scratch) }
+            swap(&current, &next)
+        }
+        output.append(contentsOf: current)
+    }
+
+    func isIdentity(on bytes: UnsafeBufferPointer<UInt8>, at sourceOffset: Int) -> Bool {
+        if probesMetaspaceFirst, !normalizers[normalizers.count - 1].isIdentity(on: bytes, at: sourceOffset) {
+            return false
+        }
+        return normalizers.allSatisfy { $0.isIdentity(on: bytes, at: sourceOffset) }
+    }
+
+    /// The original section offset stays constant through the chain, even if earlier
+    /// normalizers remove or insert text. This is the canonical Metaspace `first` rule.
+    func normalize(
+        _ bytes: UnsafeBufferPointer<UInt8>, at sourceOffset: Int,
+        into output: inout [UInt8], scratch: ScratchBuffers
+    ) {
+        var index = 0
+        while index < normalizers.count, normalizers[index].isIdentity(on: bytes, at: sourceOffset) { index += 1 }
+        guard index < normalizers.count else {
+            output.append(contentsOf: bytes)
+            return
+        }
+        if index == normalizers.count - 1 {
+            normalizers[index].normalize(bytes, at: sourceOffset, into: &output, scratch: scratch)
+            return
+        }
+        var current = scratch.take()
+        var next = scratch.take()
+        defer {
+            scratch.recycle(current)
+            scratch.recycle(next)
+        }
+        normalizers[index].normalize(bytes, at: sourceOffset, into: &current, scratch: scratch)
+        index += 1
+        while index < normalizers.count {
+            let stage = normalizers[index]
+            index += 1
+            if current.withUnsafeBufferPointer({ stage.isIdentity(on: $0, at: sourceOffset) }) { continue }
+            next.removeAll(keepingCapacity: true)
+            current.withUnsafeBufferPointer {
+                stage.normalize($0, at: sourceOffset, into: &next, scratch: scratch)
+            }
             swap(&current, &next)
         }
         output.append(contentsOf: current)

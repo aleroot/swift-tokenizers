@@ -15,6 +15,22 @@ public extension PostProcessor {
     }
 }
 
+extension PostProcessor {
+    /// Canonical templates carry IDs without spellings. Bind their string view once at
+    /// load time; the ID processor remains a precompiled sequence of splices.
+    func bindingVocabulary(
+        resolving resolve: (String) -> Int?, spelling: (Int) -> String?
+    ) -> any PostProcessor {
+        switch self {
+        case let template as TemplateProcessing:
+            return template.bindingVocabulary(resolving: resolve, spelling: spelling)
+        case let sequence as SequenceProcessing:
+            return sequence.bindingVocabulary(resolving: resolve, spelling: spelling)
+        default: return self
+        }
+    }
+}
+
 /// The id-level half of post-processing: splicing special-token ids into a sequence.
 ///
 /// Deliberately not a refinement of ``PostProcessor``, so that a tokenizer can hold one
@@ -143,6 +159,8 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
         /// The template's identifier, its `special_tokens` entry when the file has one, and the
         /// segment the piece belongs to.
         case special(String, SpecialToken?, typeId: Int)
+        /// JSON 2.0 specifies a run of special IDs directly, without a named-token table.
+        case ids([Int], tokens: [String], typeId: Int)
         case sequenceA(typeId: Int)
         case sequenceB(typeId: Int)
         case ignored
@@ -185,8 +203,8 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
         for (key, value) in config.specialTokens.dictionary(or: [:]) {
             specials[key.string] = SpecialToken(config: value)
         }
-        singleItems = single.map { Self.item($0, specials: specials) }
-        pairItems = pair.map { Self.item($0, specials: specials) }
+        singleItems = try single.map { try Self.item($0, specials: specials) }
+        pairItems = try pair.map { try Self.item($0, specials: specials) }
         guard
             !singleItems.contains(where: {
                 if case .sequenceB = $0 { return true }; return false
@@ -224,12 +242,32 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
             single: single, pair: pair, singleItems: singleItems, pairItems: pairItems, resolving: resolve)
     }
 
+    func bindingVocabulary(
+        resolving resolve: (String) -> Int?, spelling: (Int) -> String?
+    ) -> TemplateProcessing {
+        guard
+            (singleItems + pairItems).contains(where: {
+                if case .ids = $0 { return true }; return false
+            })
+        else { return self }
+        func bind(_ item: Item) -> Item {
+            if case let .ids(ids, _, typeId) = item {
+                return .ids(ids, tokens: ids.compactMap(spelling), typeId: typeId)
+            }
+            return item
+        }
+        return TemplateProcessing(
+            single: single, pair: pair, singleItems: singleItems.map(bind),
+            pairItems: pairItems.map(bind), resolving: resolve)
+    }
+
     /// Resolves a template to ids. Sequence B and the pieces a template ignores contribute
     /// nothing at either level, so they drop out here.
     private static func compile(_ items: [Item], resolving resolve: (String) -> Int?) -> [IdItem] {
         items.compactMap { item in
             switch item {
             case .sequenceA: return .sequence
+            case let .ids(ids, _, _): return ids.isEmpty ? nil : .ids(ids)
             case let .special(token, special, _):
                 let ids = Self.ids(of: token, special, resolving: resolve)
                 return ids.isEmpty ? nil : .ids(ids)
@@ -245,6 +283,7 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
             switch item {
             case let .sequenceA(typeId): return .sequenceA(typeId: typeId)
             case let .sequenceB(typeId): return .sequenceB(typeId: typeId)
+            case let .ids(ids, _, typeId): return ids.isEmpty ? nil : .ids(ids, typeId: typeId)
             case let .special(token, special, typeId):
                 let ids = Self.ids(of: token, special, resolving: resolve)
                 return ids.isEmpty ? nil : .ids(ids, typeId: typeId)
@@ -279,7 +318,34 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
         return (prefix, suffix)
     }
 
-    private static func item(_ config: Config, specials: [String: SpecialToken]) -> Item {
+    private static func item(_ config: Config, specials: [String: SpecialToken]) throws -> Item {
+        let fields = config.dictionary(or: [:])
+        if fields["seq"] != nil || fields["ids"] != nil {
+            let typeId = fields["type_id"]?.integer() ?? 0
+            guard UInt32(exactly: typeId) != nil,
+                fields["type_id"] == nil || fields["type_id"]?.integer() != nil,
+                (fields["seq"] == nil) != (fields["ids"] == nil)
+            else {
+                throw TokenizerError.invalidConfiguration("Invalid TemplateProcessing piece")
+            }
+            if let sequence = fields["seq"] {
+                switch sequence.string() {
+                case "A": return .sequenceA(typeId: typeId)
+                case "B": return .sequenceB(typeId: typeId)
+                default: throw TokenizerError.invalidConfiguration("TemplateProcessing sequence must be A or B")
+                }
+            }
+            guard let values = fields["ids"]?.array() else {
+                throw TokenizerError.invalidConfiguration("TemplateProcessing ids must be an array")
+            }
+            let ids = try values.map { value in
+                guard let id = value.integer(), UInt32(exactly: id) != nil else {
+                    throw TokenizerError.invalidConfiguration("TemplateProcessing ids must be unsigned 32-bit integers")
+                }
+                return id
+            }
+            return .ids(ids, tokens: [], typeId: typeId)
+        }
         if let id = config.SpecialToken.id.string() {
             return .special(id, specials[id] ?? nil, typeId: config.SpecialToken.typeId.integer(or: 0))
         }
@@ -299,6 +365,8 @@ final class TemplateProcessing: PostProcessor, IdPostProcessor {
             switch item {
             case let .special(id, special, _):
                 if addSpecialTokens { out.append(contentsOf: special?.tokens ?? [id]) }
+            case let .ids(_, spellings, _):
+                if addSpecialTokens { out.append(contentsOf: spellings) }
             case .sequenceA:
                 out.append(contentsOf: tokens)
             case .sequenceB:
@@ -470,6 +538,13 @@ final class SequenceProcessing: PostProcessor, IdPostProcessor {
     private init(processors: [any PostProcessor], idProcessors: [any IdPostProcessor]) {
         self.processors = processors
         self.idProcessors = idProcessors
+    }
+
+    func bindingVocabulary(
+        resolving resolve: (String) -> Int?, spelling: (Int) -> String?
+    ) -> SequenceProcessing {
+        let bound = processors.map { $0.bindingVocabulary(resolving: resolve, spelling: spelling) }
+        return SequenceProcessing(processors: bound, idProcessors: bound.compactMap { $0 as? any IdPostProcessor })
     }
 
     func postProcess(tokens: [String], tokensPair: [String]?, addSpecialTokens: Bool = true) -> [String] {

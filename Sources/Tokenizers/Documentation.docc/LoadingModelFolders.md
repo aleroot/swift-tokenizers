@@ -30,6 +30,13 @@ A valid `tokenizer.json` can also be loaded on its own. Without companion config
 the serialized pipeline is authoritative; class-specific metadata and chat templates are not
 guessed from vocabulary spelling.
 
+Both legacy `"version": "1.0"` and canonical `"version": "2.0"` files load directly. The
+2.0 format declares byte-level BPE with `model.byte_level`, separates `MetaspaceNormalizer`
+from delimiter splitting, and writes template pieces as `{"seq":"A"}` or `{"ids":[1,2]}`.
+These compile into the same byte pipeline and ID processors as legacy components; no
+offline conversion or different encoding API is needed. Metaspace's `prepend` accepts
+`"always"`, `"first"` and `"never"`; `drop_whitespace` controls whitespace removal.
+
 ### Special-token metadata
 
 Explicit values in `tokenizer_config.json`, including null, take precedence. Missing fields

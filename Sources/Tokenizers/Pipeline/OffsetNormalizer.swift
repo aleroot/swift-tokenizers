@@ -1,8 +1,9 @@
 import Foundation
 
 extension AlignedText {
-    func normalized(by normalizer: any ByteNormalizer) throws -> Self {
-        if bytes.withUnsafeBufferPointer({ normalizer.isIdentity(on: $0) }) { return self }
+    func normalized(by normalizer: any ByteNormalizer, at sourceOffset: Int? = nil) throws -> Self {
+        let offset = sourceOffset ?? sourceRange(0..<bytes.count).lowerBound
+        if bytes.withUnsafeBufferPointer({ normalizer.isIdentity(on: $0, at: offset) }) { return self }
         if (normalizer is BertNormalizer || normalizer is LowercaseNormalizer),
             bytes.withUnsafeBufferPointer({ ASCII.isASCII($0) })
         {
@@ -16,7 +17,36 @@ extension AlignedText {
         }
         switch normalizer {
         case let sequence as NormalizerSequence:
-            return try sequence.normalizers.reduce(self) { try $0.normalized(by: $1) }
+            return try sequence.normalizers.reduce(self) { try $0.normalized(by: $1, at: offset) }
+        case let metaspace as MetaspaceNormalizer:
+            var output: [UInt8] = []
+            let origins = bytes.withUnsafeBufferPointer { input in
+                metaspace.normalize(input, at: offset, into: &output, scratch: ScratchBuffers())
+                let markerCount = metaspace.replacement.utf8.count
+                // The byte writer gives the exact size. Fill the trace in place, with
+                // the same edits, rather than appending an array element per source byte.
+                return [Range<Int>](unsafeUninitializedCapacity: output.count) { buffer, initializedCount in
+                    var written = 0
+                    func append(_ origin: Range<Int>, count: Int) {
+                        (buffer.baseAddress! + written).initialize(repeating: origin, count: count)
+                        written += count
+                    }
+                    metaspace.rewrite(
+                        input, at: offset,
+                        onText: { range in
+                            var index = range.lowerBound
+                            while index < range.upperBound {
+                                let end = min(index + UTF8Cursor.width(input[index]), range.upperBound)
+                                append(sourceRange(index..<end), count: end - index)
+                                index = end
+                            }
+                        },
+                        onMarker: { append(sourceRange($0), count: markerCount) })
+                    assert(written == buffer.count)
+                    initializedCount = written
+                }
+            }
+            return Self(bytes: output[...], origins: origins[...], sourceStart: sourceStart)
         case let prepend as PrependNormalizer:
             return prepending(prepend.prepend)
         case let replace as ReplaceNormalizer:
@@ -202,11 +232,11 @@ extension AlignedText {
         _ input: UnsafeBufferPointer<UInt8>, _ range: Range<Int>,
         into output: inout [UInt8], origins: inout [Range<Int>]
     ) {
+        output.append(contentsOf: UnsafeBufferPointer(rebasing: input[range]))
         var i = range.lowerBound
         while i < range.upperBound {
             let end = min(i + UTF8Cursor.width(input[i]), range.upperBound)
             let origin = sourceRange(i..<end)
-            output.append(contentsOf: UnsafeBufferPointer(rebasing: input[i..<end]))
             origins.append(contentsOf: repeatElement(origin, count: end - i))
             i = end
         }

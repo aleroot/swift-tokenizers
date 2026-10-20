@@ -310,6 +310,11 @@ vocabulary-walk and load tables:
 RUN_BENCHMARKS=1 swift test -c release --filter Benchmarks
 ```
 
+To compare equivalent legacy and canonical Metaspace pipelines for T5 and Mistral, run
+`RUN_BENCHMARKS=1 swift test -c release --filter MetaspaceBenchmarkTests`. This suite checks
+ID parity before timing IDs-only and aligned encoding of queries, passages, large documents
+and multilingual text, then reverses the measurement order on its second pass.
+
 Cross-engine numbers come from four harnesses over the same corpus files, each reporting MiB/s and
 a `phys_footprint` delta around the load, so the columns are comparable: a SwiftPM executable for
 this library, a C++ executable linking `libsentencepiece.a`, a Python script for the Rust core and
