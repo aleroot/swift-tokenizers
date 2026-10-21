@@ -74,6 +74,12 @@ tasks at once. Load it once, share it, never copy it per request.
 - ``TruncationSide``
 - ``ChatTemplateEncoding``
 
+### Speech recognition evaluation
+
+- <doc:NormalizingTranscripts>
+- ``EnglishTextNormalizer``
+- ``BasicTextNormalizer``
+
 ### Moving from swift-transformers
 
 - <doc:MigratingFromSwiftTransformers>

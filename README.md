@@ -114,6 +114,7 @@ Python for standard schemas. For tokenizer JSON you already hold in memory, use
 | **Pre-tokenizers** | Sequence, ByteLevel, Split, Metaspace, Whitespace, WhitespaceSplit, Punctuation, Digits, BertPreTokenizer, CharDelimiterSplit, FixedLength, UnicodeScripts |
 | **Post-processors** | TemplateProcessing, ByteLevel, RobertaProcessing, BertProcessing, Sequence |
 | **Decoders** | Sequence, ByteLevel, ByteFallback, Fuse, Strip, Replace, Metaspace, WordPiece, BPEDecoder, CTC |
+| **Transcript normalizers** | Whisper's EnglishTextNormalizer and BasicTextNormalizer, for word and character error rates |
 
 ## Performance
 
