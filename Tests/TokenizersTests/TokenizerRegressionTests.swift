@@ -183,6 +183,31 @@ struct TokenizerRegressionTests {
         #expect(try decode(model: "WordLevel", [:]) == "a .")
     }
 
+    @Test(
+        "DeepSeek OCR tokenizers follow tokenizer.json like the Rust core",
+        arguments: [
+            // Ids from tokenizers 0.23.3, which transformers 5.20.2 AutoTokenizer also returns.
+            (
+                "baidu/Unlimited-OCR", "8249d20b2822a7d8a4c22c8d8c9069b5ac36bda3",
+                [0, 14791, 4310, 260, 9251, 304, 270, 15106]
+            ),
+            (
+                "deepseek-ai/DeepSeek-OCR", "9f30c71f441d010e5429c532364a86705536c53a",
+                [0, 14791, 4310, 260, 9251, 304, 270, 15106]
+            ),
+            // This copy ships a Metaspace pre-tokenizer over a byte-level vocabulary, so the
+            // spaces are lost in the Rust core too; it is not repaired behind the caller's back.
+            (
+                "mikoy92/Unlimited-OCR-bf16-mlx", "a8eb000a53fdfb357c135277ed27501ee4bc4a1e",
+                [0, 85, 7772, 854, 268, 9815, 11162, 14795]
+            ),
+        ])
+    func deepSeekOCR(repo: String, revision: String, expected: [Int]) async throws {
+        let folder = try await HubFixtures.modelFolder(for: repo, revision: revision)
+        let tokenizer = try await AutoTokenizer.from(modelFolder: folder)
+        #expect(tokenizer.encode(text: "she took a train to the west") == expected)
+    }
+
     @Test("JSONSerialization loaders preserve token IDs zero and one")
     func foundationDictionaryLoading() throws {
         let json =
