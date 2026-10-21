@@ -131,8 +131,11 @@ final class NormalizerSequence: ByteNormalizer {
     func isIdentity(on bytes: UnsafeBufferPointer<UInt8>) -> Bool {
         // A required Metaspace prefix proves a rewrite without scanning earlier
         // Unicode stages. Those stages are checked once when normalization runs.
-        if probesMetaspaceFirst, !normalizers[normalizers.count - 1].isIdentity(on: bytes) { return false }
-        return normalizers.allSatisfy { $0.isIdentity(on: bytes) }
+        guard probesMetaspaceFirst else { return normalizers.allSatisfy { $0.isIdentity(on: bytes) } }
+        let last = normalizers.count - 1
+        guard normalizers[last].isIdentity(on: bytes) else { return false }
+        for index in 0..<last where !normalizers[index].isIdentity(on: bytes) { return false }
+        return true
     }
 
     func normalize(_ bytes: UnsafeBufferPointer<UInt8>, into output: inout [UInt8], scratch: ScratchBuffers) {
@@ -174,10 +177,13 @@ final class NormalizerSequence: ByteNormalizer {
     }
 
     func isIdentity(on bytes: UnsafeBufferPointer<UInt8>, at sourceOffset: Int) -> Bool {
-        if probesMetaspaceFirst, !normalizers[normalizers.count - 1].isIdentity(on: bytes, at: sourceOffset) {
-            return false
+        guard probesMetaspaceFirst else {
+            return normalizers.allSatisfy { $0.isIdentity(on: bytes, at: sourceOffset) }
         }
-        return normalizers.allSatisfy { $0.isIdentity(on: bytes, at: sourceOffset) }
+        let last = normalizers.count - 1
+        guard normalizers[last].isIdentity(on: bytes, at: sourceOffset) else { return false }
+        for index in 0..<last where !normalizers[index].isIdentity(on: bytes, at: sourceOffset) { return false }
+        return true
     }
 
     /// The original section offset stays constant through the chain, even if earlier

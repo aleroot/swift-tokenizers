@@ -74,7 +74,7 @@ jobs:
         run: swift test --sanitize=thread --filter "TokenizerLifetime|Concurrency|Differential|OptimizationRegression|UnicodeTablesTests|SendableTests|BPEMerge|PieceDecoder|TokenStreamDecoder"
 
       - name: Address sanitizer (byte kernels and raw storage)
-        run: swift test --sanitize=address --filter "TokenizerLifetime|ByteKernels|OptimizationRegression|ConfigTests|TrieTests|UnicodeTablesTests|UnicodeNormalizationTests|CorrectnessAuditTests|JSONFuzz|BPEMerge|PieceDecoder|TokenStreamDecoder|TokenizationCleanup"
+        run: swift test --sanitize=address --filter "TokenizerLifetime|ByteKernels|OptimizationRegression|ConfigTests|TrieTests|UnicodeTablesTests|UnicodeNormalizationTests|CorrectnessAuditTests|JSONFuzz|BPEMerge|PieceDecoder|TokenStreamDecoder|TokenizationCleanup|CanonicalJSON|CanonicalModelParity"
 
   docs:
     name: Documentation
