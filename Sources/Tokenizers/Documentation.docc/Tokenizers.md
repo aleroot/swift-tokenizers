@@ -54,10 +54,17 @@ tasks at once. Load it once, share it, never copy it per request.
 
 - <doc:ChatTemplates>
 - <doc:StreamingGeneration>
+- <doc:ParsingResponses>
 - ``TokenStreamDecoder``
 - ``ChatTemplateArgument``
 - ``Message``
 - ``ToolSpec``
+- ``ResponseTemplate``
+- ``ResponseParser``
+- ``ResponseEvent``
+- ``ResponseValue``
+- ``ResponseObject``
+- ``ResponseParsingError``
 
 ### Working with the text
 

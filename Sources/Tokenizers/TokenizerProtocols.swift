@@ -183,6 +183,11 @@ public protocol Tokenizer: Sendable {
 
     var hasChatTemplate: Bool { get }
 
+    /// The `response_template` of the tokenizer configuration, which describes how to turn
+    /// generated text back into a structured message; `nil` when the configuration has none.
+    /// Throws when the template is malformed.
+    var responseTemplate: ResponseTemplate? { get throws }
+
     func applyChatTemplate(messages: [Message]) throws -> [Int]
     func applyChatTemplate(messages: [Message], tools: [ToolSpec]?) throws -> [Int]
     func applyChatTemplate(
@@ -213,6 +218,8 @@ public protocol Tokenizer: Sendable {
 
 public extension Tokenizer {
     var hasChatTemplate: Bool { false }
+
+    var responseTemplate: ResponseTemplate? { nil }
 
     func callAsFunction(_ text: String, addSpecialTokens: Bool = true) -> [Int] {
         encode(text: text, addSpecialTokens: addSpecialTokens)

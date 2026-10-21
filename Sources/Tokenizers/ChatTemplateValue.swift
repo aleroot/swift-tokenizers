@@ -95,6 +95,12 @@ enum ChatTemplateValue {
         case let array as [Any?]:
             return .array(try array.map { try convert($0, userKeyed: false) })
 
+        // Parsed responses keep the key order the model wrote.
+        case let value as ResponseValue:
+            return jinja(value)
+        case let object as ResponseObject:
+            return jinja(.object(object))
+
         case let .some(wrapped):
             // A nested `Optional` erased into `Any` (e.g. `Optional<Any>.some(.none)`): unwrap it.
             let mirror = Mirror(reflecting: wrapped)
@@ -109,6 +115,21 @@ enum ChatTemplateValue {
     private static func convertDictionary(_ dict: [String: Any?], userKeyed: Bool) throws -> Value {
         let keys = userKeyed ? dict.keys.sorted() : dict.keys.sorted(by: canonicalLess)
         return try object(keys.map { ($0, dict[$0] ?? nil) })
+    }
+
+    private static func jinja(_ value: ResponseValue) -> Value {
+        switch value {
+        case .null: return .null
+        case let .bool(value): return .boolean(value)
+        case let .int(value): return .int(value)
+        case let .double(value): return .double(value)
+        case let .string(value): return .string(value)
+        case let .array(values): return .array(values.map(jinja))
+        case let .object(object):
+            var storage = emptyObjectStorage
+            for (key, value) in object { storage[.string(key)] = jinja(value) }
+            return .object(storage)
+        }
     }
 
     /// Builds an object from already-ordered pairs, converting each value with the right

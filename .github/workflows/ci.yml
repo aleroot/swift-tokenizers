@@ -71,10 +71,10 @@ jobs:
           swift test -c release --skip-build --filter UnicodeConformanceTests
 
       - name: Thread sanitizer (concurrency suites)
-        run: swift test --sanitize=thread --filter "TokenizerLifetime|Concurrency|Differential|OptimizationRegression|UnicodeTablesTests|SendableTests|BPEMerge|PieceDecoder|TokenStreamDecoder"
+        run: swift test --sanitize=thread --filter "TokenizerLifetime|Concurrency|Differential|OptimizationRegression|UnicodeTablesTests|SendableTests|BPEMerge|PieceDecoder|TokenStreamDecoder|ResponseParsingTests|UTF16TextTests"
 
       - name: Address sanitizer (byte kernels and raw storage)
-        run: swift test --sanitize=address --filter "TokenizerLifetime|ByteKernels|OptimizationRegression|ConfigTests|TrieTests|UnicodeTablesTests|UnicodeNormalizationTests|CorrectnessAuditTests|JSONFuzz|BPEMerge|PieceDecoder|TokenStreamDecoder|TokenizationCleanup|CanonicalJSON|CanonicalModelParity"
+        run: swift test --sanitize=address --filter "TokenizerLifetime|ByteKernels|OptimizationRegression|ConfigTests|TrieTests|UnicodeTablesTests|UnicodeNormalizationTests|CorrectnessAuditTests|JSONFuzz|BPEMerge|PieceDecoder|TokenStreamDecoder|TokenizationCleanup|CanonicalJSON|CanonicalModelParity|ResponseParsingTests|UTF16TextTests"
 
   docs:
     name: Documentation

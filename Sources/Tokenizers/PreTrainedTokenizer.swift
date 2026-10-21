@@ -66,6 +66,8 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     private let byteLevelDecodeTable: Lazy<ByteLevelDecodeTable>?
     /// Immutable byte decoder plan; processes only the ids in each call.
     private let pieceDecoder: PieceDecoder?
+    /// The configuration's `response_template`, compiled on first use.
+    private let compiledResponseTemplate: Lazy<Result<ResponseTemplate?, any Error>>
 
     /// Compiled Jinja templates keyed by their source, bounded by ``chatTemplateCacheLimit``.
     private struct CompiledChatTemplate: Sendable {
@@ -172,6 +174,10 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             pieceDecoder = PieceDecoder(vocabulary: vocabulary, normalizedSpellings: spellings, shape: shape)
         } else {
             pieceDecoder = nil
+        }
+        let responseTemplate = tokenizerConfig["response_template"]
+        compiledResponseTemplate = Lazy {
+            responseTemplate.isNull() ? .success(nil) : Result { try ResponseTemplate(config: responseTemplate) }
         }
     }
 
@@ -414,6 +420,10 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
 
     public var hasChatTemplate: Bool {
         !tokenizerConfig.chatTemplate.isNull()
+    }
+
+    public var responseTemplate: ResponseTemplate? {
+        get throws { try compiledResponseTemplate.value.get() }
     }
 
     /// A tokenizer declares one template, or a handful when the config names several. Callers
