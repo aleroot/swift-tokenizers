@@ -7,6 +7,11 @@ cache (run the Swift test-suite once) and a venv with transformers + tokenizers 
 
 Writes Tests/TokenizersTests/Resources/differential/hf__<repo>.json with records:
     {text, ids, idsNoSpecial, decoded, decodedSkipSpecial}
+
+The oracle is transformers 4.x, whose per-class pipelines follow tokenizer.json (transformers 5
+rebuilds Llama and XLM-R pipelines and departs from the Rust core on them). Decoding follows the
+transformers 5 rule that never applies `clean_up_tokenization_spaces` to BPE models, which
+`bpe_cleanup` reproduces.
 """
 import json
 import os
@@ -19,6 +24,19 @@ os.environ["TRANSFORMERS_VERBOSITY"] = "error"
 
 from tokenizers import Tokenizer  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
+
+
+def bpe_cleanup(tok):
+    """Applies transformers 5's `TokenizersBackend._decode` rule: the clean-up is skipped for BPE
+    models unless `clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output`."""
+    backend = getattr(tok, "backend_tokenizer", None)
+    if backend is None or type(backend.model).__name__ != "BPE":
+        return
+    forced = tok.init_kwargs.get("clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output")
+    if forced is None:
+        forced = type(tok).__name__.removesuffix("Fast") in ("LukeTokenizer", "MLukeTokenizer")
+    if not forced:
+        tok.clean_up_tokenization_spaces = False
 
 
 class RawTokenizer:
@@ -80,6 +98,7 @@ def main():
             continue
         try:
             tok = AutoTokenizer.from_pretrained(folder, use_fast=True)
+            bpe_cleanup(tok)
         except Exception as e:  # noqa: BLE001
             print(f"{model}: transformers failed ({e}); using raw tokenizers", file=sys.stderr)
             tok = RawTokenizer(folder)

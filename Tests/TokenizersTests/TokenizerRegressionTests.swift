@@ -161,6 +161,28 @@ struct TokenizerRegressionTests {
         }
     }
 
+    @Test("Decoding cleanup follows transformers 5: never for BPE unless forced")
+    func cleanupSkipsBPE() throws {
+        func decode(model: String, _ configuration: Config) throws -> String {
+            let data: Config = [
+                "model": ["type": Config(model), "vocab": ["a": 0, " ": 1, ".": 2], "merges": [], "unk_token": "a"],
+                "decoder": ["type": "Fuse"],
+            ]
+            let tokenizer = try PreTrainedTokenizer(tokenizerConfig: configuration, tokenizerData: data)
+            return tokenizer.decode(tokens: [0, 1, 2])
+        }
+        let cleanUp: Config.Key = "clean_up_tokenization_spaces"
+        let force: Config.Key = "clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output"
+        let luke: Config = "LukeTokenizer"
+        #expect(try decode(model: "BPE", [cleanUp: true]) == "a .")
+        #expect(try decode(model: "BPE", [cleanUp: true, force: true]) == "a.")
+        #expect(try decode(model: "BPE", [cleanUp: false, force: true]) == "a .")
+        #expect(try decode(model: "BPE", [cleanUp: true, "tokenizer_class": luke]) == "a.")
+        #expect(try decode(model: "BPE", [cleanUp: true, "tokenizer_class": luke, force: false]) == "a .")
+        #expect(try decode(model: "WordLevel", [cleanUp: true]) == "a.")
+        #expect(try decode(model: "WordLevel", [:]) == "a .")
+    }
+
     @Test("JSONSerialization loaders preserve token IDs zero and one")
     func foundationDictionaryLoading() throws {
         let json =

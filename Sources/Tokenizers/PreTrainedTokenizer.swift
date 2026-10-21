@@ -127,8 +127,6 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         self.normalizer = normalizer
         let postProcessor = try PostProcessorFactory.fromConfig(config: tokenizerData["postProcessor"])
         decoder = try DecoderFactory.fromConfig(config: tokenizerData["decoder"])
-        // `transformers` >= 4.45 defaults `clean_up_tokenization_spaces` to `False`.
-        cleanUpTokenizationSpaces = tokenizerConfig.cleanUpTokenizationSpaces.boolean(or: false)
         // `added_tokens_decoder` has been folded into the tokens above and is not consulted
         // again; it is by far the largest part of the configuration (one object per added token).
         if var retained = tokenizerConfig.dictionary(), retained["added_tokens_decoder"] != nil {
@@ -141,6 +139,7 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         let model = try TokenizerModel.from(
             tokenizerConfig: tokenizerConfig, tokenizerData: tokenizerData, addedTokens: addedTokens, strict: strict)
         self.model = model
+        cleanUpTokenizationSpaces = Self.cleansUpTokenizationSpaces(tokenizerConfig, model: model)
         self.postProcessor = postProcessor?.bindingVocabulary(
             resolving: model.convertTokenToId, spelling: model.convertIdToToken)
         modelIdentity = ObjectIdentifier(model as AnyObject)
@@ -203,6 +202,21 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     func cleanUp(text: String) -> String {
         guard cleanUpTokenizationSpaces else { return text }
         return TokenizationCleanup.cleanUp(text)
+    }
+
+    /// Whether decoding applies `clean_up_tokenization_spaces`, as `transformers` 5 decides it:
+    /// off unless requested, and never for BPE models, whose decoded text already carries its
+    /// real spacing, unless `clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output`
+    /// forces it (LUKE and mLUKE set that by default).
+    static func cleansUpTokenizationSpaces(_ tokenizerConfig: Config, model: any TokenizingModel) -> Bool {
+        guard tokenizerConfig.cleanUpTokenizationSpaces.boolean(or: false) else { return false }
+        guard model is BPETokenizer else { return true }
+        let forced = tokenizerConfig["clean_up_tokenization_spaces_for_bpe_even_though_it_will_corrupt_output"]
+        if let forced = forced.boolean() { return forced }
+        switch tokenizerConfig.tokenizerClass.string()?.replacingOccurrences(of: "Fast", with: "") {
+        case "LukeTokenizer", "MLukeTokenizer": return true
+        default: return false
+        }
     }
 
     // MARK: - Tokenization

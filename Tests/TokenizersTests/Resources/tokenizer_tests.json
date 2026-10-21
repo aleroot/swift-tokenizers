@@ -3005,8 +3005,8 @@
           1
         ]
       },
-      "decoded_with_special": "<|startoftranscript|><|notimestamps|>A\n'll!!to?'d''d of, can't.<|endoftext|>",
-      "decoded_without_special": "A\n'll!!to?'d''d of, can't."
+      "decoded_with_special": "<|startoftranscript|><|notimestamps|>A\n'll !!to?'d''d of, can't.<|endoftext|>",
+      "decoded_without_special": "A\n'll !!to?'d''d of, can't."
     },
     {
       "input": "def main():\n\tpass",
@@ -3593,8 +3593,8 @@
           1
         ]
       },
-      "decoded_with_special": "<|startoftranscript|><|notimestamps|>A\n'll!!to?'d''d of, can't.<|endoftext|>",
-      "decoded_without_special": "A\n'll!!to?'d''d of, can't."
+      "decoded_with_special": "<|startoftranscript|><|notimestamps|>A\n'll !!to?'d''d of, can't.<|endoftext|>",
+      "decoded_without_special": "A\n'll !!to?'d''d of, can't."
     },
     {
       "input": "def main():\n\tpass",
@@ -4655,8 +4655,8 @@
           1
         ]
       },
-      "decoded_with_special": "<|begin_of_text|>A\n'll!!to?'d''d of, can't.",
-      "decoded_without_special": "A\n'll!!to?'d''d of, can't."
+      "decoded_with_special": "<|begin_of_text|>A\n'll !!to?'d''d of, can't.",
+      "decoded_without_special": "A\n'll !!to?'d''d of, can't."
     },
     {
       "input": "def main():\n\tpass",
