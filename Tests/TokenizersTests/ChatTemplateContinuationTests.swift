@@ -145,6 +145,35 @@ struct ChatTemplateContinuationTests {
         #expect(prompt == "Describe the Swift programming language.Swift is a")
     }
 
+    @Test("A conversation that ends with a tool result renders as usual")
+    func rendersAToolResultAsUsual() async throws {
+        let tokenizer = try await Self.qwen()
+        let messages: [Message] = [
+            ["role": "user", "content": "Describe the Swift programming language."],
+            ["role": "assistant", "content": "Swift is a"],
+            ["role": "tool", "content": "a tool result"],
+        ]
+        let prompt = try tokenizer.renderChatTemplate(
+            messages: messages, additionalContext: Self.continuation)
+        // The ChatML template writes a tool result as a user turn.
+        #expect(
+            prompt
+                == "<|im_start|>user\nDescribe the Swift programming language.<|im_end|>\n"
+                + "<|im_start|>assistant\nSwift is a<|im_end|>\n"
+                + "<|im_start|>user\n<tool_response>\na tool result\n</tool_response><|im_end|>\n")
+    }
+
+    @Test("The key never reaches the template of a conversation that does not continue")
+    func hidesTheKeyFromAnOrdinaryTemplate() async throws {
+        let tokenizer = try await Self.qwen()
+        let template =
+            "{% if continue_final_message %}leaked{% else %}{{ messages[0]['content'] }}{% endif %}"
+        let prompt = try tokenizer.renderChatTemplate(
+            messages: [["role": "user", "content": "Describe the Swift programming language."]],
+            chatTemplate: .literal(template), additionalContext: Self.continuation)
+        #expect(prompt == "Describe the Swift programming language.")
+    }
+
     @Test("A conversation without the key renders as usual")
     func rendersWithoutTheKey() async throws {
         let tokenizer = try await Self.qwen()
