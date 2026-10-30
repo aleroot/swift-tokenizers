@@ -133,6 +133,38 @@ struct ChatTemplateContinuationTests {
         }
     }
 
+    @Test("A changed message is refused even when an earlier turn holds the same words")
+    func failsOnAChangedMessageWithRepeatedText() async throws {
+        let tokenizer = try await Self.qwen()
+        // The template changes the reply, and an earlier turn holds the words it started with.
+        let template =
+            "{% for message in messages %}{% if message['role'] == 'assistant' %}"
+            + "{{ message['content'] | upper }}{% else %}{{ message['content'] }}{% endif %}{% endfor %}"
+        let messages: [Message] = [
+            ["role": "user", "content": "abc"],
+            ["role": "assistant", "content": "abc"],
+        ]
+        #expect(throws: TokenizerError.self) {
+            try tokenizer.renderChatTemplate(
+                messages: messages, chatTemplate: .literal(template),
+                additionalContext: Self.continuation)
+        }
+    }
+
+    @Test("A repeated text in an earlier turn does not confuse the continuation")
+    func continuesWithRepeatedTextInAnEarlierTurn() async throws {
+        let tokenizer = try await Self.qwen()
+        let template = "{% for message in messages %}[{{ message['content'] }}]{% endfor %}"
+        let messages: [Message] = [
+            ["role": "user", "content": "abc"],
+            ["role": "assistant", "content": "abc"],
+        ]
+        let prompt = try tokenizer.renderChatTemplate(
+            messages: messages, chatTemplate: .literal(template), additionalContext: Self.continuation)
+        // The prompt ends inside the reply, so the markup the template writes after it is gone.
+        #expect(prompt == "[abc][abc")
+    }
+
     @Test("The key never reaches the template")
     func hidesTheKeyFromTheTemplate() async throws {
         let tokenizer = try await Self.qwen()

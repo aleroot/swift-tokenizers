@@ -65,17 +65,25 @@ public enum ChatTemplateContinuation {
 
     /// The rendered prompt up to the end of the final message.
     static func prompt(_ rendered: String, finalText: String) throws -> String {
-        guard rendered.contains(finalText.trimmingCharacters(in: .whitespacesAndNewlines)),
-              let mark = rendered.range(of: marker, options: .backwards)
-        else {
+        guard let mark = rendered.range(of: marker, options: .backwards) else {
             throw TokenizerError.chatTemplate(
                 "The chat template does not show the final message, so it cannot be continued.")
+        }
+        // The message ends the prompt: what precedes the marker is the message itself, up to the
+        // whitespace the template may have trimmed. A template that changed the message leaves
+        // something else there, and the continuation would carry the change. The text is read
+        // next to the marker, not anywhere in the prompt, so an earlier turn that happens to
+        // hold the same words cannot stand in for the message.
+        let head = Self.droppingTrailingWhitespace(String(rendered[..<mark.lowerBound]))
+        guard head.hasSuffix(finalText.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            throw TokenizerError.chatTemplate(
+                "The chat template changed the final message, so it cannot be continued.")
         }
         // The template either keeps the space that follows the marker or trims it.
         if rendered[mark.lowerBound...].hasPrefix(markedSuffix) {
             return String(rendered[..<mark.lowerBound])
         }
-        return Self.droppingTrailingWhitespace(String(rendered[..<mark.lowerBound]))
+        return head
     }
 
     /// The text without the whitespace at its end.
