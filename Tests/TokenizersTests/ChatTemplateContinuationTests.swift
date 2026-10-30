@@ -183,4 +183,60 @@ struct ChatTemplateContinuationTests {
                 == "<|im_start|>user\nDescribe the Swift programming language.<|im_end|>\n"
                 + "<|im_start|>assistant\n<think>\n\n</think>\n\nSwift is a<|im_end|>\n")
     }
+
+    @Test("A context that does not ask for a continuation reaches the template")
+    func keepsAnInactiveRequestInTheContext() async throws {
+        let tokenizer = try await Self.qwen()
+        let template = "{% if continue_final_message is defined %}defined{% else %}undefined{% endif %}"
+        let prompt = try tokenizer.renderChatTemplate(
+            messages: [["role": "user", "content": "Describe the Swift programming language."]],
+            chatTemplate: .literal(template),
+            additionalContext: [ChatTemplateContinuation.key: false])
+        #expect(prompt == "defined")
+    }
+
+    @Test("A value that is not a request reaches the template")
+    func keepsAnyOtherValueInTheContext() async throws {
+        let tokenizer = try await Self.qwen()
+        let prompt = try tokenizer.renderChatTemplate(
+            messages: [["role": "user", "content": "Describe the Swift programming language."]],
+            chatTemplate: .literal("{{ continue_final_message }}"),
+            additionalContext: [ChatTemplateContinuation.key: "kept"])
+        #expect(prompt == "kept")
+    }
+
+    @Test("An assistant mask refuses a continued prompt")
+    func refusesAMaskedContinuation() throws {
+        let tokenizer = try Self.smallTokenizer()
+        let template =
+            "{% for m in messages %}{% if m.role == 'assistant' %}{% generation %}{{ m.content }}"
+            + "{% endgeneration %}{% else %}{{ m.content }}{% endif %}\n{% endfor %}"
+        let messages: [Message] = [["role": "user", "content": "a"], ["role": "assistant", "content": "b"]]
+        #expect(throws: TokenizerError.self) {
+            try tokenizer.applyChatTemplateWithAssistantMask(
+                messages: messages, chatTemplate: .literal(template),
+                additionalContext: [ChatTemplateContinuation.key: true])
+        }
+        // A context that does not ask for a continuation leaves the mask alone.
+        let masked = try tokenizer.applyChatTemplateWithAssistantMask(
+            messages: messages, chatTemplate: .literal(template),
+            additionalContext: [ChatTemplateContinuation.key: false])
+        let plain = try tokenizer.applyChatTemplateWithAssistantMask(
+            messages: messages, chatTemplate: .literal(template))
+        #expect(masked.ids == plain.ids)
+        #expect(masked.assistantMask == plain.assistantMask)
+    }
+
+    /// A tokenizer with a tiny vocabulary, for the paths that need no model.
+    private static func smallTokenizer() throws -> any Tokenizer {
+        try AutoTokenizer.from(
+            tokenizerConfig: [:],
+            tokenizerData: [
+                "model": [
+                    "type": "BPE",
+                    "vocab": ["a": 0, "b": 1, "ab": 2, " ": 3, "\n": 4],
+                    "merges": ["a b"],
+                ],
+            ])
+    }
 }

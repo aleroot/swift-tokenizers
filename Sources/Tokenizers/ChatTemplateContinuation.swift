@@ -9,8 +9,25 @@ import Foundation
 /// (trims it, for instance) ends the prompt in the same place in both.
 public enum ChatTemplateContinuation {
     /// The context key that asks a chat template to continue its final message. `transformers`
-    /// names it the same way, and the template never sees it.
+    /// names it the same way.
+    ///
+    /// Only the Boolean `true` asks for a continuation, and a request never reaches the template.
+    /// Any other value is the caller's own context and reaches the template as it did before the
+    /// key was reserved.
     public static let key = "continue_final_message"
+
+    /// Whether the context asks for a continuation.
+    static func isRequested(_ additionalContext: [String: any Sendable]?) -> Bool {
+        additionalContext?[key] as? Bool == true
+    }
+
+    /// The context without the request, so a template never reads it.
+    static func withoutRequest(_ additionalContext: [String: any Sendable]?) -> [String: any Sendable]? {
+        guard isRequested(additionalContext) else { return additionalContext }
+        var context = additionalContext
+        context?[key] = nil
+        return context
+    }
 
     /// The marker that finds the end of the final message inside a rendered template.
     private static let marker = "CONTINUE_FINAL_MESSAGE_TAG"

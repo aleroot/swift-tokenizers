@@ -507,10 +507,12 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     /// Renders the chat template to a string without tokenizing it.
     ///
     /// When `additionalContext` asks for a continuation (see ``ChatTemplateContinuation/key``),
-    /// the prompt ends inside the final message instead of opening a new turn, and the key itself
-    /// never reaches the template. Only an assistant message continues: a conversation that ends
-    /// with anything else renders as usual, so a caller that keeps the request in a context
-    /// cannot make a tool result or a user turn swallow the prompt.
+    /// the prompt ends inside the final message instead of opening a new turn, and the request
+    /// never reaches the template. A continued prompt carries no generation prompt: the model
+    /// continues the message it is given, so a caller that asks for both gets the continuation.
+    /// Only an assistant message continues: a conversation that ends with anything else renders as
+    /// usual, so a caller that keeps the request in a context cannot make a tool result or a user
+    /// turn swallow the prompt.
     public func renderChatTemplate(
         messages: [Message],
         chatTemplate: ChatTemplateArgument? = nil,
@@ -519,9 +521,8 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
         additionalContext: [String: any Sendable]? = nil
     ) throws -> String {
         let template = try compiledTemplate(for: try selectChatTemplate(chatTemplate, tools: tools))
-        var context = additionalContext
-        let continues = context?[ChatTemplateContinuation.key] as? Bool == true
-        context?[ChatTemplateContinuation.key] = nil
+        let continues = ChatTemplateContinuation.isRequested(additionalContext)
+        let context = ChatTemplateContinuation.withoutRequest(additionalContext)
 
         guard continues, messages.last?["role"] as? String == "assistant" else {
             return try template.render(
@@ -685,12 +686,19 @@ extension PreTrainedTokenizer {
             cleanup: cleanUpTokenizationSpaces, skipped: specialTokenIds)
     }
 
+    /// Encodes a conversation and marks the assistant content its template generates.
+    ///
+    /// A continued prompt cannot carry a mask: the mask would cover a message the model never
+    /// finished. `transformers` refuses the same combination.
     public func encodeChatTemplateWithAssistantMask(
         messages: [Message], chatTemplate: ChatTemplateArgument? = nil, addGenerationPrompt: Bool = false,
         maxLength: Int? = nil, tools: [ToolSpec]? = nil, additionalContext: [String: any Sendable]? = nil
     ) throws -> ChatTemplateEncoding {
         if let maxLength, maxLength < 0 {
             throw TokenizerError.invalidConfiguration("maxLength must be nonnegative")
+        }
+        if ChatTemplateContinuation.isRequested(additionalContext) {
+            throw TokenizerError.chatTemplate("A continued prompt cannot carry an assistant mask.")
         }
         let source = try selectChatTemplate(chatTemplate, tools: tools)
         let annotated = try compiledGenerationTemplate(for: source)
