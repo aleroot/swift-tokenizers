@@ -505,6 +505,10 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     }
 
     /// Renders the chat template to a string without tokenizing it.
+    ///
+    /// When `additionalContext` asks for a continuation (see ``ChatTemplateContinuation/key``),
+    /// the prompt ends inside the final message instead of opening a new turn, and the key itself
+    /// never reaches the template.
     public func renderChatTemplate(
         messages: [Message],
         chatTemplate: ChatTemplateArgument? = nil,
@@ -514,10 +518,22 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
     ) throws -> String {
         let template = try compiledTemplate(for: try selectChatTemplate(chatTemplate, tools: tools))
 
-        return try template.render(
+        guard additionalContext?[ChatTemplateContinuation.key] as? Bool == true else {
+            return try template.render(
+                chatContext(
+                    messages: messages, addGenerationPrompt: addGenerationPrompt,
+                    tools: tools, additionalContext: additionalContext))
+        }
+
+        // A continued prompt ends inside the final message, so it carries no generation prompt.
+        let marked = try ChatTemplateContinuation.marking(messages)
+        var context = additionalContext
+        context?[ChatTemplateContinuation.key] = nil
+        let rendered = try template.render(
             chatContext(
-                messages: messages, addGenerationPrompt: addGenerationPrompt,
-                tools: tools, additionalContext: additionalContext))
+                messages: marked.messages, addGenerationPrompt: false,
+                tools: tools, additionalContext: context))
+        return try ChatTemplateContinuation.prompt(rendered, finalText: marked.text)
     }
 
     private func chatContext(
