@@ -36,9 +36,10 @@ let text = tokenizer.decode(tokens: ids)          // "Hello world"
   component references, Unicode conformance, and regression tests. Local differential harnesses
   also check generated configurations and source offsets.
 - **Broad inference support.** The model and pipeline component families listed below, plus
-  added and special tokens, chat templates with tools and assistant masks, source offsets,
-  sequence pairs with segment ids, streaming decoding, special-token-aware truncation and O(1)
-  vocabulary lookup. Tokenizer training, nonzero BPE dropout and padding are out of scope.
+  added and special tokens, chat templates with tools, assistant masks and continued final
+  messages, source offsets, sequence pairs with segment ids, streaming decoding,
+  special-token-aware truncation and O(1) vocabulary lookup. Tokenizer training, nonzero BPE
+  dropout and padding are out of scope.
 - **Familiar inference API.** Keep `import Tokenizers` and ordinary encode, decode, chat and
   vocabulary calls. Folder loading and MLX adapters are supported; Hub services and every
   historical public helper are not part of the compatibility contract. See [migration](#migrating-from-swift-transformers).
@@ -50,7 +51,7 @@ let text = tokenizer.decode(tokens: ids)          // "Hello world"
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/aleroot/swift-tokenizers", from: "1.0.0"),
+    .package(url: "https://github.com/aleroot/swift-tokenizers", from: "1.1.0"),
 ],
 targets: [
     .target(name: "MyApp", dependencies: [
@@ -97,11 +98,18 @@ pair.ids, pair.typeIds
 
 // Chat templates, with optional tool definitions
 let prompt = try tokenizer.applyChatTemplate(messages: messages, tools: tools)
+
+// A prompt that continues the final message, as `transformers` does with
+// `continue_final_message`: the model writes the rest of that message
+let continued = try tokenizer.applyChatTemplate(
+    messages: messages, tools: nil, additionalContext: [ChatTemplateContinuation.key: true])
 ```
 
 Messages are `[String: any Sendable]` dictionaries and tools follow the OpenAI function schema;
 both render in the canonical key order of `transformers.utils.get_json_schema`, byte-identical to
-Python for standard schemas. For tokenizer JSON you already hold in memory, use
+Python for standard schemas. A continued prompt ends inside the final assistant message, so the
+model completes it instead of opening a new turn; a conversation that ends with anything else
+renders as usual. For tokenizer JSON you already hold in memory, use
 `Config(tokenizerJSON:)`, which preserves byte-distinct vocabulary keys that Foundation's
 `JSONDecoder` would merge through Unicode canonical equivalence.
 
@@ -167,7 +175,7 @@ For local inference, keep the `Tokenizers` module name and swap the package depe
 .product(name: "Tokenizers", package: "swift-transformers"),
 
 // after
-.package(url: "https://github.com/aleroot/swift-tokenizers", from: "1.0.0"),
+.package(url: "https://github.com/aleroot/swift-tokenizers", from: "1.1.0"),
 .product(name: "Tokenizers", package: "swift-tokenizers"),
 ```
 

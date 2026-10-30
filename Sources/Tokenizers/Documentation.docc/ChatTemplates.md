@@ -89,6 +89,26 @@ try tokenizer.applyChatTemplate(
     additionalContext: ["tools_in_user_message": false])
 ```
 
+### Continuing the final message
+
+A reply that stopped early can be continued. The prompt then ends inside the final assistant
+message, so the model writes the rest of it instead of opening a new turn:
+
+```swift
+let ids = try tokenizer.applyChatTemplate(
+    messages: messages,
+    tools: nil,
+    additionalContext: [ChatTemplateContinuation.key: true])
+```
+
+The request travels in the context, so the template never sees it. Only an assistant message
+continues: a conversation that ends with a tool result or a user turn renders as usual, which
+keeps a runtime that reuses the context across a tool loop sound.
+
+A message the template changed cannot be continued, because the prompt would carry the change
+instead of the reply. The text is read next to the marker the library inserts, so an earlier
+turn that holds the same words cannot stand in for the message.
+
 ### Choosing a template
 
 ```swift
