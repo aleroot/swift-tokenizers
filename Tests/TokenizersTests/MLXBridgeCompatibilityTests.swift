@@ -37,13 +37,17 @@ private protocol MLXTokenizerLoader: Sendable {
 // MARK: - Verbatim macro expansions
 
 /// `#adaptHuggingFaceTokenizer(upstream)`
-private func adaptHuggingFaceTokenizer(_ huggingFaceTokenizer: any Tokenizers.Tokenizer) -> any MLXTokenizer {
-    { (huggingFaceTokenizer: any Tokenizers.Tokenizer) -> any MLXTokenizer in
+private func adaptHuggingFaceTokenizer(
+    _ huggingFaceTokenizer: any Tokenizers.Tokenizer, chatTemplate: String? = nil
+) -> any MLXTokenizer {
+    { (huggingFaceTokenizer: any Tokenizers.Tokenizer, chatTemplate: String?) -> any MLXTokenizer in
         struct TokenizerBridge: MLXTokenizer {
             private let upstream: any Tokenizers.Tokenizer
+            private let chatTemplate: String?
 
-            init(_ upstream: any Tokenizers.Tokenizer) {
+            init(_ upstream: any Tokenizers.Tokenizer, chatTemplate: String?) {
                 self.upstream = upstream
+                self.chatTemplate = chatTemplate
             }
 
             func encode(text: String, addSpecialTokens: Bool) -> [Int] {
@@ -77,12 +81,20 @@ private func adaptHuggingFaceTokenizer(_ huggingFaceTokenizer: any Tokenizers.To
                         messages: messages, tools: tools, additionalContext: additionalContext)
                 } catch Tokenizers.TokenizerError.missingChatTemplate {
                     throw MLXTokenizerError.missingChatTemplate
+                } catch {
+                    guard let chatTemplate,
+                        error.localizedDescription.contains("Unexpected keyword argument 'separators'")
+                    else { throw error }
+                    return try upstream.applyChatTemplate(
+                        messages: messages, chatTemplate: .literal(chatTemplate),
+                        addGenerationPrompt: true, truncation: false, maxLength: nil,
+                        tools: tools, additionalContext: additionalContext)
                 }
             }
         }
 
-        return TokenizerBridge(huggingFaceTokenizer)
-    }(huggingFaceTokenizer)
+        return TokenizerBridge(huggingFaceTokenizer, chatTemplate: chatTemplate)
+    }(huggingFaceTokenizer, chatTemplate)
 }
 
 /// `#huggingFaceTokenizerLoader()`
@@ -121,6 +133,17 @@ struct MLXBridgeCompatibilityTests {
             messages: [["role": "user", "content": "Hi"]], tools: nil, additionalContext: nil
         )
         #expect(prompt.first == 151644)  // <|im_start|>
+    }
+
+    @Test("Bridge keeps a supported original template rather than using its fallback")
+    func nativeTemplateTakesPriority() async throws {
+        let folder = try await HubFixtures.modelFolder(for: "Qwen/Qwen3-0.6B")
+        let tokenizer = try await Tokenizers.AutoTokenizer.from(modelFolder: folder)
+        let adapted = adaptHuggingFaceTokenizer(tokenizer, chatTemplate: "{{ raise_exception('wrong template') }}")
+        let messages: [Message] = [["role": "user", "content": "Hi"]]
+        #expect(
+            try adapted.applyChatTemplate(messages: messages, tools: nil, additionalContext: nil)
+                == tokenizer.applyChatTemplate(messages: messages, tools: nil, additionalContext: nil))
     }
 
     @Test("Missing chat template maps to the bridge error")

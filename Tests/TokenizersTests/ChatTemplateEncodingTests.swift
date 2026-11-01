@@ -67,6 +67,59 @@ struct ChatTemplateEncodingTests {
         #expect(result.assistantMask == [true, true])
     }
 
+    @Test("Raw blocks and quoted delimiters do not confuse generation tracking")
+    func rawAndQuotedDelimiters() throws {
+        let tokenizer = try tokenizer()
+        let template = "{% set x = '%}' %}{% generation %}a{% endgeneration %}"
+        let result = try tokenizer.applyChatTemplateWithAssistantMask(messages: [], chatTemplate: .literal(template))
+        #expect(result.text == "a")
+        #expect(result.assistantMask == [true])
+        #expect(throws: (any Error).self) {
+            try tokenizer.applyChatTemplateWithAssistantMask(
+                messages: [],
+                chatTemplate: .literal(
+                    "{% raw %}{{ unclosed {% generation %}{% endraw %}{% generation %}a{% endgeneration %}"))
+        }
+    }
+
+    @Test("Generation blocks preserve trim-block and explicit whitespace controls")
+    func generationWhitespaceControls() throws {
+        let tokenizer = try tokenizer()
+        for template in [
+            "a{% generation %}\nb{% endgeneration %}\na",
+            "a {% generation -%} \n b {%- endgeneration %}a",
+            "a {% generation %} b {% endgeneration -%} \n a",
+            "{% generation %}a\n  {% endgeneration %}b",
+        ] {
+            let result = try tokenizer.applyChatTemplateWithAssistantMask(
+                messages: [], chatTemplate: .literal(template))
+            let plain = try #require(tokenizer as? PreTrainedTokenizer).renderChatTemplate(
+                messages: [], chatTemplate: .literal(template))
+            #expect(result.text.utf8.elementsEqual(plain.utf8))
+            #expect(result.assistantMask.contains(true))
+        }
+    }
+
+    @Test("Spark JSON separators preserve compact and spaced output")
+    func sparkJSONSeparators() throws {
+        let tokenizer = try #require(tokenizer() as? PreTrainedTokenizer)
+        let template =
+            "{{ data | tojson(separators=(',', ':'), sort_keys=true) }}|{{ data | tojson(separators=(', ', ': '), sort_keys=true) }}"
+        let data: [String: any Sendable] = ["a": 1, "b": "x"]
+        let rendered = try tokenizer.renderChatTemplate(
+            messages: [], chatTemplate: .literal(template), additionalContext: ["data": data])
+        #expect(rendered == #"{"a":1,"b":"x"}|{"a": 1, "b": "x"}"#)
+    }
+
+    @Test("A generation block inside filtered set is rejected")
+    func filteredSetIsRejected() throws {
+        let tokenizer = try tokenizer()
+        let template = "{% set x | replace('=', ':') %}{% generation %}a{% endgeneration %}{% endset %}{{ x }}"
+        #expect(throws: (any Error).self) {
+            try tokenizer.applyChatTemplateWithAssistantMask(messages: [], chatTemplate: .literal(template))
+        }
+    }
+
     @Test("Template caches preserve byte-distinct canonically equivalent Unicode sources")
     func unicodeTemplateKeys() throws {
         let tokenizer = try tokenizer()
@@ -108,6 +161,8 @@ struct ChatTemplateEncodingTests {
         for template in [
             "a", "{{ '{% generation %}' }}", "{% set x %}{% generation %}a{% endgeneration %}{% endset %}{{x}}",
             "{% filter upper %}{% generation %}a{% endgeneration %}{% endfilter %}",
+            "{% macro wrap() %}{% generation %}a{% endgeneration %}{% endmacro %}{{ wrap() }}",
+            "{% macro wrap() %}{{ caller('a') }}{% endmacro %}{% call(x) wrap() %}{% generation %}{{ x }}{% endgeneration %}{% endcall %}",
             "{% for m in messages %}{% generation %}a{% break %}{% endgeneration %}{% endfor %}",
         ] {
             #expect(throws: (any Error).self) {

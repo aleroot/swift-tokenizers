@@ -457,8 +457,8 @@ struct ConfigTests {
             1.2
             tre
             jeq
-            true
-            false
+            True
+            False
             1.1
             1.2
             ghz
@@ -466,7 +466,7 @@ struct ConfigTests {
             678
             1.1
             hha
-            true
+            True
             iop
             """
 

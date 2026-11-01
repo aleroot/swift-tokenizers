@@ -1,7 +1,4 @@
-// The preprocessor fills the jinja2 whitespace-control gaps in swift-jinja:
-// comment strip markers (`{#-` / `-#}`) and a literal `{` before a
-// whitespace-controlled tag. Expectations below are jinja2 semantics,
-// verified against CPython jinja2 3.x (transformers' rendering engine).
+// The native Jinja lexer preserves whitespace-control behavior used by model templates.
 
 import Foundation
 import Jinja
@@ -10,11 +7,11 @@ import Testing
 @testable import Tokenizers
 
 private func render(_ source: String) throws -> String {
-    try Template(ChatTemplatePreprocessor.preprocess(source), with: .init(lstripBlocks: true, trimBlocks: true))
+    try Template(source, with: .init(lstripBlocks: true, trimBlocks: true))
         .render([:])
 }
 
-@Suite("Chat template preprocessor")
+@Suite("Chat template whitespace control")
 struct ChatTemplatePreprocessorTests {
     @Test("Comment with left strip removes preceding whitespace")
     func commentLeftStrip() throws {

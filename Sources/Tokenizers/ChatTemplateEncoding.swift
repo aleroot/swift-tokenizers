@@ -58,65 +58,170 @@ public extension Tokenizer {
     }
 }
 
-/// swift-jinja exposes its AST but does not yet expose generation-span callbacks. Annotate
-/// output at AST boundaries, after whitespace control, and verify byte-for-byte render parity.
-/// Restrict annotations to direct output: capturing/filtering a generation block can change
-/// string operations before the markers are removed and cannot be tracked safely this way.
+/// Annotates generation blocks in source, then verifies the unmarked render byte for byte.
 struct GenerationTemplate: Sendable {
-    let nodes: [Node]
+    let template: Template
     let start: String
     let end: String
+    let startName: String
+    let endName: String
 
     init(source: String) throws {
-        let nonce = UUID().uuidString
-        let start = "\u{0}generation-\(nonce)-start\u{0}"
-        let end = "\u{0}generation-\(nonce)-end\u{0}"
-        let parsed = try Parser.parse(Lexer.tokenize(ChatTemplatePreprocessor.preparedSource(source)))
+        let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        start = "\u{0}generation-\(nonce)-start\u{0}"
+        end = "\u{0}generation-\(nonce)-end\u{0}"
+        startName = "_generation_\(nonce)_start"
+        endName = "_generation_\(nonce)_end"
+        let normalized = source.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let annotated = try Self.annotate(normalized, startName: startName, endName: endName)
+        template = try Template(annotated, with: .init(lstripBlocks: true, trimBlocks: true))
+    }
+
+    private static func annotate(_ source: String, startName: String, endName: String) throws -> String {
+        var result = ""
+        var cursor = source.startIndex
+        var captures: [String] = []
+        var inRaw = false
         var found = false
-        func annotate(_ nodes: [Node], captured: Bool = false) throws -> [Node] {
-            try nodes.flatMap { node -> [Node] in
-                guard case let .statement(statement) = node else { return [node] }
-                let result: Statement
-                switch statement {
-                case let .generation(body):
-                    guard !captured else {
-                        throw TokenizerError.chatTemplate(
-                            "Assistant masks require generation blocks in direct output, outside set, macro, call and filter blocks"
-                        )
-                    }
-                    found = true
-                    return [.text(start)] + (try annotate(body)) + [.text(end)]
-                case let .program(body): result = .program(try annotate(body, captured: captured))
-                case let .if(test, body, alternate):
-                    result = .if(
-                        test, try annotate(body, captured: captured), try annotate(alternate, captured: captured))
-                case let .for(variable, expression, body, alternate, test):
-                    result = .for(
-                        variable, expression, try annotate(body, captured: captured),
-                        try annotate(alternate, captured: captured), test: test)
-                case let .set(target, value, body):
-                    result = .set(target: target, value: value, body: try annotate(body, captured: true))
-                case let .macro(name, args, defaults, body):
-                    result = .macro(name, args, defaults, try annotate(body, captured: true))
-                case let .call(callable, args, body):
-                    result = .call(callable: callable, callerArgs: args, body: try annotate(body, captured: true))
-                case let .filter(expression, body):
-                    result = .filter(filterExpr: expression, body: try annotate(body, captured: true))
-                case .break, .continue: result = statement
+        while cursor < source.endIndex {
+            if inRaw {
+                guard let close = source[cursor...].firstRange(of: /\{%[-]?\s*endraw\s*[-]?%\}/) else {
+                    result += source[cursor...]
+                    break
                 }
-                return [.statement(result)]
+                result += source[cursor..<close.upperBound]
+                cursor = close.upperBound
+                inRaw = false
+                continue
+            }
+            guard let open = source[cursor...].range(of: "{") else {
+                result += source[cursor...]
+                break
+            }
+            result += source[cursor..<open.lowerBound]
+            let suffix = source[open.lowerBound...]
+            let delimiter: String
+            if suffix.hasPrefix("{{") {
+                delimiter = "}}"
+            } else if suffix.hasPrefix("{%") {
+                delimiter = "%}"
+            } else if suffix.hasPrefix("{#") {
+                delimiter = "#}"
+            } else {
+                result += "{"
+                cursor = source.index(after: open.lowerBound)
+                continue
+            }
+            let start = open.lowerBound
+            var i = source.index(start, offsetBy: 2)
+            var quote: Character?
+            var escaped = false
+            var close: String.Index?
+            while i < source.endIndex {
+                let c = source[i]
+                if delimiter != "#}", let current = quote {
+                    if escaped {
+                        escaped = false
+                    } else if c == "\\" {
+                        escaped = true
+                    } else if c == current {
+                        quote = nil
+                    }
+                } else if delimiter != "#}", c == "'" || c == "\"" {
+                    quote = c
+                } else if source[i...].hasPrefix(delimiter) {
+                    close = i
+                    break
+                }
+                i = source.index(after: i)
+            }
+            guard let close else {
+                result += source[start...]
+                cursor = source.endIndex
+                break
+            }
+            let after = source.index(close, offsetBy: 2)
+            let tag = source[start..<after]
+            cursor = after
+            guard delimiter == "%}" else { result += tag; continue }
+            var body = source[source.index(start, offsetBy: 2)..<close]
+            if body.first == "-" { body = body.dropFirst() }
+            if body.last == "-" { body = body.dropLast() }
+            let statement = body.trimmingCharacters(in: .whitespacesAndNewlines)
+            let keyword = String(statement.prefix { $0.isLetter || $0 == "_" })
+            if keyword == "raw" { inRaw = true; result += tag; continue }
+            if ["macro", "call", "filter"].contains(keyword)
+                || (keyword == "set" && !Self.isSetAssignment(statement))
+            {
+                captures.append(keyword)
+            } else if keyword.hasPrefix("end"), captures.last == String(keyword.dropFirst(3)) {
+                captures.removeLast()
+            }
+            if keyword == "generation" {
+                guard statement == "generation", captures.isEmpty else {
+                    throw TokenizerError.chatTemplate(
+                        "Assistant masks require generation blocks in direct output, outside set, macro, call and filter blocks"
+                    )
+                }
+                found = true
+                result += tag
+                let stripRight = source[source.index(before: close)] == "-"
+                if stripRight {
+                    while cursor < source.endIndex, source[cursor].isWhitespace {
+                        result.append(source[cursor]); cursor = source.index(after: cursor)
+                    }
+                } else if cursor < source.endIndex, source[cursor] == "\n" || source[cursor] == "\r\n" {
+                    result.append(source[cursor]); cursor = source.index(after: cursor)
+                }
+                result += "{{ \(startName) }}"
+            } else if keyword == "endgeneration" {
+                guard statement == "endgeneration" else {
+                    throw TokenizerError.chatTemplate("Invalid generation block")
+                }
+                if !tag.hasPrefix("{%-") {
+                    let prefix = source[..<start]
+                    let lineStart = prefix.lastIndex(of: "\n").map { source.index(after: $0) } ?? source.startIndex
+                    let indentation = source[lineStart..<start]
+                    if indentation.allSatisfy({ $0 == " " || $0 == "\t" }) {
+                        result.removeLast(indentation.count)
+                    }
+                }
+                result += tag.hasPrefix("{%-") ? "{{- \(endName) }}" : "{{ \(endName) }}"
+                result += tag
+            } else {
+                result += tag
             }
         }
-        self.start = start
-        self.end = end
-        nodes = try annotate(parsed)
         guard found else { throw TokenizerError.chatTemplate("Assistant masks require {% generation %} annotations") }
+        return result
+    }
+
+    private static func isSetAssignment(_ statement: String) -> Bool {
+        var quote: Character?
+        var escaped = false
+        var depth = 0
+        for c in statement {
+            if let current = quote {
+                if escaped { escaped = false } else if c == "\\" { escaped = true } else if c == current { quote = nil }
+            } else if c == "'" || c == "\"" {
+                quote = c
+            } else if c == "(" || c == "[" || c == "{" {
+                depth += 1
+            } else if c == ")" || c == "]" || c == "}" {
+                depth -= 1
+            } else if c == "=" && depth == 0 {
+                return true
+            }
+        }
+        return false
     }
 
     func ranges(context: [String: Jinja.Value], expected: String) throws -> [Range<Int>] {
-        let environment = Environment()
-        for (key, value) in context { environment[key] = value }
-        let rendered = try Interpreter.interpret(nodes, environment: environment)
+        var annotatedContext = context
+        annotatedContext[startName] = .string(start)
+        annotatedContext[endName] = .string(end)
+        let rendered = try template.render(annotatedContext)
         let bytes = Array(rendered.utf8)
         let opening = Array(start.utf8)
         let closing = Array(end.utf8)

@@ -437,9 +437,9 @@ public class PreTrainedTokenizer: @unchecked Sendable, Tokenizer {
             return cached
         }
         // Compile outside the lock; a concurrent duplicate compilation is harmless.
-        let compiled = try Template(
-            ChatTemplatePreprocessor.preparedSource(source)
-        )
+        let normalized = source.replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let compiled = try Template(normalized, with: .init(lstripBlocks: true, trimBlocks: true))
         return compiledChatTemplates.withLock { cache in
             if let cached = cache[key] { return cached.template }
             // Templates are interchangeable once compiled, so dropping the whole cache is as

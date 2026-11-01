@@ -15,7 +15,7 @@ let package = Package(
         .library(name: "Tokenizers", targets: ["Tokenizers"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/huggingface/swift-jinja.git", from: "2.5.2"),
+        .package(url: "https://github.com/huggingface/swift-jinja.git", from: "3.0.0"),
     ],
     targets: [
         .target(
