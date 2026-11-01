@@ -63,6 +63,8 @@ struct GenerationTemplate: Sendable {
     let template: Template
     let start: String
     let end: String
+    let opening: [UInt8]
+    let closing: [UInt8]
     let startName: String
     let endName: String
 
@@ -70,6 +72,8 @@ struct GenerationTemplate: Sendable {
         let nonce = UUID().uuidString.replacingOccurrences(of: "-", with: "")
         start = "\u{0}generation-\(nonce)-start\u{0}"
         end = "\u{0}generation-\(nonce)-end\u{0}"
+        opening = Array(start.utf8)
+        closing = Array(end.utf8)
         startName = "_generation_\(nonce)_start"
         endName = "_generation_\(nonce)_end"
         let normalized = source.replacingOccurrences(of: "\r\n", with: "\n")
@@ -223,8 +227,6 @@ struct GenerationTemplate: Sendable {
         annotatedContext[endName] = .string(end)
         let rendered = try template.render(annotatedContext)
         let bytes = Array(rendered.utf8)
-        let opening = Array(start.utf8)
-        let closing = Array(end.utf8)
         var output: [UInt8] = []
         output.reserveCapacity(bytes.count)
         var depth = 0
