@@ -37,9 +37,9 @@ let text = tokenizer.decode(tokens: ids)          // "Hello world"
   also check generated configurations and source offsets.
 - **Broad inference support.** The model and pipeline component families listed below, plus
   added and special tokens, chat templates with tools, assistant masks and continued final
-  messages, source offsets, sequence pairs with segment ids, streaming decoding,
-  special-token-aware truncation and O(1) vocabulary lookup. Tokenizer training, nonzero BPE
-  dropout and padding are out of scope.
+  messages, source offsets, sequence pairs with segment ids, streaming decoding that exposes
+  the bytes held inside a character, special-token-aware truncation and O(1) vocabulary
+  lookup. Tokenizer training, nonzero BPE dropout and padding are out of scope.
 - **Familiar inference API.** Keep `import Tokenizers` and ordinary encode, decode, chat and
   vocabulary calls. Folder loading and MLX adapters are supported; Hub services and every
   historical public helper are not part of the compatibility contract. See [migration](#migrating-from-swift-transformers).
@@ -51,7 +51,7 @@ let text = tokenizer.decode(tokens: ids)          // "Hello world"
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/aleroot/swift-tokenizers", from: "1.1.0"),
+    .package(url: "https://github.com/aleroot/swift-tokenizers", from: "1.1.1"),
 ],
 targets: [
     .target(name: "MyApp", dependencies: [
@@ -175,7 +175,7 @@ For local inference, keep the `Tokenizers` module name and swap the package depe
 .product(name: "Tokenizers", package: "swift-transformers"),
 
 // after
-.package(url: "https://github.com/aleroot/swift-tokenizers", from: "1.1.0"),
+.package(url: "https://github.com/aleroot/swift-tokenizers", from: "1.1.1"),
 .product(name: "Tokenizers", package: "swift-tokenizers"),
 ```
 
