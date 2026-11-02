@@ -7,6 +7,15 @@ public struct TokenStreamDecoder: Sendable {
     /// False for pipelines whose global transformations require the complete sequence.
     /// Such pipelines buffer IDs and emit their result once, from `finish()`.
     public let isIncremental: Bool
+
+    /// The UTF-8 bytes appended but not yet emitted as text, oldest first: an incomplete
+    /// character, or a byte-fallback run that a later byte can still make invalid.
+    ///
+    /// A token that emits no text adds its bytes here, so a copy of the session shows what that
+    /// token would contribute, even in the middle of a character. Empty for a pipeline that
+    /// buffers token IDs, and it excludes text that a cleanup rule holds back.
+    public var held: [UInt8] { pendingUTF8 + pendingFallback }
+
     private let tokenizer: any Tokenizer
     private let skipSpecialTokens: Bool
     private let skipped: Set<Int>

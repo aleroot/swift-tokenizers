@@ -117,6 +117,34 @@ struct TokenStreamDecoderTests {
         }
     }
 
+    @Test("Held bytes show what a token adds inside a character, and clear once it is text")
+    func held() throws {
+        let words = (0..<256).map { [UInt8($0)].withUnsafeBufferPointer { ByteLevelAlphabet.encode($0) } }
+        var byteLevel = try tokenizer(vocab: words, decoder: ["type": "ByteLevel"]).makeStreamDecoder()
+        _ = try byteLevel.append(token: 0xF0)
+        let branch = byteLevel
+        _ = try byteLevel.append(token: 0x9F)
+        #expect(byteLevel.held == [0xF0, 0x9F])
+        #expect(branch.held == [0xF0])
+        _ = try byteLevel.append(token: 0x98)
+        #expect(try byteLevel.append(token: 0x80) == "😀")
+        #expect(byteLevel.held.isEmpty)
+
+        let vocab = ["▁hello", "<0xF0>", "<0x9F>", "<0x98>", "<0x80>"]
+        let decoder: Config = [
+            "type": "Sequence",
+            "decoders": [
+                ["type": "Replace", "pattern": ["String": "▁"], "content": " "],
+                ["type": "ByteFallback"], ["type": "Fuse"], ["type": "Strip", "content": " ", "start": 1, "stop": 0],
+            ],
+        ]
+        var fallback = try tokenizer(vocab: vocab, decoder: decoder).makeStreamDecoder()
+        for id in 1...4 { #expect(try fallback.append(token: id).isEmpty) }
+        #expect(fallback.held == [0xF0, 0x9F, 0x98, 0x80])
+        #expect(try fallback.append(token: 0) == "😀 hello")
+        #expect(fallback.held.isEmpty)
+    }
+
     @Test("Direct byte decoding preserves normalized added tokens and skipped specials")
     func normalizedSpecialTokens() throws {
         let data: Config = [

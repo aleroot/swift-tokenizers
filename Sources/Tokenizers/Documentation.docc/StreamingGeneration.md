@@ -53,6 +53,18 @@ stream.reset()   // start another response with the same settings
 Appending after `finish()` throws, so an accidentally reused session fails loudly instead of
 producing text that silently continues the previous answer.
 
+### Tokens inside a character
+
+A token that ends inside a character emits no text. ``TokenStreamDecoder/held`` shows the
+UTF-8 bytes the session holds for it. Append a token to a copy to see what it would add at that
+point, for example to label an alternative the model did not choose:
+
+```swift
+var probe = stream
+let text = try probe.append(token: candidate)
+let label = text.isEmpty ? probe.held.dropFirst(stream.held.count) : Array(text.utf8)
+```
+
 ### Pipelines that cannot stream
 
 A few decoder pipelines transform the sequence as a whole and genuinely cannot emit anything
